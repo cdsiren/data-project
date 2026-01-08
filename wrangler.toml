@@ -48,6 +48,8 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 SNAPSHOT_INTERVAL_MS = "60000"
 
-# Secrets (set with: wrangler secret put CLICKHOUSE_URL)
-# CLICKHOUSE_URL
-# CLICKHOUSE_TOKEN
+# Secrets (set with: wrangler secret put SECRET_NAME)
+# CLICKHOUSE_URL - Full URL to ClickHouse HTTP interface (e.g., https://your-instance.clickhouse.cloud:8443)
+# CLICKHOUSE_USER - ClickHouse username (e.g., default)
+# CLICKHOUSE_TOKEN - ClickHouse password/API key
+# WEBHOOK_API_KEY - API key for Goldsky webhook authentication

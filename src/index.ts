@@ -12,39 +12,47 @@ import { snapshotConsumer } from "./consumers/snapshot-consumer";
 const app = new Hono<{ Bindings: Env }>();
 
 app.post("/webhook/goldsky", async (c) => {
-  const event: GoldskyTradeEvent = await c.req.json();
-
-  // TODO: Extract condition_id from token_id or event data
-  const conditionId = "STUB_CONDITION_ID";
-
-  // Check cache for market metadata
-  const cacheKey = `market:${conditionId}`;
-  const cached = await c.env.MARKET_CACHE.get(cacheKey);
-
-  if (!cached) {
-    // Queue metadata fetch on cache miss
-    const job: MetadataFetchJob = {
-      condition_id: conditionId,
-      token_id: event.token_id,
-    };
-    c.executionCtx.waitUntil(c.env.METADATA_QUEUE.send(job));
+  // Verify API key
+  const apiKey = c.req.header("X-API-Key");
+  if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
+    return c.json({ error: "Unauthorized" }, 401);
   }
 
-  // Trigger Durable Object subscription
-  const doId = c.env.ORDERBOOK_MANAGER.idFromName(conditionId);
-  const doStub = c.env.ORDERBOOK_MANAGER.get(doId);
+  const body = await c.req.json();
 
-  c.executionCtx.waitUntil(
-    doStub.fetch("https://stub/subscribe", {
-      method: "POST",
-      body: JSON.stringify({
-        condition_id: conditionId,
-        token_id: event.token_id,
-      }),
-    })
-  );
+  // Handle both single event and array of events
+  const events: GoldskyTradeEvent[] = Array.isArray(body) ? body : [body];
 
-  return c.json({ status: "ok" });
+  console.log(`Received ${events.length} events from Goldsky`);
+
+  const queuedJobs: string[] = [];
+
+  for (const event of events) {
+    // Extract active asset ID (the one that's not "0")
+    const activeAssetId = event.maker_asset_id !== "0"
+      ? event.maker_asset_id
+      : event.taker_asset_id;
+
+    // Check cache for market metadata using clob_token_id
+    const cacheKey = `market:${activeAssetId}`;
+    const cached = await c.env.MARKET_CACHE.get(cacheKey);
+
+    if (!cached) {
+      // Queue metadata fetch on cache miss
+      const job: MetadataFetchJob = {
+        clob_token_id: activeAssetId,
+      };
+      c.executionCtx.waitUntil(c.env.METADATA_QUEUE.send(job));
+      queuedJobs.push(activeAssetId);
+    }
+  }
+
+  return c.json({
+    status: "ok",
+    events_received: events.length,
+    jobs_queued: queuedJobs.length,
+    cached: events.length - queuedJobs.length
+  });
 });
 
 app.get("/health", (c) => {
