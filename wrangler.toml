@@ -1,0 +1,53 @@
+name = "polymarket-enrichment"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Queues
+[[queues.producers]]
+queue = "metadata-fetch-queue"
+binding = "METADATA_QUEUE"
+
+[[queues.producers]]
+queue = "orderbook-snapshot-queue"
+binding = "SNAPSHOT_QUEUE"
+
+[[queues.consumers]]
+queue = "metadata-fetch-queue"
+max_batch_size = 10
+max_batch_timeout = 5
+
+[[queues.consumers]]
+queue = "orderbook-snapshot-queue"
+max_batch_size = 50
+max_batch_timeout = 10
+
+# Durable Objects
+[durable_objects]
+bindings = [
+  { name = "ORDERBOOK_MANAGER", class_name = "OrderbookManager" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["OrderbookManager"]
+
+# KV Namespace
+[[kv_namespaces]]
+binding = "MARKET_CACHE"
+id = "9377c262330f4d80b9fb6841d6b8cf19"
+
+# R2 Bucket (create with: wrangler r2 bucket create polymarket-orderbooks)
+[[r2_buckets]]
+binding = "ORDERBOOK_STORAGE"
+bucket_name = "polymarket-orderbooks"
+
+# Environment variables
+[vars]
+GAMMA_API_URL = "https://gamma-api.polymarket.com"
+CLOB_WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+SNAPSHOT_INTERVAL_MS = "60000"
+
+# Secrets (set with: wrangler secret put CLICKHOUSE_URL)
+# CLICKHOUSE_URL
+# CLICKHOUSE_TOKEN
