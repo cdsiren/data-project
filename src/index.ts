@@ -10,7 +10,6 @@ import { metadataConsumer } from "./consumers/metadata-consumer";
 import { snapshotConsumer } from "./consumers/snapshot-consumer";
 import { gapBackfillConsumer } from "./consumers/gap-backfill-consumer";
 import { tradeTickConsumer } from "./consumers/trade-tick-consumer";
-import { R2Archiver } from "./services/r2-archiver";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -322,79 +321,6 @@ app.get("/test/clickhouse", async (c) => {
   }
 });
 
-app.get("/test/r2", async (c) => {
-  const testId = `test_${Date.now()}`;
-  const testKey = `test/${testId}.json`;
-
-  try {
-    const testData = {
-      id: testId,
-      timestamp: Date.now(),
-      bids: [{ price: 0.45, size: 100 }],
-      asks: [{ price: 0.55, size: 100 }],
-    };
-
-    // 1. Write to R2
-    await c.env.ORDERBOOK_STORAGE.put(testKey, JSON.stringify(testData), {
-      httpMetadata: { contentType: "application/json" },
-    });
-
-    // 2. Read back
-    const object = await c.env.ORDERBOOK_STORAGE.get(testKey);
-    if (!object) {
-      return c.json(
-        {
-          test: "r2",
-          status: "fail",
-          step: "read",
-          error: "Object not found after write",
-        },
-        500
-      );
-    }
-
-    const retrieved = await object.json();
-
-    // 3. Verify data
-    const dataMatches = JSON.stringify(retrieved) === JSON.stringify(testData);
-
-    // 4. Cleanup
-    await c.env.ORDERBOOK_STORAGE.delete(testKey);
-
-    // 5. Verify deletion
-    const deleted = await c.env.ORDERBOOK_STORAGE.get(testKey);
-
-    return c.json({
-      test: "r2",
-      status: dataMatches && deleted === null ? "pass" : "fail",
-      steps: {
-        write: "ok",
-        read: "ok",
-        verify: dataMatches ? "ok" : "data mismatch",
-        cleanup: deleted === null ? "ok" : "deletion failed",
-      },
-      bucket: "polymarket-orderbooks",
-      testKey,
-    });
-  } catch (error) {
-    // Attempt cleanup on error
-    try {
-      await c.env.ORDERBOOK_STORAGE.delete(testKey);
-    } catch {
-      /* ignore */
-    }
-
-    return c.json(
-      {
-        test: "r2",
-        status: "fail",
-        error: String(error),
-      },
-      500
-    );
-  }
-});
-
 app.post("/admin/migrate", async (c) => {
   const apiKey = c.req.header("X-API-Key");
   if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
@@ -432,7 +358,7 @@ app.post("/admin/migrate", async (c) => {
       bid_levels UInt16 MATERIALIZED toUInt16(length(bid_prices)),
       ask_levels UInt16 MATERIALIZED toUInt16(length(ask_prices)),
       book_imbalance Float64 MATERIALIZED if(arraySum(bid_sizes) + arraySum(ask_sizes) > 0, (arraySum(bid_sizes) - arraySum(ask_sizes)) / (arraySum(bid_sizes) + arraySum(ask_sizes)), 0)
-    ) ENGINE = MergeTree() PARTITION BY toYYYYMM(source_ts) ORDER BY (asset_id, source_ts, ingestion_ts) TTL source_ts + INTERVAL 90 DAY SETTINGS index_granularity = 8192`,
+    ) ENGINE = MergeTree() PARTITION BY toYYYYMM(source_ts) ORDER BY (asset_id, source_ts, ingestion_ts) SETTINGS index_granularity = 8192`,
 
     // ob_gap_events table
     `CREATE TABLE IF NOT EXISTS polymarket.ob_gap_events (
@@ -453,7 +379,7 @@ app.post("/admin/migrate", async (c) => {
       ingestion_ts DateTime64(6, 'UTC'),
       latency_ms Float64 MATERIALIZED dateDiff('millisecond', source_ts, ingestion_ts),
       event_type LowCardinality(String)
-    ) ENGINE = MergeTree() PARTITION BY toYYYYMMDD(source_ts) ORDER BY (source_ts, asset_id) TTL source_ts + INTERVAL 7 DAY`,
+    ) ENGINE = MergeTree() PARTITION BY toYYYYMMDD(source_ts) ORDER BY (source_ts, asset_id)`,
 
     // trade_ticks table for execution-level data (critical for backtesting)
     `CREATE TABLE IF NOT EXISTS polymarket.trade_ticks (
@@ -467,7 +393,7 @@ app.post("/admin/migrate", async (c) => {
       ingestion_ts DateTime64(6, 'UTC'),
       latency_ms Float64 MATERIALIZED dateDiff('millisecond', source_ts, ingestion_ts),
       notional Float64 MATERIALIZED price * size
-    ) ENGINE = MergeTree() PARTITION BY toYYYYMM(source_ts) ORDER BY (asset_id, source_ts) TTL source_ts + INTERVAL 90 DAY`,
+    ) ENGINE = MergeTree() PARTITION BY toYYYYMM(source_ts) ORDER BY (asset_id, source_ts)`,
   ];
 
   const results: Array<{ statement: string; status: string; error?: string }> =
@@ -509,19 +435,17 @@ app.get("/test/all", async (c) => {
   };
 
   // Run all tests in parallel
-  const [wsResult, chResult, r2Result] = await Promise.all([
+  const [wsResult, chResult] = await Promise.all([
     fetch(new URL("/test/websocket", c.req.url)).then((r) => r.json()) as Promise<{ status: string }>,
     fetch(new URL("/test/clickhouse", c.req.url)).then((r) => r.json()) as Promise<{ status: string }>,
-    fetch(new URL("/test/r2", c.req.url)).then((r) => r.json()) as Promise<{ status: string }>,
   ]);
 
   results.tests = {
     websocket: wsResult,
     clickhouse: chResult,
-    r2: r2Result,
   };
 
-  const allPassed = [wsResult, chResult, r2Result].every(
+  const allPassed = [wsResult, chResult].every(
     (r) => r.status === "pass"
   );
 
@@ -556,26 +480,7 @@ async function queueHandler(batch: MessageBatch, env: Env) {
   }
 }
 
-// Scheduled handler for daily R2 archival
-async function scheduledHandler(
-  controller: ScheduledController,
-  env: Env,
-  ctx: ExecutionContext
-) {
-  console.log(`[Scheduled] Running archive job at ${new Date().toISOString()}`);
-
-  const archiver = new R2Archiver(env);
-
-  try {
-    const result = await archiver.archiveAll();
-    console.log(`[Scheduled] Archive complete:`, result);
-  } catch (error) {
-    console.error(`[Scheduled] Archive failed:`, error);
-  }
-}
-
 export default {
   fetch: app.fetch,
   queue: queueHandler,
-  scheduled: scheduledHandler,
 };

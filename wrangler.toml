@@ -68,15 +68,6 @@ id = "9377c262330f4d80b9fb6841d6b8cf19"
 binding = "HASH_CHAIN_CACHE"
 id = "2d5f178dcab04f4697eb6f6a9a0946a5"
 
-# R2 Bucket (create with: wrangler r2 bucket create polymarket-orderbooks)
-[[r2_buckets]]
-binding = "ORDERBOOK_STORAGE"
-bucket_name = "polymarket-orderbooks"
-
-# Cron trigger for daily R2 archival (runs at 2 AM UTC)
-[triggers]
-crons = ["0 2 * * *"]
-
 # Environment variables
 [vars]
 GAMMA_API_URL = "https://gamma-api.polymarket.com"

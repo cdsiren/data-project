@@ -2,7 +2,6 @@ import type { GapBackfillJob, TradeTick } from "./types/orderbook";
 
 export interface Env {
   MARKET_CACHE: KVNamespace;
-  ORDERBOOK_STORAGE: R2Bucket;
   METADATA_QUEUE: Queue;
   SNAPSHOT_QUEUE: Queue;
   ORDERBOOK_MANAGER: DurableObjectNamespace;

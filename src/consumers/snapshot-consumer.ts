@@ -102,6 +102,18 @@ export async function snapshotConsumer(
         `(valid=${stats.valid}, dup=${stats.duplicates}, gaps=${stats.gaps}, ` +
         `first=${stats.first}, resync=${stats.resyncs})`
       );
+
+      // Record latency metrics (fire-and-forget, don't block main flow)
+      Promise.all(
+        validSnapshots.map((snapshot) =>
+          clickhouse.recordLatency(
+            snapshot.asset_id,
+            snapshot.source_ts,
+            snapshot.ingestion_ts,
+            snapshot.is_resync ? "resync" : "snapshot"
+          )
+        )
+      ).catch((err) => console.error("[Snapshot] Latency recording failed:", err));
     } catch (error) {
       console.error("[Snapshot] ClickHouse insert failed:", error);
       // Don't retry acked messages - they'll be lost
