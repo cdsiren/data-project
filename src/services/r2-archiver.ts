@@ -1,7 +1,60 @@
 // src/services/r2-archiver.ts
-// Archives orderbook snapshots to R2 before ClickHouse TTL expires
+// Archives time-series data from ClickHouse to R2 before TTL expires
 
 import type { Env } from "../types";
+
+interface TableArchiveConfig {
+  table: string;
+  partitionKey: string;
+  dateColumn: string;
+  selectExpr?: string; // Custom SELECT expression, defaults to "*"
+}
+
+const ARCHIVE_CONFIGS: TableArchiveConfig[] = [
+  {
+    table: "ob_snapshots",
+    partitionKey: "asset_id",
+    dateColumn: "source_ts",
+  },
+  {
+    table: "trades",
+    partitionKey: "token_id",
+    dateColumn: "timestamp",
+  },
+  {
+    table: "makers",
+    partitionKey: "token_id",
+    dateColumn: "timestamp",
+  },
+  {
+    table: "takers",
+    partitionKey: "token_id",
+    dateColumn: "timestamp",
+  },
+  {
+    table: "markets",
+    partitionKey: "token_id",
+    dateColumn: "timestamp",
+    // Finalize aggregate functions for JSON export
+    selectExpr:
+      "* EXCEPT(unique_makers, unique_takers), finalizeAggregation(unique_makers) as unique_makers_count, finalizeAggregation(unique_takers) as unique_takers_count",
+  },
+];
+
+interface TableArchiveResult {
+  table: string;
+  date: string;
+  partitionsArchived: number;
+  bytesWritten: number;
+  filesCreated: string[];
+}
+
+interface ArchiveAllResult {
+  date: string;
+  tables: TableArchiveResult[];
+  totalBytesWritten: number;
+  totalFilesCreated: number;
+}
 
 interface ArchiveResult {
   date: string;
@@ -11,12 +64,12 @@ interface ArchiveResult {
 }
 
 /**
- * R2 Archiver for orderbook cold storage
+ * R2 Archiver for ClickHouse cold storage
  *
  * Exports data from ClickHouse that's about to expire (89 days old)
- * and writes to R2 as compressed NDJSON (Parquet-convertible format).
+ * and writes to R2 as compressed NDJSON.
  *
- * File structure: archive/{YYYY}/{MM}/{DD}/{asset_id}.ndjson.gz
+ * File structure: archive/{table}/{YYYY}/{MM}/{DD}/{partition_value}.ndjson.gz
  */
 export class R2Archiver {
   private baseUrl: string;
@@ -31,24 +84,59 @@ export class R2Archiver {
   }
 
   /**
-   * Archive snapshots from a specific date (defaults to 89 days ago)
+   * Archive all configured tables for a specific date (defaults to 89 days ago)
    */
-  async archiveDate(targetDate?: Date): Promise<ArchiveResult> {
-    // Default to 89 days ago (1 day before TTL expires)
-    const archiveDate = targetDate ?? new Date(Date.now() - 89 * 24 * 60 * 60 * 1000);
-    const dateStr = archiveDate.toISOString().split("T")[0]; // YYYY-MM-DD
+  async archiveAll(targetDate?: Date): Promise<ArchiveAllResult> {
+    const archiveDate =
+      targetDate ?? new Date(Date.now() - 89 * 24 * 60 * 60 * 1000);
+    const dateStr = archiveDate.toISOString().split("T")[0];
+
+    console.log(`[R2Archiver] Starting archiveAll for ${dateStr}`);
+
+    const tableResults: TableArchiveResult[] = [];
+    let totalBytes = 0;
+    let totalFiles = 0;
+
+    for (const config of ARCHIVE_CONFIGS) {
+      const result = await this.archiveTable(config, dateStr);
+      tableResults.push(result);
+      totalBytes += result.bytesWritten;
+      totalFiles += result.filesCreated.length;
+    }
+
+    console.log(
+      `[R2Archiver] archiveAll complete: ${totalFiles} files, ${totalBytes} bytes across ${tableResults.length} tables`
+    );
+
+    return {
+      date: dateStr,
+      tables: tableResults,
+      totalBytesWritten: totalBytes,
+      totalFilesCreated: totalFiles,
+    };
+  }
+
+  /**
+   * Archive a single table for a specific date
+   */
+  async archiveTable(
+    config: TableArchiveConfig,
+    dateStr: string
+  ): Promise<TableArchiveResult> {
     const [year, month, day] = dateStr.split("-");
 
-    console.log(`[R2Archiver] Starting archive for ${dateStr}`);
+    console.log(`[R2Archiver] Archiving ${config.table} for ${dateStr}`);
 
-    // Get distinct assets for this date
-    const assets = await this.getAssetsForDate(dateStr);
-    console.log(`[R2Archiver] Found ${assets.length} assets to archive`);
+    const partitions = await this.getPartitionsForDate(config, dateStr);
+    console.log(
+      `[R2Archiver] Found ${partitions.length} partitions for ${config.table}`
+    );
 
-    if (assets.length === 0) {
+    if (partitions.length === 0) {
       return {
+        table: config.table,
         date: dateStr,
-        assetsArchived: 0,
+        partitionsArchived: 0,
         bytesWritten: 0,
         filesCreated: [],
       };
@@ -57,38 +145,84 @@ export class R2Archiver {
     let totalBytes = 0;
     const filesCreated: string[] = [];
 
-    // Archive each asset separately for better queryability
-    for (const assetId of assets) {
-      const { bytes, key } = await this.archiveAsset(assetId, dateStr, year, month, day);
+    for (const partitionValue of partitions) {
+      const { bytes, key } = await this.archivePartition(
+        config,
+        partitionValue,
+        dateStr,
+        year,
+        month,
+        day
+      );
       totalBytes += bytes;
       if (key) filesCreated.push(key);
     }
 
-    console.log(`[R2Archiver] Completed: ${filesCreated.length} files, ${totalBytes} bytes`);
+    console.log(
+      `[R2Archiver] ${config.table}: ${filesCreated.length} files, ${totalBytes} bytes`
+    );
 
     return {
+      table: config.table,
       date: dateStr,
-      assetsArchived: assets.length,
+      partitionsArchived: partitions.length,
       bytesWritten: totalBytes,
       filesCreated,
     };
   }
 
-  private async getAssetsForDate(dateStr: string): Promise<string[]> {
+  /**
+   * Archive snapshots from a specific date (backwards compatibility)
+   * Only archives ob_snapshots table
+   */
+  async archiveDate(targetDate?: Date): Promise<ArchiveResult> {
+    const archiveDate =
+      targetDate ?? new Date(Date.now() - 89 * 24 * 60 * 60 * 1000);
+    const dateStr = archiveDate.toISOString().split("T")[0];
+
+    const config = ARCHIVE_CONFIGS.find((c) => c.table === "ob_snapshots");
+    if (!config) {
+      return {
+        date: dateStr,
+        assetsArchived: 0,
+        bytesWritten: 0,
+        filesCreated: [],
+      };
+    }
+
+    const result = await this.archiveTable(config, dateStr);
+
+    return {
+      date: result.date,
+      assetsArchived: result.partitionsArchived,
+      bytesWritten: result.bytesWritten,
+      filesCreated: result.filesCreated,
+    };
+  }
+
+  private async getPartitionsForDate(
+    config: TableArchiveConfig,
+    dateStr: string
+  ): Promise<string[]> {
     const query = `
-      SELECT DISTINCT asset_id
-      FROM polymarket.ob_snapshots
-      WHERE toDate(source_ts) = '${dateStr}'
+      SELECT DISTINCT ${config.partitionKey}
+      FROM polymarket.${config.table}
+      WHERE toDate(${config.dateColumn}) = '${dateStr}'
       FORMAT JSONEachRow
     `;
 
-    const response = await fetch(`${this.baseUrl}/?query=${encodeURIComponent(query)}`, {
-      method: "GET",
-      headers: this.headers,
-    });
+    const response = await fetch(
+      `${this.baseUrl}/?query=${encodeURIComponent(query)}`,
+      {
+        method: "GET",
+        headers: this.headers,
+      }
+    );
 
     if (!response.ok) {
-      console.error(`[R2Archiver] Failed to get assets: ${await response.text()}`);
+      console.error(
+        `[R2Archiver] Failed to get partitions for ${config.table}: ${await response.text()}`
+      );
       return [];
     }
 
@@ -98,52 +232,38 @@ export class R2Archiver {
     return text
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line).asset_id);
+      .map((line) => JSON.parse(line)[config.partitionKey]);
   }
 
-  private async archiveAsset(
-    assetId: string,
+  private async archivePartition(
+    config: TableArchiveConfig,
+    partitionValue: string,
     dateStr: string,
     year: string,
     month: string,
     day: string
   ): Promise<{ bytes: number; key: string | null }> {
-    // Query all snapshots for this asset on this date
+    const selectExpr = config.selectExpr ?? "*";
     const query = `
-      SELECT
-        asset_id,
-        condition_id,
-        source_ts,
-        ingestion_ts,
-        book_hash,
-        bid_prices,
-        bid_sizes,
-        ask_prices,
-        ask_sizes,
-        best_bid,
-        best_ask,
-        mid_price,
-        spread,
-        spread_bps,
-        tick_size,
-        is_resync,
-        sequence_number,
-        total_bid_depth,
-        total_ask_depth,
-        book_imbalance
-      FROM polymarket.ob_snapshots
-      WHERE asset_id = '${assetId}' AND toDate(source_ts) = '${dateStr}'
-      ORDER BY source_ts
+      SELECT ${selectExpr}
+      FROM polymarket.${config.table}
+      WHERE ${config.partitionKey} = '${partitionValue}' AND toDate(${config.dateColumn}) = '${dateStr}'
+      ORDER BY ${config.dateColumn}
       FORMAT JSONEachRow
     `;
 
-    const response = await fetch(`${this.baseUrl}/?query=${encodeURIComponent(query)}`, {
-      method: "GET",
-      headers: this.headers,
-    });
+    const response = await fetch(
+      `${this.baseUrl}/?query=${encodeURIComponent(query)}`,
+      {
+        method: "GET",
+        headers: this.headers,
+      }
+    );
 
     if (!response.ok) {
-      console.error(`[R2Archiver] Failed to fetch ${assetId}: ${await response.text()}`);
+      console.error(
+        `[R2Archiver] Failed to fetch ${config.table}/${partitionValue}: ${await response.text()}`
+      );
       return { bytes: 0, key: null };
     }
 
@@ -152,13 +272,11 @@ export class R2Archiver {
       return { bytes: 0, key: null };
     }
 
-    // Compress with gzip
     const encoder = new TextEncoder();
     const data = encoder.encode(ndjsonData);
     const compressed = await this.gzipCompress(data);
 
-    // Write to R2
-    const key = `archive/${year}/${month}/${day}/${assetId}.ndjson.gz`;
+    const key = `archive/${config.table}/${year}/${month}/${day}/${partitionValue}.ndjson.gz`;
 
     await this.env.ORDERBOOK_STORAGE.put(key, compressed, {
       httpMetadata: {
@@ -166,14 +284,18 @@ export class R2Archiver {
         contentEncoding: "gzip",
       },
       customMetadata: {
-        assetId,
+        table: config.table,
+        partitionKey: config.partitionKey,
+        partitionValue,
         date: dateStr,
         rowCount: String(ndjsonData.trim().split("\n").length),
         uncompressedSize: String(data.byteLength),
       },
     });
 
-    console.log(`[R2Archiver] Wrote ${key} (${compressed.byteLength} bytes compressed)`);
+    console.log(
+      `[R2Archiver] Wrote ${key} (${compressed.byteLength} bytes compressed)`
+    );
 
     return { bytes: compressed.byteLength, key };
   }
@@ -196,8 +318,10 @@ export class R2Archiver {
       chunks.push(value);
     }
 
-    // Combine chunks
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    const totalLength = chunks.reduce(
+      (sum, chunk) => sum + chunk.byteLength,
+      0
+    );
     const result = new Uint8Array(totalLength);
     let offset = 0;
     for (const chunk of chunks) {
@@ -209,7 +333,7 @@ export class R2Archiver {
   }
 
   /**
-   * List archived dates
+   * List archived files
    */
   async listArchives(prefix?: string): Promise<string[]> {
     const listed = await this.env.ORDERBOOK_STORAGE.list({
@@ -221,16 +345,19 @@ export class R2Archiver {
   }
 
   /**
-   * Read archived data for an asset on a specific date
+   * Read archived data for a partition on a specific date
    */
-  async readArchive(assetId: string, dateStr: string): Promise<string | null> {
+  async readArchive(
+    table: string,
+    partitionValue: string,
+    dateStr: string
+  ): Promise<string | null> {
     const [year, month, day] = dateStr.split("-");
-    const key = `archive/${year}/${month}/${day}/${assetId}.ndjson.gz`;
+    const key = `archive/${table}/${year}/${month}/${day}/${partitionValue}.ndjson.gz`;
 
     const object = await this.env.ORDERBOOK_STORAGE.get(key);
     if (!object) return null;
 
-    // Decompress
     const compressed = await object.arrayBuffer();
     const decompressed = await this.gzipDecompress(new Uint8Array(compressed));
 
@@ -245,7 +372,9 @@ export class R2Archiver {
       },
     });
 
-    const decompressedStream = stream.pipeThrough(new DecompressionStream("gzip"));
+    const decompressedStream = stream.pipeThrough(
+      new DecompressionStream("gzip")
+    );
     const reader = decompressedStream.getReader();
     const chunks: Uint8Array[] = [];
 
@@ -255,7 +384,10 @@ export class R2Archiver {
       chunks.push(value);
     }
 
-    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    const totalLength = chunks.reduce(
+      (sum, chunk) => sum + chunk.byteLength,
+      0
+    );
     const result = new Uint8Array(totalLength);
     let offset = 0;
     for (const chunk of chunks) {

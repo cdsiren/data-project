@@ -567,7 +567,7 @@ async function scheduledHandler(
   const archiver = new R2Archiver(env);
 
   try {
-    const result = await archiver.archiveDate();
+    const result = await archiver.archiveAll();
     console.log(`[Scheduled] Archive complete:`, result);
   } catch (error) {
     console.error(`[Scheduled] Archive failed:`, error);
