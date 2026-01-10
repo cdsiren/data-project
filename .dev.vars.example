@@ -1,0 +1,7 @@
+# Copy this file to .dev.vars and fill in your credentials
+# These are used by wrangler dev for local development
+
+CLICKHOUSE_URL=https://your-instance.clickhouse.cloud:8443
+CLICKHOUSE_USER=default
+CLICKHOUSE_TOKEN=your-clickhouse-password
+WEBHOOK_API_KEY=your-webhook-api-key

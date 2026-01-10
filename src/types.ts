@@ -1,3 +1,5 @@
+import type { GapBackfillJob, TradeTick } from "./types/orderbook";
+
 export interface Env {
   MARKET_CACHE: KVNamespace;
   ORDERBOOK_STORAGE: R2Bucket;
@@ -11,6 +13,11 @@ export interface Env {
   CLICKHOUSE_USER: string;
   CLICKHOUSE_TOKEN: string;
   WEBHOOK_API_KEY: string;
+  // New bindings for orderbook gap detection
+  HASH_CHAIN_CACHE: KVNamespace;
+  GAP_BACKFILL_QUEUE: Queue<GapBackfillJob>;
+  // Trade tick queue for execution-level data (backtesting)
+  TRADE_QUEUE: Queue<TradeTick>;
 }
 
 export interface GoldskyTradeEvent {
