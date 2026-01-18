@@ -4,12 +4,19 @@ import type {
   EnhancedOrderbookSnapshot,
   GapBackfillJob,
   TradeTick,
+  AggregatedSnapshot,
+  RealtimeTick,
 } from "./types/orderbook";
 import { OrderbookManager } from "./durable-objects/orderbook-manager";
+import { SnapshotAggregator } from "./durable-objects/snapshot-aggregator";
 import { metadataConsumer } from "./consumers/metadata-consumer";
 import { snapshotConsumer } from "./consumers/snapshot-consumer";
 import { gapBackfillConsumer } from "./consumers/gap-backfill-consumer";
 import { tradeTickConsumer } from "./consumers/trade-tick-consumer";
+import { aggregatedSnapshotConsumer } from "./consumers/aggregated-snapshot-consumer";
+import { realtimeTickConsumer } from "./consumers/realtime-tick-consumer";
+import { R2ArchivalService, type ArchivalJob } from "./services/r2-archival";
+import { DB_CONFIG } from "./config/database";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -248,7 +255,7 @@ app.get("/test/clickhouse", async (c) => {
     };
 
     const insertResponse = await fetch(
-      `${c.env.CLICKHOUSE_URL}/?query=INSERT INTO polymarket.ob_snapshots FORMAT JSONEachRow`,
+      `${c.env.CLICKHOUSE_URL}/?query=INSERT INTO ${DB_CONFIG.DATABASE}.ob_snapshots FORMAT JSONEachRow`,
       { method: "POST", headers, body: JSON.stringify(testRow) }
     );
 
@@ -269,7 +276,7 @@ app.get("/test/clickhouse", async (c) => {
 
     const readResponse = await fetch(
       `${c.env.CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        `SELECT * FROM polymarket.ob_snapshots WHERE asset_id = '${testId}' FORMAT JSON`
+        `SELECT * FROM ${DB_CONFIG.DATABASE}.ob_snapshots WHERE asset_id = '${testId}' FORMAT JSON`
       )}`,
       { method: "GET", headers }
     );
@@ -293,7 +300,7 @@ app.get("/test/clickhouse", async (c) => {
     // 4. Cleanup
     await fetch(
       `${c.env.CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        `ALTER TABLE polymarket.ob_snapshots DELETE WHERE asset_id = '${testId}'`
+        `ALTER TABLE ${DB_CONFIG.DATABASE}.ob_snapshots DELETE WHERE asset_id = '${testId}'`
       )}`,
       { method: "POST", headers }
     );
@@ -335,7 +342,7 @@ app.post("/admin/migrate", async (c) => {
 
   const statements = [
     // ob_snapshots table
-    `CREATE TABLE IF NOT EXISTS polymarket.ob_snapshots (
+    `CREATE TABLE IF NOT EXISTS ${DB_CONFIG.DATABASE}.ob_snapshots (
       asset_id String,
       condition_id String,
       source_ts DateTime64(3, 'UTC'),
@@ -361,7 +368,7 @@ app.post("/admin/migrate", async (c) => {
     ) ENGINE = MergeTree() PARTITION BY toYYYYMM(source_ts) ORDER BY (asset_id, source_ts, ingestion_ts) SETTINGS index_granularity = 8192`,
 
     // ob_gap_events table
-    `CREATE TABLE IF NOT EXISTS polymarket.ob_gap_events (
+    `CREATE TABLE IF NOT EXISTS ${DB_CONFIG.DATABASE}.ob_gap_events (
       asset_id String,
       detected_at DateTime64(3, 'UTC'),
       last_known_hash String,
@@ -373,7 +380,7 @@ app.post("/admin/migrate", async (c) => {
     ) ENGINE = MergeTree() PARTITION BY toYYYYMM(detected_at) ORDER BY (asset_id, detected_at)`,
 
     // ob_latency table
-    `CREATE TABLE IF NOT EXISTS polymarket.ob_latency (
+    `CREATE TABLE IF NOT EXISTS ${DB_CONFIG.DATABASE}.ob_latency (
       asset_id String,
       source_ts DateTime64(3, 'UTC'),
       ingestion_ts DateTime64(6, 'UTC'),
@@ -382,7 +389,7 @@ app.post("/admin/migrate", async (c) => {
     ) ENGINE = MergeTree() PARTITION BY toYYYYMMDD(source_ts) ORDER BY (source_ts, asset_id)`,
 
     // trade_ticks table for execution-level data (critical for backtesting)
-    `CREATE TABLE IF NOT EXISTS polymarket.trade_ticks (
+    `CREATE TABLE IF NOT EXISTS ${DB_CONFIG.DATABASE}.trade_ticks (
       asset_id String,
       condition_id String,
       trade_id String,
@@ -455,8 +462,73 @@ app.get("/test/all", async (c) => {
   });
 });
 
-// Export Durable Object
+// ============================================================
+// Admin Endpoints - Archival Management
+// ============================================================
+
+app.get("/admin/archive/status", async (c) => {
+  const apiKey = c.req.header("X-API-Key");
+  if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const archival = new R2ArchivalService(c.env);
+    const partitions = await archival.listArchivedPartitions();
+    return c.json({
+      status: "ok",
+      archived_partitions: partitions,
+      total_partitions: partitions.length,
+    });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.post("/admin/archive/trigger", async (c) => {
+  const apiKey = c.req.header("X-API-Key");
+  if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const archival = new R2ArchivalService(c.env);
+    const results = await archival.runScheduledArchival();
+    return c.json({
+      status: "ok",
+      results,
+      partitions_archived: results.length,
+    });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+app.get("/admin/aggregator/status", async (c) => {
+  const apiKey = c.req.header("X-API-Key");
+  if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const assetId = c.req.query("asset_id");
+  if (!assetId) {
+    return c.json({ error: "asset_id query param required" }, 400);
+  }
+
+  try {
+    const id = c.env.SNAPSHOT_AGGREGATOR.idFromName(assetId);
+    const stub = c.env.SNAPSHOT_AGGREGATOR.get(id);
+    const response = await stub.fetch(new Request("http://internal/status"));
+    const data = await response.json();
+    return c.json({ status: "ok", aggregator: data });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+// Export Durable Objects
 export { OrderbookManager };
+export { SnapshotAggregator };
 
 async function queueHandler(batch: MessageBatch, env: Env) {
   const queueName = batch.queue;
@@ -477,10 +549,42 @@ async function queueHandler(batch: MessageBatch, env: Env) {
     case "trade-tick-queue":
       await tradeTickConsumer(batch as MessageBatch<TradeTick>, env);
       break;
+    case "aggregated-snapshot-queue":
+      await aggregatedSnapshotConsumer(
+        batch as MessageBatch<AggregatedSnapshot[]>,
+        env
+      );
+      break;
+    case "realtime-tick-queue":
+      await realtimeTickConsumer(batch as MessageBatch<RealtimeTick>, env);
+      break;
+    case "archival-queue":
+      const archival = new R2ArchivalService(env);
+      for (const msg of batch.messages) {
+        try {
+          await archival.archivePartition(msg.body as ArchivalJob);
+          msg.ack();
+        } catch (error) {
+          console.error("[Archival] Job failed:", error);
+          msg.retry();
+        }
+      }
+      break;
   }
+}
+
+async function scheduledHandler(
+  event: ScheduledEvent,
+  env: Env,
+  ctx: ExecutionContext
+) {
+  console.log("[Scheduled] Running daily archival job at", new Date().toISOString());
+  const archival = new R2ArchivalService(env);
+  ctx.waitUntil(archival.runScheduledArchival());
 }
 
 export default {
   fetch: app.fetch,
   queue: queueHandler,
+  scheduled: scheduledHandler,
 };

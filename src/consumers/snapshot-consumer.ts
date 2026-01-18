@@ -1,5 +1,5 @@
 // src/consumers/snapshot-consumer.ts
-// Enhanced with hash chain validation for gap detection - critical for reliable historical data
+// Enhanced with hash chain validation and optional aggregation routing
 
 import type { Env } from "../types";
 import type { EnhancedOrderbookSnapshot } from "../types/orderbook";
@@ -13,6 +13,7 @@ interface ValidationStats {
   gaps: number;
   first: number;
   resyncs: number;
+  validation_errors: number;
 }
 
 export async function snapshotConsumer(
@@ -21,6 +22,7 @@ export async function snapshotConsumer(
 ): Promise<void> {
   const clickhouse = new ClickHouseOrderbookClient(env);
   const hashChain = new HashChainValidator(env.HASH_CHAIN_CACHE, env.GAP_BACKFILL_QUEUE);
+  const useAggregation = env.AGGREGATE_SNAPSHOTS === "true";
 
   const validSnapshots: EnhancedOrderbookSnapshot[] = [];
   const stats: ValidationStats = {
@@ -30,6 +32,7 @@ export async function snapshotConsumer(
     gaps: 0,
     first: 0,
     resyncs: 0,
+    validation_errors: 0,
   };
 
   // Process each snapshot with hash chain validation
@@ -37,7 +40,6 @@ export async function snapshotConsumer(
     const snapshot = message.body;
 
     // Resync snapshots (from gap backfill) bypass hash chain validation
-    // but still get inserted to fill the gap
     if (snapshot.is_resync) {
       stats.resyncs++;
       validSnapshots.push(snapshot);
@@ -46,7 +48,6 @@ export async function snapshotConsumer(
     }
 
     try {
-      // Validate against hash chain
       const validation = await hashChain.validateAndUpdate(
         snapshot.asset_id,
         snapshot.book_hash,
@@ -54,7 +55,6 @@ export async function snapshotConsumer(
       );
 
       if (validation.isDuplicate) {
-        // Skip duplicate - already processed
         stats.duplicates++;
         message.ack();
         continue;
@@ -62,8 +62,6 @@ export async function snapshotConsumer(
 
       if (validation.gapDetected) {
         stats.gaps++;
-        // Gap backfill job already queued by validator
-        // Record gap event for monitoring with full context
         await clickhouse.recordGapEvent(
           snapshot.asset_id,
           validation.previousHash || "UNKNOWN",
@@ -81,46 +79,104 @@ export async function snapshotConsumer(
         stats.first++;
       }
 
-      // Valid snapshot - add to batch
       stats.valid++;
       validSnapshots.push(snapshot);
       message.ack();
     } catch (error) {
+      // Validation errors are likely permanent (bad data format), so ack to avoid infinite retries
+      // but do NOT push to validSnapshots - this prevents bad data from entering the system
       console.error(`[Snapshot] Validation error for ${snapshot.asset_id}:`, error);
-      // On validation error, still insert but don't update hash chain
-      validSnapshots.push(snapshot);
+      stats.validation_errors++;
       message.ack();
     }
   }
 
-  // Batch insert valid snapshots to ClickHouse
-  if (validSnapshots.length > 0) {
-    try {
-      await clickhouse.insertSnapshots(validSnapshots);
-      console.log(
-        `[Snapshot] Inserted ${validSnapshots.length}/${stats.total} ` +
-        `(valid=${stats.valid}, dup=${stats.duplicates}, gaps=${stats.gaps}, ` +
-        `first=${stats.first}, resync=${stats.resyncs})`
-      );
-
-      // Record latency metrics (fire-and-forget, don't block main flow)
-      Promise.all(
-        validSnapshots.map((snapshot) =>
-          clickhouse.recordLatency(
-            snapshot.asset_id,
-            snapshot.source_ts,
-            snapshot.ingestion_ts,
-            snapshot.is_resync ? "resync" : "snapshot"
-          )
-        )
-      ).catch((err) => console.error("[Snapshot] Latency recording failed:", err));
-    } catch (error) {
-      console.error("[Snapshot] ClickHouse insert failed:", error);
-      // Don't retry acked messages - they'll be lost
-      // This is a trade-off: we prioritize not double-processing over guaranteed delivery
-      // The gap detection will catch any missing data
+  if (validSnapshots.length === 0) {
+    if (stats.duplicates > 0) {
+      console.log(`[Snapshot] Skipped ${stats.duplicates} duplicates`);
     }
-  } else if (stats.duplicates > 0) {
-    console.log(`[Snapshot] Skipped ${stats.duplicates} duplicates`);
+    return;
+  }
+
+  // Route to aggregator or direct insert based on config
+  if (useAggregation) {
+    await routeToAggregator(validSnapshots, env, stats);
+  } else {
+    await insertDirectToClickHouse(validSnapshots, clickhouse, stats);
+  }
+}
+
+async function routeToAggregator(
+  snapshots: EnhancedOrderbookSnapshot[],
+  env: Env,
+  stats: ValidationStats
+): Promise<void> {
+  // Group snapshots by asset for routing to per-asset aggregator DOs
+  const snapshotsByAsset = new Map<string, EnhancedOrderbookSnapshot[]>();
+
+  for (const snapshot of snapshots) {
+    const assetId = snapshot.asset_id;
+    const existing = snapshotsByAsset.get(assetId) || [];
+    existing.push(snapshot);
+    snapshotsByAsset.set(assetId, existing);
+  }
+
+  const errors: string[] = [];
+
+  for (const [assetId, assetSnapshots] of snapshotsByAsset) {
+    try {
+      const id = env.SNAPSHOT_AGGREGATOR.idFromName(assetId);
+      const stub = env.SNAPSHOT_AGGREGATOR.get(id);
+
+      const response = await stub.fetch(new Request("http://internal/ingest", {
+        method: "POST",
+        body: JSON.stringify(assetSnapshots),
+        headers: { "Content-Type": "application/json" },
+      }));
+
+      if (!response.ok) {
+        errors.push(`${assetId}: ${await response.text()}`);
+      }
+    } catch (error) {
+      errors.push(`${assetId}: ${String(error)}`);
+    }
+  }
+
+  if (errors.length > 0) {
+    console.error(`[Snapshot] Aggregator routing errors: ${errors.join(", ")}`);
+  }
+
+  console.log(
+    `[Snapshot] Routed ${snapshots.length}/${stats.total} to aggregator ` +
+    `(${snapshotsByAsset.size} assets, dup=${stats.duplicates}, gaps=${stats.gaps})`
+  );
+}
+
+async function insertDirectToClickHouse(
+  snapshots: EnhancedOrderbookSnapshot[],
+  clickhouse: ClickHouseOrderbookClient,
+  stats: ValidationStats
+): Promise<void> {
+  try {
+    await clickhouse.insertSnapshots(snapshots);
+    console.log(
+      `[Snapshot] Inserted ${snapshots.length}/${stats.total} ` +
+      `(valid=${stats.valid}, dup=${stats.duplicates}, gaps=${stats.gaps}, ` +
+      `first=${stats.first}, resync=${stats.resyncs})`
+    );
+
+    // Record latency metrics (fire-and-forget)
+    Promise.all(
+      snapshots.map((snapshot) =>
+        clickhouse.recordLatency(
+          snapshot.asset_id,
+          snapshot.source_ts,
+          snapshot.ingestion_ts,
+          snapshot.is_resync ? "resync" : "snapshot"
+        )
+      )
+    ).catch((err) => console.error("[Snapshot] Latency recording failed:", err));
+  } catch (error) {
+    console.error("[Snapshot] ClickHouse insert failed:", error);
   }
 }

@@ -3,6 +3,8 @@
 
 import type { Env } from "../types";
 import type { TradeTick } from "../types/orderbook";
+import { toClickHouseDateTime64, toClickHouseDateTime64Micro } from "../utils/datetime";
+import { DB_CONFIG } from "../config/database";
 
 export async function tradeTickConsumer(
   batch: MessageBatch<TradeTick>,
@@ -21,14 +23,8 @@ export async function tradeTickConsumer(
       price: t.price,
       size: t.size,
       side: t.side,
-      source_ts: new Date(t.source_ts)
-        .toISOString()
-        .replace("T", " ")
-        .slice(0, -1),
-      ingestion_ts: new Date(t.ingestion_ts / 1000)
-        .toISOString()
-        .replace("T", " ")
-        .slice(0, -1),
+      source_ts: toClickHouseDateTime64(t.source_ts),
+      ingestion_ts: toClickHouseDateTime64Micro(t.ingestion_ts),
     };
   });
 
@@ -36,7 +32,7 @@ export async function tradeTickConsumer(
 
   try {
     const response = await fetch(
-      `${env.CLICKHOUSE_URL}/?query=INSERT INTO polymarket.trade_ticks FORMAT JSONEachRow`,
+      `${env.CLICKHOUSE_URL}/?query=INSERT INTO ${DB_CONFIG.DATABASE}.trade_ticks FORMAT JSONEachRow`,
       {
         method: "POST",
         headers: {

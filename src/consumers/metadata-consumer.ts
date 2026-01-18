@@ -5,6 +5,7 @@ import {
   MarketMetadataRecord,
   MarketEventRecord,
 } from "../types";
+import { DB_CONFIG } from "../config/database";
 
 export async function metadataConsumer(
   batch: MessageBatch<MetadataFetchJob>,
@@ -180,20 +181,20 @@ async function insertMarketsIntoClickHouse(
 async function insertIntoClickHouse(
   env: Env,
   table: string,
-  records: any[],
+  records: unknown[],
   columns: string[]
 ): Promise<void> {
   // Build INSERT query with database name
   const columnsList = columns.join(", ");
 
   // Using JSONEachRow format for bulk insert
-  const query = `INSERT INTO polymarket.${table} (${columnsList}) FORMAT JSONEachRow`;
+  const query = `INSERT INTO ${DB_CONFIG.DATABASE}.${table} (${columnsList}) FORMAT JSONEachRow`;
 
   // Convert records to NDJSON (newline-delimited JSON)
   const body = records.map((record) => JSON.stringify(record)).join("\n");
 
   // Append query parameter to URL and specify database
-  const url = `${env.CLICKHOUSE_URL}?database=polymarket&query=${encodeURIComponent(query)}`;
+  const url = `${env.CLICKHOUSE_URL}?database=${DB_CONFIG.DATABASE}&query=${encodeURIComponent(query)}`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -212,5 +213,5 @@ async function insertIntoClickHouse(
     );
   }
 
-  console.log(`Successfully inserted ${records.length} records into polymarket.${table}`);
+  console.log(`Successfully inserted ${records.length} records into ${DB_CONFIG.DATABASE}.${table}`);
 }

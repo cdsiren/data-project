@@ -8,7 +8,10 @@ enabled = true
 head_sampling_rate = 1
 invocation_logs = true
 
-# Queues
+# ============================================================
+# QUEUES - Optimized batch settings for 10x cost reduction
+# ============================================================
+
 [[queues.producers]]
 queue = "metadata-fetch-queue"
 binding = "METADATA_QUEUE"
@@ -19,13 +22,14 @@ binding = "SNAPSHOT_QUEUE"
 
 [[queues.consumers]]
 queue = "metadata-fetch-queue"
-max_batch_size = 10
-max_batch_timeout = 5
+max_batch_size = 50
+max_batch_timeout = 10
 
 [[queues.consumers]]
 queue = "orderbook-snapshot-queue"
-max_batch_size = 50
-max_batch_timeout = 10
+max_batch_size = 100
+max_batch_timeout = 30
+max_retries = 2
 
 # Gap backfill queue for recovery
 [[queues.producers]]
@@ -34,9 +38,9 @@ binding = "GAP_BACKFILL_QUEUE"
 
 [[queues.consumers]]
 queue = "gap-backfill-queue"
-max_batch_size = 5
-max_batch_timeout = 30
-max_retries = 3
+max_batch_size = 10
+max_batch_timeout = 60
+max_retries = 2
 
 # Trade tick queue for execution-level data (backtesting)
 [[queues.producers]]
@@ -46,36 +50,101 @@ binding = "TRADE_QUEUE"
 [[queues.consumers]]
 queue = "trade-tick-queue"
 max_batch_size = 100
-max_batch_timeout = 5
+max_batch_timeout = 30
+max_retries = 2
 
-# Durable Objects
+# Aggregated snapshot queue (from SnapshotAggregator DO)
+[[queues.producers]]
+queue = "aggregated-snapshot-queue"
+binding = "AGGREGATED_SNAPSHOT_QUEUE"
+
+[[queues.consumers]]
+queue = "aggregated-snapshot-queue"
+max_batch_size = 100
+max_batch_timeout = 60
+max_retries = 2
+
+# Realtime tick queue (for triggers with 24h TTL)
+[[queues.producers]]
+queue = "realtime-tick-queue"
+binding = "REALTIME_TICK_QUEUE"
+
+[[queues.consumers]]
+queue = "realtime-tick-queue"
+max_batch_size = 100
+max_batch_timeout = 10
+max_retries = 2
+
+# Archival queue for R2 cold storage
+[[queues.producers]]
+queue = "archival-queue"
+binding = "ARCHIVAL_QUEUE"
+
+[[queues.consumers]]
+queue = "archival-queue"
+max_batch_size = 1
+max_batch_timeout = 60
+max_retries = 3
+
+# ============================================================
+# DURABLE OBJECTS
+# ============================================================
+
 [durable_objects]
 bindings = [
-  { name = "ORDERBOOK_MANAGER", class_name = "OrderbookManager" }
+  { name = "ORDERBOOK_MANAGER", class_name = "OrderbookManager" },
+  { name = "SNAPSHOT_AGGREGATOR", class_name = "SnapshotAggregator" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["OrderbookManager"]
 
-# KV Namespaces
+[[migrations]]
+tag = "v2"
+new_classes = ["SnapshotAggregator"]
+
+# ============================================================
+# KV NAMESPACES
+# ============================================================
+
 [[kv_namespaces]]
 binding = "MARKET_CACHE"
 id = "9377c262330f4d80b9fb6841d6b8cf19"
 
-# Hash chain cache for gap detection (create with: wrangler kv:namespace create HASH_CHAIN_CACHE)
 [[kv_namespaces]]
 binding = "HASH_CHAIN_CACHE"
 id = "2d5f178dcab04f4697eb6f6a9a0946a5"
 
-# Environment variables
+# ============================================================
+# R2 STORAGE - Cold storage for historical data
+# Create with: wrangler r2 bucket create polymarket-archive
+# ============================================================
+
+[[r2_buckets]]
+binding = "ARCHIVE_BUCKET"
+bucket_name = "polymarket-archive"
+
+# ============================================================
+# SCHEDULED TRIGGERS - Daily archival at 3 AM UTC
+# ============================================================
+
+[triggers]
+crons = ["0 3 * * *"]
+
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
+
 [vars]
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 SNAPSHOT_INTERVAL_MS = "60000"
+ARCHIVE_RETENTION_DAYS = "180"
+AGGREGATE_SNAPSHOTS = "true"
 
 # Secrets (set with: wrangler secret put SECRET_NAME)
-# CLICKHOUSE_URL - Full URL to ClickHouse HTTP interface (e.g., https://your-instance.clickhouse.cloud:8443)
-# CLICKHOUSE_USER - ClickHouse username (e.g., default)
+# CLICKHOUSE_URL - Full URL to ClickHouse HTTP interface
+# CLICKHOUSE_USER - ClickHouse username
 # CLICKHOUSE_TOKEN - ClickHouse password/API key
 # WEBHOOK_API_KEY - API key for Goldsky webhook authentication

@@ -1,10 +1,39 @@
-import type { GapBackfillJob, TradeTick } from "./types/orderbook";
+import type {
+  GapBackfillJob,
+  TradeTick,
+  AggregatedSnapshot,
+  RealtimeTick,
+  EnhancedOrderbookSnapshot,
+} from "./types/orderbook";
+import type { ArchivalJob } from "./services/r2-archival";
+
+// Queue message type aliases for type safety
+export type MetadataQueueMessage = MetadataFetchJob;
+export type SnapshotQueueMessage = EnhancedOrderbookSnapshot;
+export type RealtimeTickQueueMessage = RealtimeTick;
 
 export interface Env {
+  // KV Namespaces
   MARKET_CACHE: KVNamespace;
-  METADATA_QUEUE: Queue;
-  SNAPSHOT_QUEUE: Queue;
+  HASH_CHAIN_CACHE: KVNamespace;
+
+  // Queues with explicit types
+  METADATA_QUEUE: Queue<MetadataQueueMessage>;
+  SNAPSHOT_QUEUE: Queue<SnapshotQueueMessage>;
+  GAP_BACKFILL_QUEUE: Queue<GapBackfillJob>;
+  TRADE_QUEUE: Queue<TradeTick>;
+  AGGREGATED_SNAPSHOT_QUEUE: Queue<AggregatedSnapshot[]>;
+  REALTIME_TICK_QUEUE: Queue<RealtimeTickQueueMessage>;
+  ARCHIVAL_QUEUE: Queue<ArchivalJob>;
+
+  // Durable Objects
   ORDERBOOK_MANAGER: DurableObjectNamespace;
+  SNAPSHOT_AGGREGATOR: DurableObjectNamespace;
+
+  // R2 Storage
+  ARCHIVE_BUCKET: R2Bucket;
+
+  // Environment Variables
   GAMMA_API_URL: string;
   CLOB_WSS_URL: string;
   SNAPSHOT_INTERVAL_MS: string;
@@ -12,11 +41,8 @@ export interface Env {
   CLICKHOUSE_USER: string;
   CLICKHOUSE_TOKEN: string;
   WEBHOOK_API_KEY: string;
-  // New bindings for orderbook gap detection
-  HASH_CHAIN_CACHE: KVNamespace;
-  GAP_BACKFILL_QUEUE: Queue<GapBackfillJob>;
-  // Trade tick queue for execution-level data (backtesting)
-  TRADE_QUEUE: Queue<TradeTick>;
+  ARCHIVE_RETENTION_DAYS: string;
+  AGGREGATE_SNAPSHOTS: string;
 }
 
 export interface GoldskyTradeEvent {
@@ -35,22 +61,6 @@ export interface GoldskyTradeEvent {
   _gs_chain: string;
   _gs_gid: string;
   is_deleted: number;
-}
-
-export interface OrderbookLevel {
-  price: string;
-  size: string;
-}
-
-export interface OrderbookSnapshot {
-  condition_id: string;
-  token_id: string;
-  timestamp: number;
-  bids: OrderbookLevel[];
-  asks: OrderbookLevel[];
-  best_bid: string | null;
-  best_ask: string | null;
-  spread: number | null;
 }
 
 export interface MetadataFetchJob {
