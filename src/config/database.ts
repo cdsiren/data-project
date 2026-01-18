@@ -2,7 +2,7 @@
 // Centralized database configuration
 
 export const DB_CONFIG = {
-  DATABASE: "polymarket_optimized",
+  DATABASE: "polymarket",
   TABLES: {
     // Buffer tables (write to these)
     ORDER_FILLED_BUFFER: "order_filled_buffer",
