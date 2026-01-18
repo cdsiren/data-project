@@ -1,32 +1,59 @@
-import { Hono } from "hono";
-import { Env, GoldskyTradeEvent, MetadataFetchJob } from "./types";
+import { Hono, Context, Next } from "hono";
+import { Env, GoldskyTradeEvent } from "./types";
 import type {
-  EnhancedOrderbookSnapshot,
+  BBOSnapshot,
   GapBackfillJob,
   TradeTick,
-  AggregatedSnapshot,
-  RealtimeTick,
+  OrderbookLevelChange,
+  FullL2Snapshot,
 } from "./types/orderbook";
 import { OrderbookManager } from "./durable-objects/orderbook-manager";
-import { SnapshotAggregator } from "./durable-objects/snapshot-aggregator";
-import { metadataConsumer } from "./consumers/metadata-consumer";
 import { snapshotConsumer } from "./consumers/snapshot-consumer";
 import { gapBackfillConsumer } from "./consumers/gap-backfill-consumer";
 import { tradeTickConsumer } from "./consumers/trade-tick-consumer";
-import { aggregatedSnapshotConsumer } from "./consumers/aggregated-snapshot-consumer";
-import { realtimeTickConsumer } from "./consumers/realtime-tick-consumer";
-import { R2ArchivalService, type ArchivalJob } from "./services/r2-archival";
+import { levelChangeConsumer } from "./consumers/level-change-consumer";
+import { fullL2SnapshotConsumer } from "./consumers/full-l2-snapshot-consumer";
+import { MarketLifecycleService, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { DB_CONFIG } from "./config/database";
 
-const app = new Hono<{ Bindings: Env }>();
+/**
+ * Load lifecycle webhooks from KV storage (parallel)
+ */
+async function loadLifecycleWebhooks(env: Env): Promise<MarketLifecycleWebhook[]> {
+  const list = await env.MARKET_CACHE.list({ prefix: "lifecycle_webhook_" });
 
-app.post("/webhook/goldsky", async (c) => {
-  // Verify API key
+  const results = await Promise.all(
+    list.keys.map(async (key) => {
+      const data = await env.MARKET_CACHE.get(key.name);
+      if (!data) return null;
+      try {
+        return JSON.parse(data) as MarketLifecycleWebhook;
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  return results.filter((w): w is MarketLifecycleWebhook => w !== null);
+}
+
+/**
+ * Auth middleware for API endpoints
+ */
+const authMiddleware = async (
+  c: Context<{ Bindings: Env }>,
+  next: Next
+): Promise<Response | void> => {
   const apiKey = c.req.header("X-API-Key");
   if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
     return c.json({ error: "Unauthorized" }, 401);
   }
+  await next();
+};
 
+const app = new Hono<{ Bindings: Env }>();
+
+app.post("/webhook/goldsky", authMiddleware, async (c) => {
   const body = await c.req.json();
 
   // Handle both single event and array of events
@@ -34,8 +61,8 @@ app.post("/webhook/goldsky", async (c) => {
 
   console.log(`Received ${events.length} events from Goldsky`);
 
-  const queuedJobs: string[] = [];
   const subscribedAssets: string[] = [];
+  let cacheHits = 0;
 
   for (const event of events) {
     // Extract active asset ID (the one that's not "0")
@@ -51,27 +78,26 @@ app.post("/webhook/goldsky", async (c) => {
     let conditionId = activeAssetId; // Default to asset ID
     let tickSize = 0.01;
     let marketEnded = false;
+    let negRisk = false;
+    let orderMinSize = 0;
 
     if (cached) {
       try {
         const metadata = JSON.parse(cached);
         conditionId = metadata.condition_id || activeAssetId;
         tickSize = metadata.order_price_min_tick_size || 0.01;
+        negRisk = metadata.neg_risk === 1 || metadata.neg_risk === true;
+        orderMinSize = metadata.order_min_size || 0;
         // Check if market has ended
         if (metadata.end_date) {
           marketEnded = new Date(metadata.end_date) < new Date();
         }
+        cacheHits++;
       } catch {
         // Use defaults if parse fails
       }
-    } else {
-      // Queue metadata fetch on cache miss
-      const job: MetadataFetchJob = {
-        clob_token_id: activeAssetId,
-      };
-      c.executionCtx.waitUntil(c.env.METADATA_QUEUE.send(job));
-      queuedJobs.push(activeAssetId);
     }
+    // On cache miss, use defaults - metadata will be synced by 5-minute cron
 
     // Subscribe to orderbook WebSocket if market hasn't ended
     if (!marketEnded) {
@@ -84,6 +110,8 @@ app.post("/webhook/goldsky", async (c) => {
             condition_id: conditionId,
             token_ids: [activeAssetId],
             tick_size: tickSize,
+            neg_risk: negRisk,
+            order_min_size: orderMinSize,
           }),
         })
       );
@@ -94,14 +122,85 @@ app.post("/webhook/goldsky", async (c) => {
   return c.json({
     status: "ok",
     events_received: events.length,
-    jobs_queued: queuedJobs.length,
     subscriptions_triggered: subscribedAssets.length,
-    cached: events.length - queuedJobs.length,
+    cache_hits: cacheHits,
   });
 });
 
 app.get("/health", (c) => {
   return c.json({ status: "ok" });
+});
+
+// ============================================================
+// Low-Latency Trigger Management API
+// ============================================================
+
+async function proxyToDO(
+  c: Context<{ Bindings: Env }>,
+  endpoint: string,
+  method: string = "GET"
+): Promise<Response> {
+  const conditionId = c.req.param("condition_id");
+  const doId = c.env.ORDERBOOK_MANAGER.idFromName(conditionId);
+  const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+
+  const body = method !== "GET" ? await c.req.text() : undefined;
+  const response = await stub.fetch(`http://do${endpoint}`, {
+    method: method === "DELETE" ? "POST" : method,
+    headers: method !== "GET" ? { "Content-Type": "application/json" } : undefined,
+    body,
+  });
+
+  return new Response(response.body, {
+    status: response.status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+app.get("/triggers/:condition_id", authMiddleware, (c) => proxyToDO(c, "/triggers"));
+app.post("/triggers/:condition_id", authMiddleware, (c) => proxyToDO(c, "/triggers", "POST"));
+app.delete("/triggers/:condition_id", authMiddleware, (c) => proxyToDO(c, "/triggers/delete", "DELETE"));
+
+// ============================================================
+// Market Lifecycle Webhooks (Resolution & New Markets)
+// ============================================================
+
+app.post("/lifecycle/webhooks", authMiddleware, async (c) => {
+  const webhook = (await c.req.json()) as MarketLifecycleWebhook;
+
+  if (!webhook.url || !webhook.event_types || webhook.event_types.length === 0) {
+    return c.json({ error: "Missing required fields: url, event_types" }, 400);
+  }
+
+  // Validate event types
+  const validTypes = ["MARKET_RESOLVED", "NEW_MARKET"];
+  for (const t of webhook.event_types) {
+    if (!validTypes.includes(t)) {
+      return c.json({ error: `Invalid event_type: ${t}` }, 400);
+    }
+  }
+
+  // Store in KV for persistence
+  const webhookId = `lifecycle_webhook_${Date.now()}`;
+  await c.env.MARKET_CACHE.put(webhookId, JSON.stringify(webhook), { expirationTtl: 86400 * 30 });
+
+  return c.json({ status: "registered", webhook_id: webhookId, event_types: webhook.event_types });
+});
+
+app.get("/lifecycle/webhooks", authMiddleware, async (c) => {
+  const webhooks = await loadLifecycleWebhooks(c.env);
+  return c.json({ webhooks, count: webhooks.length });
+});
+
+app.post("/lifecycle/check", authMiddleware, async (c) => {
+  const lifecycle = new MarketLifecycleService(c.env);
+  const webhooks = await loadLifecycleWebhooks(c.env);
+  for (const wh of webhooks) {
+    lifecycle.registerWebhook(wh);
+  }
+
+  const results = await lifecycle.runCheck();
+  return c.json({ status: "ok", ...results });
 });
 
 // ============================================================
@@ -297,10 +396,10 @@ app.get("/test/clickhouse", async (c) => {
       data: Array<Record<string, unknown>>;
     };
 
-    // 4. Cleanup
+    // 4. Cleanup (using lightweight delete instead of mutation for better performance)
     await fetch(
       `${c.env.CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        `ALTER TABLE ${DB_CONFIG.DATABASE}.ob_snapshots DELETE WHERE asset_id = '${testId}'`
+        `DELETE FROM ${DB_CONFIG.DATABASE}.ob_snapshots WHERE asset_id = '${testId}'`
       )}`,
       { method: "POST", headers }
     );
@@ -328,12 +427,7 @@ app.get("/test/clickhouse", async (c) => {
   }
 });
 
-app.post("/admin/migrate", async (c) => {
-  const apiKey = c.req.header("X-API-Key");
-  if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
+app.post("/admin/migrate", authMiddleware, async (c) => {
   const headers = {
     "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
     "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
@@ -341,25 +435,27 @@ app.post("/admin/migrate", async (c) => {
   };
 
   const statements = [
-    // ob_snapshots table
+    // ob_snapshots table (uses Decimal128 for price precision)
     `CREATE TABLE IF NOT EXISTS ${DB_CONFIG.DATABASE}.ob_snapshots (
       asset_id String,
       condition_id String,
       source_ts DateTime64(3, 'UTC'),
       ingestion_ts DateTime64(6, 'UTC'),
       book_hash String,
-      bid_prices Array(Float64),
+      bid_prices Array(Decimal128(18)),
       bid_sizes Array(Float64),
-      ask_prices Array(Float64),
+      ask_prices Array(Decimal128(18)),
       ask_sizes Array(Float64),
-      tick_size Float64,
+      tick_size Decimal128(18),
       is_resync UInt8 DEFAULT 0,
       sequence_number UInt64,
-      best_bid Float64 MATERIALIZED if(length(bid_prices) > 0, bid_prices[1], 0),
-      best_ask Float64 MATERIALIZED if(length(ask_prices) > 0, ask_prices[1], 0),
-      mid_price Float64 MATERIALIZED if(length(bid_prices) > 0 AND length(ask_prices) > 0, (bid_prices[1] + ask_prices[1]) / 2, 0),
-      spread Float64 MATERIALIZED if(length(ask_prices) > 0 AND length(bid_prices) > 0, ask_prices[1] - bid_prices[1], 0),
-      spread_bps Float64 MATERIALIZED if(length(bid_prices) > 0 AND length(ask_prices) > 0 AND (bid_prices[1] + ask_prices[1]) > 0, ((ask_prices[1] - bid_prices[1]) / ((bid_prices[1] + ask_prices[1]) / 2)) * 10000, 0),
+      neg_risk UInt8 DEFAULT 0,
+      order_min_size Float64 DEFAULT 0,
+      best_bid Decimal128(18) MATERIALIZED if(length(bid_prices) > 0, bid_prices[1], toDecimal128(0, 18)),
+      best_ask Decimal128(18) MATERIALIZED if(length(ask_prices) > 0, ask_prices[1], toDecimal128(0, 18)),
+      mid_price Decimal128(18) MATERIALIZED if(length(bid_prices) > 0 AND length(ask_prices) > 0, (bid_prices[1] + ask_prices[1]) / 2, toDecimal128(0, 18)),
+      spread Decimal128(18) MATERIALIZED if(length(ask_prices) > 0 AND length(bid_prices) > 0, ask_prices[1] - bid_prices[1], toDecimal128(0, 18)),
+      spread_bps Float64 MATERIALIZED if(length(bid_prices) > 0 AND length(ask_prices) > 0 AND (bid_prices[1] + ask_prices[1]) > toDecimal128(0, 18), toFloat64((ask_prices[1] - bid_prices[1]) / ((bid_prices[1] + ask_prices[1]) / 2)) * 10000, 0),
       total_bid_depth Float64 MATERIALIZED arraySum(bid_sizes),
       total_ask_depth Float64 MATERIALIZED arraySum(ask_sizes),
       bid_levels UInt16 MATERIALIZED toUInt16(length(bid_prices)),
@@ -389,17 +485,18 @@ app.post("/admin/migrate", async (c) => {
     ) ENGINE = MergeTree() PARTITION BY toYYYYMMDD(source_ts) ORDER BY (source_ts, asset_id)`,
 
     // trade_ticks table for execution-level data (critical for backtesting)
+    // Uses Decimal128(18) for price to avoid floating-point precision errors
     `CREATE TABLE IF NOT EXISTS ${DB_CONFIG.DATABASE}.trade_ticks (
       asset_id String,
       condition_id String,
       trade_id String,
-      price Float64,
+      price Decimal128(18),
       size Float64,
       side LowCardinality(String),
       source_ts DateTime64(3, 'UTC'),
       ingestion_ts DateTime64(6, 'UTC'),
       latency_ms Float64 MATERIALIZED dateDiff('millisecond', source_ts, ingestion_ts),
-      notional Float64 MATERIALIZED price * size
+      notional Decimal128(18) MATERIALIZED price * toDecimal128(size, 18)
     ) ENGINE = MergeTree() PARTITION BY toYYYYMM(source_ts) ORDER BY (asset_id, source_ts)`,
   ];
 
@@ -462,86 +559,15 @@ app.get("/test/all", async (c) => {
   });
 });
 
-// ============================================================
-// Admin Endpoints - Archival Management
-// ============================================================
-
-app.get("/admin/archive/status", async (c) => {
-  const apiKey = c.req.header("X-API-Key");
-  if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
-  try {
-    const archival = new R2ArchivalService(c.env);
-    const partitions = await archival.listArchivedPartitions();
-    return c.json({
-      status: "ok",
-      archived_partitions: partitions,
-      total_partitions: partitions.length,
-    });
-  } catch (error) {
-    return c.json({ error: String(error) }, 500);
-  }
-});
-
-app.post("/admin/archive/trigger", async (c) => {
-  const apiKey = c.req.header("X-API-Key");
-  if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
-  try {
-    const archival = new R2ArchivalService(c.env);
-    const results = await archival.runScheduledArchival();
-    return c.json({
-      status: "ok",
-      results,
-      partitions_archived: results.length,
-    });
-  } catch (error) {
-    return c.json({ error: String(error) }, 500);
-  }
-});
-
-app.get("/admin/aggregator/status", async (c) => {
-  const apiKey = c.req.header("X-API-Key");
-  if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
-  const assetId = c.req.query("asset_id");
-  if (!assetId) {
-    return c.json({ error: "asset_id query param required" }, 400);
-  }
-
-  try {
-    const id = c.env.SNAPSHOT_AGGREGATOR.idFromName(assetId);
-    const stub = c.env.SNAPSHOT_AGGREGATOR.get(id);
-    const response = await stub.fetch(new Request("http://internal/status"));
-    const data = await response.json();
-    return c.json({ status: "ok", aggregator: data });
-  } catch (error) {
-    return c.json({ error: String(error) }, 500);
-  }
-});
-
 // Export Durable Objects
 export { OrderbookManager };
-export { SnapshotAggregator };
 
 async function queueHandler(batch: MessageBatch, env: Env) {
   const queueName = batch.queue;
 
   switch (queueName) {
-    case "metadata-fetch-queue":
-      await metadataConsumer(batch as MessageBatch<MetadataFetchJob>, env);
-      break;
     case "orderbook-snapshot-queue":
-      await snapshotConsumer(
-        batch as MessageBatch<EnhancedOrderbookSnapshot>,
-        env
-      );
+      await snapshotConsumer(batch as MessageBatch<BBOSnapshot>, env);
       break;
     case "gap-backfill-queue":
       await gapBackfillConsumer(batch as MessageBatch<GapBackfillJob>, env);
@@ -549,26 +575,11 @@ async function queueHandler(batch: MessageBatch, env: Env) {
     case "trade-tick-queue":
       await tradeTickConsumer(batch as MessageBatch<TradeTick>, env);
       break;
-    case "aggregated-snapshot-queue":
-      await aggregatedSnapshotConsumer(
-        batch as MessageBatch<AggregatedSnapshot[]>,
-        env
-      );
+    case "level-change-queue":
+      await levelChangeConsumer(batch as MessageBatch<OrderbookLevelChange>, env);
       break;
-    case "realtime-tick-queue":
-      await realtimeTickConsumer(batch as MessageBatch<RealtimeTick>, env);
-      break;
-    case "archival-queue":
-      const archival = new R2ArchivalService(env);
-      for (const msg of batch.messages) {
-        try {
-          await archival.archivePartition(msg.body as ArchivalJob);
-          msg.ack();
-        } catch (error) {
-          console.error("[Archival] Job failed:", error);
-          msg.retry();
-        }
-      }
+    case "full-l2-queue":
+      await fullL2SnapshotConsumer(batch as MessageBatch<FullL2Snapshot>, env);
       break;
   }
 }
@@ -578,9 +589,27 @@ async function scheduledHandler(
   env: Env,
   ctx: ExecutionContext
 ) {
-  console.log("[Scheduled] Running daily archival job at", new Date().toISOString());
-  const archival = new R2ArchivalService(env);
-  ctx.waitUntil(archival.runScheduledArchival());
+  const now = new Date().toISOString();
+
+  // Market lifecycle check every 5 minutes (cron: "*/5 * * * *")
+  if (event.cron === "*/5 * * * *") {
+    console.log("[Scheduled] Running market lifecycle check at", now);
+    const lifecycle = new MarketLifecycleService(env);
+
+    // Load webhooks from KV
+    const webhooks = await loadLifecycleWebhooks(env);
+    for (const wh of webhooks) {
+      lifecycle.registerWebhook(wh);
+    }
+
+    ctx.waitUntil(
+      lifecycle.runCheck().then((results) => {
+        console.log(
+          `[Scheduled] Lifecycle check complete: ${results.resolutions} resolutions, ${results.new_markets} new markets, ${results.metadata_synced} metadata synced`
+        );
+      })
+    );
+  }
 }
 
 export default {

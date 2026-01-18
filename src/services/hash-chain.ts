@@ -117,22 +117,4 @@ export class HashChainValidator {
       sequence: newSequence,
     };
   }
-
-  /**
-   * Reset hash chain (e.g., after reconnection)
-   */
-  async reset(assetId: string): Promise<void> {
-    await this.cache.delete(`chain:${assetId}`);
-  }
-
-  /**
-   * Get current sequence number
-   */
-  async getSequence(assetId: string): Promise<number> {
-    const state = await this.cache.get<HashChainState>(
-      `chain:${assetId}`,
-      "json"
-    );
-    return state?.sequence ?? 0;
-  }
 }

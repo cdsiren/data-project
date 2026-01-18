@@ -74,15 +74,6 @@ export interface TradeTick {
 }
 
 /**
- * Local orderbook level for in-memory state
- * Uses string for price to preserve exact decimal precision (CCXT pattern)
- */
-export interface OrderbookLevel {
-  price: number;
-  size: number;
-}
-
-/**
  * Tick direction for market microstructure analysis
  */
 export type TickDirection = "UP" | "DOWN" | "UNCHANGED";
@@ -138,9 +129,78 @@ export interface EnhancedOrderbookSnapshot {
   // Polymarket-specific
   outcome?: "YES" | "NO"; // Which outcome this orderbook represents
   neg_risk?: boolean; // Negative risk market flag
+  order_min_size?: number; // Minimum order size for this market
 
   // ISO 8601 datetime for CCXT compatibility
   datetime?: string;
+}
+
+/**
+ * BBO (Best Bid/Offer) snapshot - lightweight alternative to full L2
+ * Reduces data volume by ~20-50x while preserving essential price info
+ * Use this for high-frequency tick storage
+ */
+export interface BBOSnapshot {
+  asset_id: string;
+  token_id: string;
+  condition_id: string;
+  source_ts: number;
+  ingestion_ts: number;
+  book_hash: string;
+
+  // Top-of-book only (instead of full L2 arrays)
+  best_bid: number | null;
+  best_ask: number | null;
+  bid_size: number | null;  // Size at best bid
+  ask_size: number | null;  // Size at best ask
+  mid_price: number | null;
+  spread_bps: number | null;
+
+  tick_size: number;
+  is_resync: boolean;
+  sequence_number: number;
+  neg_risk?: boolean;
+  order_min_size?: number;
+}
+
+/**
+ * Order book level change - tracks order placements, cancellations, and updates
+ * Captures the delta when a price level changes in the order book
+ */
+export type LevelChangeType = "ADD" | "REMOVE" | "UPDATE";
+
+export interface OrderbookLevelChange {
+  asset_id: string;
+  condition_id: string;
+  source_ts: number;
+  ingestion_ts: number;
+  side: "BUY" | "SELL";
+  price: number;
+  old_size: number;      // Previous size at this level (0 if new level)
+  new_size: number;      // New size at this level (0 if removed)
+  size_delta: number;    // new_size - old_size (positive = added, negative = removed)
+  change_type: LevelChangeType;
+  book_hash: string;
+  sequence_number: number;
+}
+
+/**
+ * Full L2 snapshot for periodic deep orderbook capture
+ * Stored every 5 minutes to preserve depth data while minimizing storage
+ */
+export interface FullL2Snapshot {
+  asset_id: string;
+  token_id: string;
+  condition_id: string;
+  source_ts: number;
+  ingestion_ts: number;
+  book_hash: string;
+  bids: Array<{ price: number; size: number }>;
+  asks: Array<{ price: number; size: number }>;
+  tick_size: number;
+  sequence_number: number;
+  neg_risk?: boolean;
+  order_min_size?: number;
 }
 
 /**
@@ -228,4 +288,106 @@ export interface RealtimeTick {
   book_hash: string;
   sequence_number: number;
   ingestion_ts: number; // Microseconds
+}
+
+// ============================================================
+// LOW-LATENCY TRIGGER TYPES
+// Processed directly in Durable Object, bypassing queues
+// ============================================================
+
+/**
+ * Trigger types for HFT signals
+ */
+export type TriggerType =
+  | "PRICE_ABOVE"      // Best bid or ask crosses above threshold
+  | "PRICE_BELOW"      // Best bid or ask crosses below threshold
+  | "SPREAD_NARROW"    // Spread narrows below threshold (in bps)
+  | "SPREAD_WIDE"      // Spread widens above threshold (in bps)
+  | "IMBALANCE_BID"    // Book imbalance favors bids (ratio > threshold)
+  | "IMBALANCE_ASK"    // Book imbalance favors asks (ratio < -threshold)
+  | "SIZE_SPIKE"       // Large size appears at top of book
+  | "PRICE_MOVE"       // Price moves X% within Y seconds
+  | "CROSSED_BOOK"     // Bid >= Ask (arbitrage opportunity)
+  | "ARBITRAGE_BUY"    // YES_ask + NO_ask < threshold (buy both for guaranteed profit)
+  | "ARBITRAGE_SELL";  // YES_bid + NO_bid > threshold (sell both for guaranteed profit)
+
+/**
+ * Trigger condition configuration
+ */
+export interface TriggerCondition {
+  type: TriggerType;
+  threshold: number;           // Price, spread_bps, ratio, or percentage depending on type
+  side?: "BID" | "ASK";        // For PRICE_ABOVE/BELOW, which side to watch
+  window_ms?: number;          // For PRICE_MOVE, time window in milliseconds
+  counterpart_asset_id?: string; // For ARBITRAGE triggers, the other side of the market (YES if this is NO, vice versa)
+}
+
+/**
+ * Registered trigger with metadata
+ */
+export interface Trigger {
+  id: string;                  // Unique trigger ID
+  asset_id: string;            // Asset to monitor (or "*" for all)
+  condition: TriggerCondition;
+  webhook_url: string;         // URL to POST when trigger fires
+  webhook_secret?: string;     // Optional HMAC secret for webhook verification
+  enabled: boolean;
+  cooldown_ms: number;         // Minimum time between trigger fires (default 1000ms)
+  created_at: number;
+  metadata?: Record<string, string>; // User-defined metadata passed through to webhook
+}
+
+/**
+ * Event fired when a trigger matches
+ * Sent immediately via webhook (bypasses all queues)
+ */
+export interface TriggerEvent {
+  trigger_id: string;
+  trigger_type: TriggerType;
+  asset_id: string;
+  condition_id: string;
+  fired_at: number;            // Microsecond timestamp
+  latency_us: number;          // Time from source_ts to fired_at
+
+  // Current market state
+  best_bid: number | null;
+  best_ask: number | null;
+  bid_size: number | null;
+  ask_size: number | null;
+  mid_price: number | null;
+  spread_bps: number | null;
+
+  // Trigger-specific data
+  threshold: number;
+  actual_value: number;        // The value that triggered (price, spread, ratio, etc.)
+
+  // Arbitrage-specific fields (for ARBITRAGE_BUY/SELL triggers)
+  counterpart_asset_id?: string;
+  counterpart_best_bid?: number | null;
+  counterpart_best_ask?: number | null;
+  sum_of_asks?: number;        // YES_ask + NO_ask (for ARBITRAGE_BUY)
+  sum_of_bids?: number;        // YES_bid + NO_bid (for ARBITRAGE_SELL)
+  potential_profit_bps?: number; // Estimated profit in basis points
+
+  // Context
+  book_hash: string;
+  sequence_number: number;
+  metadata?: Record<string, string>;
+}
+
+/**
+ * Response from trigger registration
+ */
+export interface TriggerRegistration {
+  trigger_id: string;
+  status: "created" | "updated" | "error";
+  message?: string;
+}
+
+/**
+ * Price history entry for PRICE_MOVE trigger
+ */
+export interface PriceHistoryEntry {
+  ts: number;
+  mid_price: number;
 }

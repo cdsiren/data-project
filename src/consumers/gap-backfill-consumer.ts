@@ -4,7 +4,7 @@
 import type { Env } from "../types";
 import type {
   GapBackfillJob,
-  EnhancedOrderbookSnapshot,
+  BBOSnapshot,
 } from "../types/orderbook";
 import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
 
@@ -53,35 +53,27 @@ export async function gapBackfillConsumer(
 
       const book = (await response.json()) as CLOBBookResponse;
 
-      // Create resync snapshot
-      const bids = book.bids.map((b) => ({
-        price: parseFloat(b.price),
-        size: parseFloat(b.size),
-      }));
-      const asks = book.asks.map((a) => ({
-        price: parseFloat(a.price),
-        size: parseFloat(a.size),
-      }));
-
-      const bestBid = bids[0]?.price ?? null;
-      const bestAsk = asks[0]?.price ?? null;
+      // Create BBO-only resync snapshot
+      const bestBid = book.bids[0] ? parseFloat(book.bids[0].price) : null;
+      const bestAsk = book.asks[0] ? parseFloat(book.asks[0].price) : null;
+      const bidSize = book.bids[0] ? parseFloat(book.bids[0].size) : null;
+      const askSize = book.asks[0] ? parseFloat(book.asks[0].size) : null;
       const midPrice = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null;
       const spread = bestBid && bestAsk ? bestAsk - bestBid : null;
       const spreadBps = midPrice && spread ? (spread / midPrice) * 10000 : null;
 
-      const snapshot: EnhancedOrderbookSnapshot = {
+      const snapshot: BBOSnapshot = {
         asset_id: book.asset_id,
         token_id: book.asset_id,
         condition_id: book.market,
         source_ts: parseInt(book.timestamp),
         ingestion_ts: Date.now() * 1000,
         book_hash: book.hash,
-        bids,
-        asks,
         best_bid: bestBid,
         best_ask: bestAsk,
+        bid_size: bidSize,
+        ask_size: askSize,
         mid_price: midPrice,
-        spread,
         spread_bps: spreadBps,
         tick_size: parseFloat(book.tick_size),
         is_resync: true,

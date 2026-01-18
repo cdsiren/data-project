@@ -240,23 +240,6 @@ TTL source_ts + INTERVAL 1 DAY DELETE
 SETTINGS index_granularity = 8192, merge_with_ttl_timeout = 3600;
 
 -- ============================================================
--- ARCHIVE MANIFEST (tracks R2 archived data)
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS polymarket.archive_manifest (
-    table_name LowCardinality(String),
-    partition_month String,
-    r2_path String,
-    row_count UInt64,
-    file_size_bytes UInt64,
-    archived_at DateTime DEFAULT now(),
-    checksum String
-)
-ENGINE = MergeTree()
-ORDER BY (table_name, partition_month)
-SETTINGS index_granularity = 256;
-
--- ============================================================
 -- MONITORING VIEWS
 -- ============================================================
 

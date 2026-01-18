@@ -1,13 +1,14 @@
 import type { Env } from "../types";
-import type { EnhancedOrderbookSnapshot } from "../types/orderbook";
+import type { BBOSnapshot } from "../types/orderbook";
 import { toClickHouseDateTime64, toClickHouseDateTime64Micro } from "../utils/datetime";
-import { DB_CONFIG } from "../config/database";
+import { getFullTableName } from "../config/database";
+import { buildAsyncInsertUrl, buildClickHouseHeaders } from "./clickhouse-client";
 
 /**
  * ClickHouse client for orderbook-specific operations
  *
- * Uses your existing CLICKHOUSE_URL and CLICKHOUSE_TOKEN secrets.
- * Only interacts with ob_* tables to avoid conflicts.
+ * Uses async inserts for efficient batching without Buffer tables.
+ * Async inserts buffer data server-side, reducing CPU from merge operations.
  */
 export class ClickHouseOrderbookClient {
   private baseUrl: string;
@@ -15,17 +16,14 @@ export class ClickHouseOrderbookClient {
 
   constructor(env: Env) {
     this.baseUrl = env.CLICKHOUSE_URL;
-    this.headers = {
-      "X-ClickHouse-User": env.CLICKHOUSE_USER,
-      "X-ClickHouse-Key": env.CLICKHOUSE_TOKEN,
-      "Content-Type": "text/plain",
-    };
+    this.headers = buildClickHouseHeaders(env.CLICKHOUSE_USER, env.CLICKHOUSE_TOKEN);
   }
 
   /**
-   * Insert orderbook snapshots (batch)
+   * Insert BBO (best bid/offer) snapshots in batch
+   * Optimized: stores only top-of-book instead of full L2 depth (~20-50x less data)
    */
-  async insertSnapshots(snapshots: EnhancedOrderbookSnapshot[]): Promise<void> {
+  async insertSnapshots(snapshots: BBOSnapshot[]): Promise<void> {
     if (snapshots.length === 0) return;
 
     const rows = snapshots.map((s) => ({
@@ -34,19 +32,23 @@ export class ClickHouseOrderbookClient {
       source_ts: toClickHouseDateTime64(s.source_ts),
       ingestion_ts: toClickHouseDateTime64Micro(s.ingestion_ts),
       book_hash: s.book_hash,
-      bid_prices: s.bids.map((b) => b.price),
-      bid_sizes: s.bids.map((b) => b.size),
-      ask_prices: s.asks.map((a) => a.price),
-      ask_sizes: s.asks.map((a) => a.size),
+      best_bid: s.best_bid ?? 0,
+      best_ask: s.best_ask ?? 0,
+      bid_size: s.bid_size ?? 0,
+      ask_size: s.ask_size ?? 0,
+      mid_price: s.mid_price ?? 0,
+      spread_bps: s.spread_bps ?? 0,
       tick_size: s.tick_size,
       is_resync: s.is_resync ? 1 : 0,
       sequence_number: s.sequence_number,
+      neg_risk: s.neg_risk ? 1 : 0,
+      order_min_size: s.order_min_size ?? 0,
     }));
 
     const body = rows.map((r) => JSON.stringify(r)).join("\n");
 
     const response = await fetch(
-      `${this.baseUrl}/?query=INSERT INTO ${DB_CONFIG.DATABASE}.ob_snapshots FORMAT JSONEachRow`,
+      buildAsyncInsertUrl(this.baseUrl, getFullTableName("OB_BBO")),
       { method: "POST", headers: this.headers, body }
     );
 
@@ -57,24 +59,31 @@ export class ClickHouseOrderbookClient {
   }
 
   /**
-   * Record latency metric
+   * Record latency metrics in batch (single HTTP request instead of N requests)
+   * ~50-100x reduction in HTTP overhead
    */
-  async recordLatency(
-    assetId: string,
-    sourceTs: number,
-    ingestionTs: number,
-    eventType: string
+  async recordLatencyBatch(
+    metrics: Array<{
+      assetId: string;
+      sourceTs: number;
+      ingestionTs: number;
+      eventType: string;
+    }>
   ): Promise<void> {
-    const row = {
-      asset_id: assetId,
-      source_ts: toClickHouseDateTime64(sourceTs),
-      ingestion_ts: toClickHouseDateTime64Micro(ingestionTs),
-      event_type: eventType,
-    };
+    if (metrics.length === 0) return;
+
+    const rows = metrics.map((m) => ({
+      asset_id: m.assetId,
+      source_ts: toClickHouseDateTime64(m.sourceTs),
+      ingestion_ts: toClickHouseDateTime64Micro(m.ingestionTs),
+      event_type: m.eventType,
+    }));
+
+    const body = rows.map((r) => JSON.stringify(r)).join("\n");
 
     await fetch(
-      `${this.baseUrl}/?query=INSERT INTO ${DB_CONFIG.DATABASE}.ob_latency FORMAT JSONEachRow`,
-      { method: "POST", headers: this.headers, body: JSON.stringify(row) }
+      buildAsyncInsertUrl(this.baseUrl, getFullTableName("OB_LATENCY")),
+      { method: "POST", headers: this.headers, body }
     );
   }
 
@@ -97,9 +106,8 @@ export class ClickHouseOrderbookClient {
     };
 
     await fetch(
-      `${this.baseUrl}/?query=INSERT INTO ${DB_CONFIG.DATABASE}.ob_gap_events FORMAT JSONEachRow`,
+      buildAsyncInsertUrl(this.baseUrl, getFullTableName("OB_GAP_EVENTS")),
       { method: "POST", headers: this.headers, body: JSON.stringify(row) }
     );
   }
-
 }

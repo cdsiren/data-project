@@ -1,8 +1,9 @@
 // src/consumers/snapshot-consumer.ts
-// Enhanced with hash chain validation and optional aggregation routing
+// Writes BBO snapshots directly to ClickHouse with hash chain validation
+// Aggregation is handled by ClickHouse materialized views (more efficient)
 
 import type { Env } from "../types";
-import type { EnhancedOrderbookSnapshot } from "../types/orderbook";
+import type { BBOSnapshot } from "../types/orderbook";
 import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
 import { HashChainValidator } from "../services/hash-chain";
 
@@ -17,14 +18,13 @@ interface ValidationStats {
 }
 
 export async function snapshotConsumer(
-  batch: MessageBatch<EnhancedOrderbookSnapshot>,
+  batch: MessageBatch<BBOSnapshot>,
   env: Env
 ): Promise<void> {
   const clickhouse = new ClickHouseOrderbookClient(env);
   const hashChain = new HashChainValidator(env.HASH_CHAIN_CACHE, env.GAP_BACKFILL_QUEUE);
-  const useAggregation = env.AGGREGATE_SNAPSHOTS === "true";
 
-  const validSnapshots: EnhancedOrderbookSnapshot[] = [];
+  const validSnapshots: BBOSnapshot[] = [];
   const stats: ValidationStats = {
     total: batch.messages.length,
     valid: 0,
@@ -98,84 +98,25 @@ export async function snapshotConsumer(
     return;
   }
 
-  // Route to aggregator or direct insert based on config
-  if (useAggregation) {
-    await routeToAggregator(validSnapshots, env, stats);
-  } else {
-    await insertDirectToClickHouse(validSnapshots, clickhouse, stats);
-  }
-}
-
-async function routeToAggregator(
-  snapshots: EnhancedOrderbookSnapshot[],
-  env: Env,
-  stats: ValidationStats
-): Promise<void> {
-  // Group snapshots by asset for routing to per-asset aggregator DOs
-  const snapshotsByAsset = new Map<string, EnhancedOrderbookSnapshot[]>();
-
-  for (const snapshot of snapshots) {
-    const assetId = snapshot.asset_id;
-    const existing = snapshotsByAsset.get(assetId) || [];
-    existing.push(snapshot);
-    snapshotsByAsset.set(assetId, existing);
-  }
-
-  const errors: string[] = [];
-
-  for (const [assetId, assetSnapshots] of snapshotsByAsset) {
-    try {
-      const id = env.SNAPSHOT_AGGREGATOR.idFromName(assetId);
-      const stub = env.SNAPSHOT_AGGREGATOR.get(id);
-
-      const response = await stub.fetch(new Request("http://internal/ingest", {
-        method: "POST",
-        body: JSON.stringify(assetSnapshots),
-        headers: { "Content-Type": "application/json" },
-      }));
-
-      if (!response.ok) {
-        errors.push(`${assetId}: ${await response.text()}`);
-      }
-    } catch (error) {
-      errors.push(`${assetId}: ${String(error)}`);
-    }
-  }
-
-  if (errors.length > 0) {
-    console.error(`[Snapshot] Aggregator routing errors: ${errors.join(", ")}`);
-  }
-
-  console.log(
-    `[Snapshot] Routed ${snapshots.length}/${stats.total} to aggregator ` +
-    `(${snapshotsByAsset.size} assets, dup=${stats.duplicates}, gaps=${stats.gaps})`
-  );
-}
-
-async function insertDirectToClickHouse(
-  snapshots: EnhancedOrderbookSnapshot[],
-  clickhouse: ClickHouseOrderbookClient,
-  stats: ValidationStats
-): Promise<void> {
+  // Insert directly to ClickHouse (aggregation handled by materialized views)
   try {
-    await clickhouse.insertSnapshots(snapshots);
+    await clickhouse.insertSnapshots(validSnapshots);
     console.log(
-      `[Snapshot] Inserted ${snapshots.length}/${stats.total} ` +
+      `[Snapshot] Inserted ${validSnapshots.length}/${stats.total} BBO snapshots ` +
       `(valid=${stats.valid}, dup=${stats.duplicates}, gaps=${stats.gaps}, ` +
       `first=${stats.first}, resync=${stats.resyncs})`
     );
 
-    // Record latency metrics (fire-and-forget)
-    Promise.all(
-      snapshots.map((snapshot) =>
-        clickhouse.recordLatency(
-          snapshot.asset_id,
-          snapshot.source_ts,
-          snapshot.ingestion_ts,
-          snapshot.is_resync ? "resync" : "snapshot"
-        )
-      )
-    ).catch((err) => console.error("[Snapshot] Latency recording failed:", err));
+    // Record latency metrics in BATCH (single HTTP request instead of N)
+    const latencyMetrics = validSnapshots.map((snapshot) => ({
+      assetId: snapshot.asset_id,
+      sourceTs: snapshot.source_ts,
+      ingestionTs: snapshot.ingestion_ts,
+      eventType: snapshot.is_resync ? "resync" : "bbo",
+    }));
+
+    clickhouse.recordLatencyBatch(latencyMetrics)
+      .catch((err) => console.error("[Snapshot] Latency recording failed:", err));
   } catch (error) {
     console.error("[Snapshot] ClickHouse insert failed:", error);
   }

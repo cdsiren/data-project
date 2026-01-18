@@ -1,37 +1,25 @@
 import type {
   GapBackfillJob,
   TradeTick,
-  AggregatedSnapshot,
-  RealtimeTick,
-  EnhancedOrderbookSnapshot,
+  BBOSnapshot,
+  OrderbookLevelChange,
+  FullL2Snapshot,
 } from "./types/orderbook";
-import type { ArchivalJob } from "./services/r2-archival";
-
-// Queue message type aliases for type safety
-export type MetadataQueueMessage = MetadataFetchJob;
-export type SnapshotQueueMessage = EnhancedOrderbookSnapshot;
-export type RealtimeTickQueueMessage = RealtimeTick;
 
 export interface Env {
   // KV Namespaces
   MARKET_CACHE: KVNamespace;
   HASH_CHAIN_CACHE: KVNamespace;
 
-  // Queues with explicit types
-  METADATA_QUEUE: Queue<MetadataQueueMessage>;
-  SNAPSHOT_QUEUE: Queue<SnapshotQueueMessage>;
+  // Queues
+  SNAPSHOT_QUEUE: Queue<BBOSnapshot>;
   GAP_BACKFILL_QUEUE: Queue<GapBackfillJob>;
   TRADE_QUEUE: Queue<TradeTick>;
-  AGGREGATED_SNAPSHOT_QUEUE: Queue<AggregatedSnapshot[]>;
-  REALTIME_TICK_QUEUE: Queue<RealtimeTickQueueMessage>;
-  ARCHIVAL_QUEUE: Queue<ArchivalJob>;
+  LEVEL_CHANGE_QUEUE: Queue<OrderbookLevelChange>;
+  FULL_L2_QUEUE: Queue<FullL2Snapshot>;
 
   // Durable Objects
   ORDERBOOK_MANAGER: DurableObjectNamespace;
-  SNAPSHOT_AGGREGATOR: DurableObjectNamespace;
-
-  // R2 Storage
-  ARCHIVE_BUCKET: R2Bucket;
 
   // Environment Variables
   GAMMA_API_URL: string;
@@ -41,8 +29,6 @@ export interface Env {
   CLICKHOUSE_USER: string;
   CLICKHOUSE_TOKEN: string;
   WEBHOOK_API_KEY: string;
-  ARCHIVE_RETENTION_DAYS: string;
-  AGGREGATE_SNAPSHOTS: string;
 }
 
 export interface GoldskyTradeEvent {
@@ -61,10 +47,6 @@ export interface GoldskyTradeEvent {
   _gs_chain: string;
   _gs_gid: string;
   is_deleted: number;
-}
-
-export interface MetadataFetchJob {
-  clob_token_id: string;
 }
 
 // Polymarket API Response Types

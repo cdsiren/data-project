@@ -17,6 +17,25 @@ Goldsky Webhook → Extract Asset ID → Queue → Batch Consumer → Polymarket
                     KV Cache ←──────────────────────────────────── Cache Update
 ```
 
+### Orderbook Data Architecture
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PRODUCTION ARCHITECTURE │
+├─────────────────────────────────────────────────────────────────────────┤
+│ │
+│ Polymarket WS ──► OrderbookManager DO │
+│ │ │
+│ ├──► evaluateTriggers() ──► Webhook (<10ms) │
+│ │ │
+│ ├──► ob_bbo (tick) ──► mv_ob_bbo_1m (CH MV) │
+│ │ └──► mv_ob_bbo_5m (CH MV) │
+│ │ │
+│ ├──► ob_snapshots (5-min L2) │
+│ ├──► ob_level_changes (order flow) │
+│ └──► trade_ticks (executions) │
+│ │
+└─────────────────────────────────────────────────────────────────────────┘
+
 ## Setup
 
 ### 1. Install Dependencies
@@ -87,6 +106,7 @@ Send Goldsky trade events to the `/webhook/goldsky` endpoint with your API key:
 **Endpoint:** `https://cd-durbin14.workers.dev/webhook/goldsky`
 
 **Headers Required:**
+
 - `Content-Type: application/json`
 - `X-API-Key: your-secret-api-key`
 
@@ -129,6 +149,7 @@ curl -X POST https://cd-durbin14.workers.dev/webhook/goldsky \
 ### Batching Strategy
 
 The metadata consumer uses Cloudflare's built-in queue batching:
+
 - **Max Batch Size**: 10 jobs
 - **Max Batch Timeout**: 5 seconds
 
@@ -148,36 +169,36 @@ Deduplication happens at multiple levels:
 
 Stores core market information:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| id | String | Polymarket market ID |
-| question | String | Market question |
-| condition_id | String | Blockchain condition ID |
-| slug | String | URL-friendly slug |
-| resolution_source | String | Source for market resolution |
-| end_date | DateTime | Market end date |
-| start_date | DateTime | Market start date |
-| created_at | DateTime | Creation timestamp |
-| submitted_by | String | Creator address |
-| resolved_by | String | Resolver address |
-| restricted | UInt8 | Whether market is restricted |
-| enable_order_book | UInt8 | Whether orderbook is enabled |
-| order_price_min_tick_size | Float64 | Minimum price tick |
-| order_min_size | Float64 | Minimum order size |
-| clob_token_ids | String | JSON array of token IDs |
-| neg_risk | UInt8 | Negative risk flag |
-| neg_risk_market_id | String | Neg risk market ID |
-| neg_risk_request_id | String | Neg risk request ID |
+| Column                    | Type     | Description                  |
+| ------------------------- | -------- | ---------------------------- |
+| id                        | String   | Polymarket market ID         |
+| question                  | String   | Market question              |
+| condition_id              | String   | Blockchain condition ID      |
+| slug                      | String   | URL-friendly slug            |
+| resolution_source         | String   | Source for market resolution |
+| end_date                  | DateTime | Market end date              |
+| start_date                | DateTime | Market start date            |
+| created_at                | DateTime | Creation timestamp           |
+| submitted_by              | String   | Creator address              |
+| resolved_by               | String   | Resolver address             |
+| restricted                | UInt8    | Whether market is restricted |
+| enable_order_book         | UInt8    | Whether orderbook is enabled |
+| order_price_min_tick_size | Float64  | Minimum price tick           |
+| order_min_size            | Float64  | Minimum order size           |
+| clob_token_ids            | String   | JSON array of token IDs      |
+| neg_risk                  | UInt8    | Negative risk flag           |
+| neg_risk_market_id        | String   | Neg risk market ID           |
+| neg_risk_request_id       | String   | Neg risk request ID          |
 
 ### market_events Table
 
 Stores events associated with markets:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| event_id | String | Event ID |
+| Column    | Type   | Description                       |
+| --------- | ------ | --------------------------------- |
+| event_id  | String | Event ID                          |
 | market_id | String | Foreign key to market_metadata.id |
-| title | String | Event title |
+| title     | String | Event title                       |
 
 ### Linking Markets and Events
 
@@ -217,6 +238,7 @@ wrangler tail
 ```
 
 Key log messages:
+
 - `Processing X unique token IDs` - Number of unique tokens in batch
 - `X tokens not in cache` - Number of tokens that need fetching
 - `Fetched X markets from Polymarket` - API response count

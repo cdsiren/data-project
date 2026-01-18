@@ -4,7 +4,8 @@
 import type { Env } from "../types";
 import type { TradeTick } from "../types/orderbook";
 import { toClickHouseDateTime64, toClickHouseDateTime64Micro } from "../utils/datetime";
-import { DB_CONFIG } from "../config/database";
+import { getFullTableName } from "../config/database";
+import { buildAsyncInsertUrl, buildClickHouseHeaders } from "../services/clickhouse-client";
 
 export async function tradeTickConsumer(
   batch: MessageBatch<TradeTick>,
@@ -32,14 +33,10 @@ export async function tradeTickConsumer(
 
   try {
     const response = await fetch(
-      `${env.CLICKHOUSE_URL}/?query=INSERT INTO ${DB_CONFIG.DATABASE}.trade_ticks FORMAT JSONEachRow`,
+      buildAsyncInsertUrl(env.CLICKHOUSE_URL, getFullTableName("TRADE_TICKS")),
       {
         method: "POST",
-        headers: {
-          "X-ClickHouse-User": env.CLICKHOUSE_USER,
-          "X-ClickHouse-Key": env.CLICKHOUSE_TOKEN,
-          "Content-Type": "text/plain",
-        },
+        headers: buildClickHouseHeaders(env.CLICKHOUSE_USER, env.CLICKHOUSE_TOKEN),
         body,
       }
     );
