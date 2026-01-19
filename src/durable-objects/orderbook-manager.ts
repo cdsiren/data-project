@@ -73,27 +73,44 @@ export class OrderbookManager extends DurableObject<Env> {
   // Latest BBO per asset for arbitrage trigger evaluation
   private latestBBO: Map<string, { best_bid: number | null; best_ask: number | null; ts: number }> = new Map();
   private readonly PRICE_HISTORY_MAX_AGE_MS = 60000; // Keep 60s of price history
+  private readonly MAX_PRICE_HISTORY_ENTRIES = 1000; // Safety limit to prevent unbounded growth
   private readonly MAX_TRIGGERS_PER_ASSET = 50; // Prevent trigger spam
 
-  private readonly MAX_ASSETS_PER_CONNECTION = 450;
+  // Polymarket allows max 500 instruments per connection
+  // We use 450 to leave headroom for pending subscriptions during updates
+  private readonly POLYMARKET_MAX_INSTRUMENTS = 500;
+  private readonly MAX_ASSETS_PER_CONNECTION = this.POLYMARKET_MAX_INSTRUMENTS - 50;
   private readonly RECONNECT_BASE_DELAY_MS = 1000;
   private readonly MAX_RECONNECT_DELAY_MS = 30000;
   private readonly PING_INTERVAL_MS = 10000; // Send PING every 10 seconds
-  private readonly CONNECTION_TIMEOUT_MS = 5000; // Timeout for WebSocket connection attempts
+  private readonly CONNECTION_TIMEOUT_MS = 15000; // Timeout for WebSocket connection attempts (increased from 5s)
   private readonly SNAPSHOT_INTERVAL_MS: number;
   private readonly FULL_L2_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes for full L2 snapshots
   private readonly MAX_SUBSCRIPTION_RETRIES = 3;
   private subscriptionFailures: Map<string, number> = new Map(); // Track failures per asset
 
   // Nautilus-style connection buffering to avoid rate limits
-  private readonly INITIAL_CONNECTION_DELAY_MS = 5000; // Wait 5s before first connection (buffer subscriptions)
-  private readonly RATE_LIMIT_BACKOFF_MS = 30000; // 30s backoff on 429 errors
+  private initialConnectionDelayMs: number = 5000; // Base delay, will be adjusted with DO ID stagger
+  private readonly RATE_LIMIT_BASE_BACKOFF_MS = 60000; // Start at 60s backoff on 429 errors (increased from 30s)
+  private readonly RATE_LIMIT_MAX_BACKOFF_MS = 300000; // Cap at 5 minutes
   private rateLimitedUntil: number = 0; // Timestamp when rate limit expires
+  private rateLimitCount: number = 0; // Track consecutive rate limits for exponential backoff
   private connectionAttempts: number = 0; // Track consecutive failures
+  private nextAlarmTime: number | null = null; // Track scheduled alarm to prevent duplicates
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.SNAPSHOT_INTERVAL_MS = parseInt(env.SNAPSHOT_INTERVAL_MS) || 1000;
+
+    // Stagger initial connection delay based on DO ID to prevent thundering herd
+    // Each DO gets a unique 0-60 second offset based on its ID hash
+    // Use a better hash function for more uniform distribution
+    const doIdStr = this.ctx.id.toString();
+    const doIdHash = Array.from(doIdStr).reduce((acc, char, idx) => {
+      return ((acc << 5) - acc) + char.charCodeAt(0) + idx;
+    }, 0);
+    const staggerMs = (Math.abs(doIdHash) % 60) * 1000; // 0-60 second stagger
+    this.initialConnectionDelayMs = 5000 + staggerMs;
 
     // Restore state on wake
     this.ctx.blockConcurrencyWhile(async () => {
@@ -135,11 +152,11 @@ export class OrderbookManager extends DurableObject<Env> {
         // Nautilus-style: Don't reconnect immediately on wake
         // Schedule delayed connection with jitter to avoid thundering herd
         if (this.connections.size > 0) {
-          const jitter = Math.random() * 5000; // 0-5s random jitter
-          const delay = this.INITIAL_CONNECTION_DELAY_MS + jitter;
+          const jitter = Math.random() * 10000; // 0-10s random jitter (increased from 5s)
+          const delay = this.initialConnectionDelayMs + jitter;
           console.log(
             `[DO] Waking with ${this.connections.size} connections, ${this.assetToConnection.size} assets. ` +
-            `Scheduling connection in ${Math.round(delay)}ms`
+            `Scheduling connection in ${Math.round(delay)}ms (stagger=${Math.round(this.initialConnectionDelayMs - 5000)}ms)`
           );
           await this.ctx.storage.setAlarm(Date.now() + delay);
         }
@@ -247,25 +264,8 @@ export class OrderbookManager extends DurableObject<Env> {
         this.connections.get(connId)?.pendingAssets.delete(tokenId);
       }
 
-      // Clean up all in-memory state to prevent memory leaks
-      this.tickSizes.delete(tokenId);
-      this.negRisk.delete(tokenId);
-      this.orderMinSizes.delete(tokenId);
-      this.localBooks.delete(tokenId);
-      this.lastQuotes.delete(tokenId);
-      this.lastFullL2SnapshotTs.delete(tokenId);
-      this.subscriptionFailures.delete(tokenId);
-      this.priceHistory.delete(tokenId);
-
-      // Clean up triggers for this asset
-      const triggerIds = this.triggersByAsset.get(tokenId);
-      if (triggerIds) {
-        for (const triggerId of triggerIds) {
-          this.triggers.delete(triggerId);
-          this.lastTriggerFire.delete(triggerId);
-        }
-        this.triggersByAsset.delete(tokenId);
-      }
+      // Use consolidated cleanup method
+      this.cleanupAssetState(tokenId);
     }
 
     await this.persistState();
@@ -295,10 +295,13 @@ export class OrderbookManager extends DurableObject<Env> {
       })
     );
 
-    // Get assets with failures
+    // Get assets with failures (only truncate long IDs)
     const failedAssets = Array.from(this.subscriptionFailures.entries())
       .filter(([, count]) => count > 0)
-      .map(([assetId, count]) => ({ assetId: assetId.slice(0, 20) + "...", failures: count }));
+      .map(([assetId, count]) => ({
+        assetId: assetId.length > 23 ? assetId.slice(0, 20) + "..." : assetId,
+        failures: count,
+      }));
 
     return Response.json({
       total_assets: this.assetToConnection.size,
@@ -346,8 +349,10 @@ export class OrderbookManager extends DurableObject<Env> {
     const now = Date.now();
     if (this.rateLimitedUntil > now) {
       const waitTime = this.rateLimitedUntil - now;
-      console.log(`[WS ${connId}] Rate limited, waiting ${waitTime}ms before reconnect`);
-      await this.ctx.storage.setAlarm(this.rateLimitedUntil + Math.random() * 1000);
+      // Add extra jitter (0-10s) when rescheduling to spread out reconnection attempts
+      const extraJitter = Math.random() * 10000;
+      console.log(`[WS ${connId}] Rate limited, will retry at ${new Date(this.rateLimitedUntil + extraJitter).toISOString()}`);
+      await this.ctx.storage.setAlarm(this.rateLimitedUntil + extraJitter);
       return;
     }
 
@@ -386,17 +391,17 @@ export class OrderbookManager extends DurableObject<Env> {
       const ws = new WebSocket(this.env.CLOB_WSS_URL);
       state.ws = ws;
 
-      // Set up connection timeout
+      // Set up connection timeout with race condition protection
       let connectionTimeout: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-        if (ws.readyState === WebSocket.CONNECTING) {
+        // Check both readyState and that we're still referencing this WS instance
+        if (ws.readyState === WebSocket.CONNECTING && state.ws === ws) {
           console.error(`[WS ${connId}] Connection timeout after ${this.CONNECTION_TIMEOUT_MS}ms`);
           ws.close();
           state.ws = null;
           // Schedule retry with backoff
-          this.ctx.storage.setAlarm(
-            Date.now() + this.RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt)
-          );
+          this.scheduleAlarm(this.RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt));
         }
+        connectionTimeout = null;
       }, this.CONNECTION_TIMEOUT_MS);
 
       ws.addEventListener("open", () => {
@@ -409,6 +414,7 @@ export class OrderbookManager extends DurableObject<Env> {
         // Reset rate limit and failure tracking on successful connection
         this.connectionAttempts = 0;
         this.rateLimitedUntil = 0;
+        this.rateLimitCount = 0; // Reset exponential backoff on success
 
         console.log(`[WS ${connId}] Connected, subscribing to ${state.assets.size} assets`);
         state.lastPing = Date.now();
@@ -426,7 +432,7 @@ export class OrderbookManager extends DurableObject<Env> {
         }
 
         // Schedule alarm for PING heartbeat
-        this.ctx.storage.setAlarm(Date.now() + this.PING_INTERVAL_MS);
+        this.scheduleAlarm(this.PING_INTERVAL_MS);
       });
 
       ws.addEventListener("message", (event) => {
@@ -468,7 +474,7 @@ export class OrderbookManager extends DurableObject<Env> {
         const delay = Math.min(baseDelay + jitter, this.MAX_RECONNECT_DELAY_MS);
 
         console.log(`[WS ${connId}] Scheduling reconnect in ${Math.round(delay)}ms (attempt ${this.connectionAttempts + 1})`);
-        this.ctx.storage.setAlarm(now + delay);
+        this.scheduleAlarm(delay);
       });
 
       ws.addEventListener("error", (event) => {
@@ -477,18 +483,32 @@ export class OrderbookManager extends DurableObject<Env> {
           clearTimeout(connectionTimeout);
           connectionTimeout = null;
         }
-        // Extract useful error info - ErrorEvent has message, Event doesn't
-        const errorInfo = "message" in event
-          ? (event as ErrorEvent).message
+        // Extract useful error info using type guard
+        const errorInfo = this.isErrorEvent(event)
+          ? event.message
           : `WebSocket error (readyState=${ws.readyState})`;
 
         // Detect rate limiting (429)
         if (errorInfo.includes("429")) {
-          console.error(`[WS ${connId}] RATE LIMITED (429) - backing off for ${this.RATE_LIMIT_BACKOFF_MS}ms`);
-          this.rateLimitedUntil = Date.now() + this.RATE_LIMIT_BACKOFF_MS;
+          this.rateLimitCount++;
           this.connectionAttempts++;
+
+          // Exponential backoff: 60s, 120s, 240s, 300s (capped at 5 min)
+          const baseBackoff = Math.min(
+            this.RATE_LIMIT_BASE_BACKOFF_MS * Math.pow(2, this.rateLimitCount - 1),
+            this.RATE_LIMIT_MAX_BACKOFF_MS
+          );
+          // Add significant jitter (0-50% of backoff) to prevent thundering herd
+          const jitter = Math.random() * baseBackoff * 0.5;
+          const totalBackoff = baseBackoff + jitter;
+
+          this.rateLimitedUntil = Date.now() + totalBackoff;
+          console.error(
+            `[WS ${connId}] RATE LIMITED (429) - exponential backoff ${Math.round(totalBackoff / 1000)}s ` +
+            `(attempt ${this.rateLimitCount}, base=${baseBackoff / 1000}s, jitter=${Math.round(jitter / 1000)}s)`
+          );
           // Schedule retry after rate limit backoff
-          this.ctx.storage.setAlarm(this.rateLimitedUntil);
+          this.scheduleAlarm(totalBackoff);
         } else {
           console.error(`[WS ${connId}] Error: ${errorInfo}`);
           this.connectionAttempts++;
@@ -497,9 +517,7 @@ export class OrderbookManager extends DurableObject<Env> {
     } catch (error) {
       console.error(`[WS ${connId}] Connection failed:`, error);
       // Schedule retry
-      this.ctx.storage.setAlarm(
-        Date.now() + this.RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt)
-      );
+      this.scheduleAlarm(this.RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt));
     }
   }
 
@@ -552,7 +570,7 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // Skip non-JSON messages
     if (!data.startsWith("{") && !data.startsWith("[")) {
-      console.warn(`[WS ${connId}] Unexpected non-JSON message: "${data.slice(0, 100)}"`);
+      console.warn(`[WS ${connId}] Unexpected non-JSON message: "${data.length > 100 ? data.slice(0, 100) + "..." : data}"`);
       return;
     }
 
@@ -594,7 +612,7 @@ export class OrderbookManager extends DurableObject<Env> {
           console.warn(`[WS ${connId}] Unknown event type: ${(event as { event_type: string }).event_type}`);
       }
     } catch (error) {
-      console.error(`[WS ${connId}] JSON parse error for message: "${data.slice(0, 200)}"`, error);
+      console.error(`[WS ${connId}] JSON parse error for message: "${data.length > 200 ? data.slice(0, 200) + "..." : data}"`, error);
     }
   }
 
@@ -608,27 +626,10 @@ export class OrderbookManager extends DurableObject<Env> {
       }
     }
 
-    // Clean up all maps to prevent memory leaks
     this.assetToConnection.delete(assetId);
     this.assetToMarket.delete(assetId);
-    this.tickSizes.delete(assetId);
-    this.negRisk.delete(assetId);
-    this.orderMinSizes.delete(assetId);
-    this.localBooks.delete(assetId);
-    this.lastQuotes.delete(assetId);
-    this.lastFullL2SnapshotTs.delete(assetId);
-    this.subscriptionFailures.delete(assetId);
-    this.priceHistory.delete(assetId);
-
-    // Clean up triggers for this asset
-    const triggerIds = this.triggersByAsset.get(assetId);
-    if (triggerIds) {
-      for (const triggerId of triggerIds) {
-        this.triggers.delete(triggerId);
-        this.lastTriggerFire.delete(triggerId);
-      }
-      this.triggersByAsset.delete(assetId);
-    }
+    // Use consolidated cleanup method
+    this.cleanupAssetState(assetId);
   }
 
   private async handleBookEvent(
@@ -677,7 +678,7 @@ export class OrderbookManager extends DurableObject<Env> {
       neg_risk: this.negRisk.get(event.asset_id),
       order_min_size: this.orderMinSizes.get(event.asset_id),
     };
-    await this.env.FULL_L2_QUEUE.send(fullL2Snapshot);
+    await this.sendToQueue("FULL_L2_QUEUE", this.env.FULL_L2_QUEUE, fullL2Snapshot);
     this.lastFullL2SnapshotTs.set(event.asset_id, sourceTs);
 
     const bestBid = bids[0]?.price ?? null;
@@ -685,40 +686,27 @@ export class OrderbookManager extends DurableObject<Env> {
     const bidSize = bids[0]?.size ?? null;
     const askSize = asks[0]?.size ?? null;
 
-    // Duplicate suppression - skip if top-of-book unchanged
-    const lastQuote = this.lastQuotes.get(event.asset_id);
-    if (lastQuote && lastQuote.bestBid === bestBid && lastQuote.bestAsk === bestAsk) {
-      return; // Skip duplicate
+    // Use consolidated BBO extraction (handles duplicate suppression)
+    const snapshot = this.extractBBOSnapshot(
+      event.asset_id,
+      conditionId,
+      sourceTs,
+      ingestionTs,
+      bestBid,
+      bestAsk,
+      bidSize,
+      askSize,
+      event.hash,
+      tickSize,
+      localBook.sequence
+    );
+
+    if (!snapshot) {
+      return; // Duplicate, skip
     }
-    this.lastQuotes.set(event.asset_id, { bestBid, bestAsk });
-
-    const midPrice = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null;
-    const spread = bestBid && bestAsk ? bestAsk - bestBid : null;
-    const spreadBps = midPrice && spread ? (spread / midPrice) * 10000 : null;
-
-    // BBO-only snapshot (~20-50x smaller than full L2)
-    const snapshot: BBOSnapshot = {
-      asset_id: event.asset_id,
-      token_id: event.asset_id,
-      condition_id: conditionId,
-      source_ts: sourceTs,
-      ingestion_ts: ingestionTs,
-      book_hash: event.hash,
-      best_bid: bestBid,
-      best_ask: bestAsk,
-      bid_size: bidSize,
-      ask_size: askSize,
-      mid_price: midPrice,
-      spread_bps: spreadBps,
-      tick_size: tickSize,
-      is_resync: false,
-      sequence_number: localBook.sequence,
-      neg_risk: this.negRisk.get(event.asset_id),
-      order_min_size: this.orderMinSizes.get(event.asset_id),
-    };
 
     // Queue for processing (async, goes through batching)
-    await this.env.SNAPSHOT_QUEUE.send(snapshot);
+    await this.sendToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, snapshot);
 
     // LOW-LATENCY: Evaluate triggers immediately (bypasses queues)
     await this.evaluateTriggers(snapshot);
@@ -727,6 +715,9 @@ export class OrderbookManager extends DurableObject<Env> {
   /**
    * Handle incremental price changes (critical for real-time accuracy)
    * This is where most orderbook updates come from - NOT book events
+   *
+   * OPTIMIZED: Tracks best bid/ask incrementally to avoid O(n log n) sorting on every update.
+   * Only performs full scan when best level is removed.
    *
    * Note: asset_id is inside each price_change, not at the event level
    * A single event can contain changes for multiple assets
@@ -742,7 +733,8 @@ export class OrderbookManager extends DurableObject<Env> {
     for (const change of event.price_changes) {
       const assetId = change.asset_id;
       if (!assetId) {
-        console.warn(`[WS] price_change missing asset_id in change:`, JSON.stringify(change).slice(0, 100));
+        const preview = JSON.stringify(change);
+        console.warn(`[WS] price_change missing asset_id in change:`, preview.length > 100 ? preview.slice(0, 100) + "..." : preview);
         continue;
       }
       if (!changesByAsset.has(assetId)) {
@@ -766,11 +758,20 @@ export class OrderbookManager extends DurableObject<Env> {
       // Collect level changes for this batch
       const levelChanges: OrderbookLevelChange[] = [];
 
+      // OPTIMIZATION: Track current best prices before changes
+      // Get from lastQuotes cache (populated on book event and previous price changes)
+      const cachedQuote = this.lastQuotes.get(assetId);
+      let currentBestBid = cachedQuote?.bestBid ?? null;
+      let currentBestAsk = cachedQuote?.bestAsk ?? null;
+      let needsBidRescan = false;
+      let needsAskRescan = false;
+
       // Apply deltas to local book and track level changes
       for (const change of changes) {
         const price = parseFloat(change.price);
         const newSize = parseFloat(change.size);
-        const book = change.side === "BUY" ? localBook.bids : localBook.asks;
+        const isBuy = change.side === "BUY";
+        const book = isBuy ? localBook.bids : localBook.asks;
         const oldSize = book.get(price) ?? 0;
 
         // Determine change type
@@ -806,10 +807,37 @@ export class OrderbookManager extends DurableObject<Env> {
           book.set(price, newSize);
         }
 
+        // OPTIMIZATION: Update best price tracking incrementally
+        if (isBuy) {
+          if (newSize === 0 && price === currentBestBid) {
+            // Best bid was removed - need to rescan
+            needsBidRescan = true;
+          } else if (newSize > 0 && (currentBestBid === null || price > currentBestBid)) {
+            // New best bid
+            currentBestBid = price;
+          }
+        } else {
+          if (newSize === 0 && price === currentBestAsk) {
+            // Best ask was removed - need to rescan
+            needsAskRescan = true;
+          } else if (newSize > 0 && (currentBestAsk === null || price < currentBestAsk)) {
+            // New best ask
+            currentBestAsk = price;
+          }
+        }
+
         // Update hash if provided in the change
         if (change.hash) {
           localBook.last_hash = change.hash;
         }
+      }
+
+      // Only rescan when best level was removed (O(n) instead of O(n log n))
+      if (needsBidRescan) {
+        currentBestBid = this.findBestBid(localBook.bids);
+      }
+      if (needsAskRescan) {
+        currentBestAsk = this.findBestAsk(localBook.asks);
       }
 
       localBook.sequence++;
@@ -817,21 +845,15 @@ export class OrderbookManager extends DurableObject<Env> {
 
       // Send level changes to queue (batch for efficiency)
       if (levelChanges.length > 0) {
-        await this.env.LEVEL_CHANGE_QUEUE.sendBatch(
-          levelChanges.map((lc) => ({ body: lc }))
-        );
+        await this.sendBatchToQueue("LEVEL_CHANGE_QUEUE", this.env.LEVEL_CHANGE_QUEUE, levelChanges);
       }
 
       // Check if it's time for a periodic full L2 snapshot (every 5 minutes)
       const lastFullL2Ts = this.lastFullL2SnapshotTs.get(assetId) || 0;
       if (sourceTs - lastFullL2Ts >= this.FULL_L2_INTERVAL_MS) {
-        // Extract full L2 depth for snapshot
-        const sortedBids = Array.from(localBook.bids.entries())
-          .sort((a, b) => b[0] - a[0])
-          .map(([price, size]) => ({ price, size }));
-        const sortedAsks = Array.from(localBook.asks.entries())
-          .sort((a, b) => a[0] - b[0])
-          .map(([price, size]) => ({ price, size }));
+        // Use centralized sorting helper
+        const sortedBids = this.getSortedLevels(localBook.bids, true);
+        const sortedAsks = this.getSortedLevels(localBook.asks, false);
 
         const fullL2Snapshot: FullL2Snapshot = {
           asset_id: assetId,
@@ -848,55 +870,35 @@ export class OrderbookManager extends DurableObject<Env> {
           order_min_size: this.orderMinSizes.get(assetId),
         };
 
-        await this.env.FULL_L2_QUEUE.send(fullL2Snapshot);
+        await this.sendToQueue("FULL_L2_QUEUE", this.env.FULL_L2_QUEUE, fullL2Snapshot);
         this.lastFullL2SnapshotTs.set(assetId, sourceTs);
       }
 
-      // Extract sorted levels from local book (only need top-of-book for BBO)
-      const sortedBids = Array.from(localBook.bids.entries())
-        .sort((a, b) => b[0] - a[0]); // Descending for bids
-      const sortedAsks = Array.from(localBook.asks.entries())
-        .sort((a, b) => a[0] - b[0]); // Ascending for asks
+      // Get sizes for best levels (O(1) lookup)
+      const bidSize = currentBestBid !== null ? localBook.bids.get(currentBestBid) ?? null : null;
+      const askSize = currentBestAsk !== null ? localBook.asks.get(currentBestAsk) ?? null : null;
 
-      const bestBid = sortedBids[0]?.[0] ?? null;
-      const bestAsk = sortedAsks[0]?.[0] ?? null;
-      const bidSize = sortedBids[0]?.[1] ?? null;
-      const askSize = sortedAsks[0]?.[1] ?? null;
+      // Use consolidated BBO extraction (handles duplicate suppression)
+      const snapshot = this.extractBBOSnapshot(
+        assetId,
+        conditionId,
+        sourceTs,
+        ingestionTs,
+        currentBestBid,
+        currentBestAsk,
+        bidSize,
+        askSize,
+        localBook.last_hash,
+        localBook.tick_size,
+        localBook.sequence
+      );
 
-      // Duplicate suppression - skip if top-of-book unchanged
-      const lastQuote = this.lastQuotes.get(assetId);
-      if (lastQuote && lastQuote.bestBid === bestBid && lastQuote.bestAsk === bestAsk) {
-        continue; // Top-of-book unchanged, skip snapshot
+      if (!snapshot) {
+        continue; // Duplicate, skip
       }
-      this.lastQuotes.set(assetId, { bestBid, bestAsk });
-
-      const midPrice = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null;
-      const spread = bestBid && bestAsk ? bestAsk - bestBid : null;
-      const spreadBps = midPrice && spread ? (spread / midPrice) * 10000 : null;
-
-      // BBO-only snapshot (~20-50x smaller than full L2)
-      const snapshot: BBOSnapshot = {
-        asset_id: assetId,
-        token_id: assetId,
-        condition_id: conditionId,
-        source_ts: sourceTs,
-        ingestion_ts: ingestionTs,
-        book_hash: localBook.last_hash,
-        best_bid: bestBid,
-        best_ask: bestAsk,
-        bid_size: bidSize,
-        ask_size: askSize,
-        mid_price: midPrice,
-        spread_bps: spreadBps,
-        tick_size: localBook.tick_size,
-        is_resync: false,
-        sequence_number: localBook.sequence,
-        neg_risk: this.negRisk.get(assetId),
-        order_min_size: this.orderMinSizes.get(assetId),
-      };
 
       // Queue for processing (async, goes through batching)
-      await this.env.SNAPSHOT_QUEUE.send(snapshot);
+      await this.sendToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, snapshot);
 
       // LOW-LATENCY: Evaluate triggers immediately (bypasses queues)
       await this.evaluateTriggers(snapshot);
@@ -925,7 +927,7 @@ export class OrderbookManager extends DurableObject<Env> {
     };
 
     // Queue trade tick for ClickHouse insertion
-    await this.env.TRADE_QUEUE.send(tradeTick);
+    await this.sendToQueue("TRADE_QUEUE", this.env.TRADE_QUEUE, tradeTick);
   }
 
   /**
@@ -976,6 +978,9 @@ export class OrderbookManager extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    // Clear alarm tracking since we're now executing
+    this.nextAlarmTime = null;
+
     const startTime = Date.now();
     let hasActiveConnections = false;
     let reconnectCount = 0;
@@ -985,7 +990,7 @@ export class OrderbookManager extends DurableObject<Env> {
     if (this.rateLimitedUntil > startTime) {
       const waitTime = this.rateLimitedUntil - startTime;
       console.log(`[Alarm] Rate limited, rescheduling in ${waitTime}ms`);
-      await this.ctx.storage.setAlarm(this.rateLimitedUntil + Math.random() * 1000);
+      await this.scheduleAlarm(waitTime + Math.random() * 1000);
       return;
     }
 
@@ -1036,7 +1041,7 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // Schedule next alarm if we have active connections
     if (hasActiveConnections || this.connections.size > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + this.PING_INTERVAL_MS);
+      await this.scheduleAlarm(this.PING_INTERVAL_MS);
     }
 
     const elapsed = Date.now() - startTime;
@@ -1052,6 +1057,219 @@ export class OrderbookManager extends DurableObject<Env> {
       orderMinSizes: Array.from(this.orderMinSizes.entries()),
       triggers: Array.from(this.triggers.values()),
     } satisfies PoolState);
+  }
+
+  // ============================================================
+  // HELPER METHODS
+  // ============================================================
+
+  /**
+   * Type guard for ErrorEvent - more type-safe than inline assertion
+   */
+  private isErrorEvent(event: Event): event is ErrorEvent {
+    return "message" in event && typeof (event as ErrorEvent).message === "string";
+  }
+
+  /**
+   * Safe queue send with error handling - prevents crashes from queue failures
+   */
+  private async sendToQueue<T>(
+    queueName: string,
+    queue: { send: (msg: T) => Promise<void> },
+    message: T
+  ): Promise<boolean> {
+    try {
+      await queue.send(message);
+      return true;
+    } catch (error) {
+      console.error(`[Queue] Failed to send to ${queueName}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Safe batch queue send with error handling
+   */
+  private async sendBatchToQueue<T>(
+    queueName: string,
+    queue: { sendBatch: (messages: { body: T }[]) => Promise<void> },
+    messages: T[]
+  ): Promise<boolean> {
+    try {
+      await queue.sendBatch(messages.map((body) => ({ body })));
+      return true;
+    } catch (error) {
+      console.error(`[Queue] Failed to send batch to ${queueName} (${messages.length} items):`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Schedule alarm with deduplication - prevents multiple alarms
+   */
+  private async scheduleAlarm(delayMs: number): Promise<void> {
+    const targetTime = Date.now() + delayMs;
+
+    // Only schedule if no alarm is set, or if this alarm should fire earlier
+    if (this.nextAlarmTime === null || targetTime < this.nextAlarmTime) {
+      await this.ctx.storage.setAlarm(targetTime);
+      this.nextAlarmTime = targetTime;
+    }
+  }
+
+  /**
+   * Clean up all in-memory state for an asset - prevents memory leaks
+   * Consolidated from handleUnsubscribe and removeAsset
+   */
+  private cleanupAssetState(assetId: string): void {
+    this.tickSizes.delete(assetId);
+    this.negRisk.delete(assetId);
+    this.orderMinSizes.delete(assetId);
+    this.localBooks.delete(assetId);
+    this.lastQuotes.delete(assetId);
+    this.lastFullL2SnapshotTs.delete(assetId);
+    this.subscriptionFailures.delete(assetId);
+    this.priceHistory.delete(assetId);
+    this.latestBBO.delete(assetId);
+
+    // Clean up triggers for this asset
+    const triggerIds = this.triggersByAsset.get(assetId);
+    if (triggerIds) {
+      for (const triggerId of triggerIds) {
+        this.triggers.delete(triggerId);
+        this.lastTriggerFire.delete(triggerId);
+      }
+      this.triggersByAsset.delete(assetId);
+    }
+  }
+
+  /**
+   * Find best bid price from a Map - O(n) but only called when best level is removed
+   */
+  private findBestBid(bids: Map<number, number>): number | null {
+    let best: number | null = null;
+    for (const price of bids.keys()) {
+      if (best === null || price > best) {
+        best = price;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Find best ask price from a Map - O(n) but only called when best level is removed
+   */
+  private findBestAsk(asks: Map<number, number>): number | null {
+    let best: number | null = null;
+    for (const price of asks.keys()) {
+      if (best === null || price < best) {
+        best = price;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Extract BBO snapshot from orderbook data - consolidated logic
+   * Returns null if this is a duplicate (top-of-book unchanged)
+   */
+  private extractBBOSnapshot(
+    assetId: string,
+    conditionId: string,
+    sourceTs: number,
+    ingestionTs: number,
+    bestBid: number | null,
+    bestAsk: number | null,
+    bidSize: number | null,
+    askSize: number | null,
+    bookHash: string,
+    tickSize: number,
+    sequence: number
+  ): BBOSnapshot | null {
+    // Duplicate suppression - skip if top-of-book unchanged
+    const lastQuote = this.lastQuotes.get(assetId);
+    if (lastQuote && lastQuote.bestBid === bestBid && lastQuote.bestAsk === bestAsk) {
+      return null; // Skip duplicate
+    }
+    this.lastQuotes.set(assetId, { bestBid, bestAsk });
+
+    const midPrice = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null;
+    const spread = bestBid && bestAsk ? bestAsk - bestBid : null;
+    const spreadBps = midPrice && spread ? (spread / midPrice) * 10000 : null;
+
+    return {
+      asset_id: assetId,
+      token_id: assetId,
+      condition_id: conditionId,
+      source_ts: sourceTs,
+      ingestion_ts: ingestionTs,
+      book_hash: bookHash,
+      best_bid: bestBid,
+      best_ask: bestAsk,
+      bid_size: bidSize,
+      ask_size: askSize,
+      mid_price: midPrice,
+      spread_bps: spreadBps,
+      tick_size: tickSize,
+      is_resync: false,
+      sequence_number: sequence,
+      neg_risk: this.negRisk.get(assetId),
+      order_min_size: this.orderMinSizes.get(assetId),
+    };
+  }
+
+  /**
+   * Get sorted levels from orderbook - centralized for consistency
+   */
+  private getSortedLevels(
+    book: Map<number, number>,
+    descending: boolean
+  ): { price: number; size: number }[] {
+    return Array.from(book.entries())
+      .sort(descending ? (a, b) => b[0] - a[0] : (a, b) => a[0] - b[0])
+      .map(([price, size]) => ({ price, size }));
+  }
+
+  /**
+   * Validate trigger condition parameters
+   */
+  private validateTriggerCondition(condition: Trigger["condition"]): string | null {
+    if (typeof condition.threshold !== "number") {
+      return "condition.threshold must be a number";
+    }
+
+    switch (condition.type) {
+      case "PRICE_ABOVE":
+      case "PRICE_BELOW":
+        if (!condition.side || !["BID", "ASK"].includes(condition.side)) {
+          return `${condition.type} requires condition.side to be "BID" or "ASK"`;
+        }
+        break;
+
+      case "PRICE_MOVE":
+        if (!condition.window_ms || typeof condition.window_ms !== "number") {
+          return "PRICE_MOVE requires condition.window_ms (number)";
+        }
+        if (condition.window_ms > this.PRICE_HISTORY_MAX_AGE_MS) {
+          return `window_ms cannot exceed ${this.PRICE_HISTORY_MAX_AGE_MS}ms`;
+        }
+        break;
+
+      case "SIZE_SPIKE":
+        if (!condition.side || !["BID", "ASK"].includes(condition.side)) {
+          return "SIZE_SPIKE requires condition.side to be 'BID' or 'ASK'";
+        }
+        break;
+
+      case "ARBITRAGE_BUY":
+      case "ARBITRAGE_SELL":
+        if (!condition.counterpart_asset_id) {
+          return `${condition.type} requires condition.counterpart_asset_id`;
+        }
+        break;
+    }
+
+    return null;
   }
 
   // ============================================================
@@ -1081,6 +1299,15 @@ export class OrderbookManager extends DurableObject<Env> {
             status: "error",
             message: "Missing required fields: asset_id, condition, webhook_url",
           } as TriggerRegistration,
+          { status: 400 }
+        );
+      }
+
+      // Validate condition-specific parameters
+      const validationError = this.validateTriggerCondition(body.condition);
+      if (validationError) {
+        return Response.json(
+          { trigger_id: "", status: "error", message: validationError } as TriggerRegistration,
           { status: 400 }
         );
       }
@@ -1202,7 +1429,8 @@ export class OrderbookManager extends DurableObject<Env> {
     const now = performance.now() * 1000 + performance.timeOrigin * 1000; // Microseconds
 
     // Update price history for PRICE_MOVE triggers
-    if (snapshot.mid_price !== null) {
+    // OPTIMIZATION: Only track history if we have active triggers (prevents memory leak)
+    if (snapshot.mid_price !== null && triggerIdsToCheck.size > 0) {
       let history = this.priceHistory.get(snapshot.asset_id);
       if (!history) {
         history = [];
@@ -1210,10 +1438,17 @@ export class OrderbookManager extends DurableObject<Env> {
       }
       history.push({ ts: snapshot.source_ts, mid_price: snapshot.mid_price });
 
-      // Prune old entries
+      // OPTIMIZATION: Prune old entries using slice instead of shift (O(n) vs O(n²))
       const cutoff = snapshot.source_ts - this.PRICE_HISTORY_MAX_AGE_MS;
-      while (history.length > 0 && history[0].ts < cutoff) {
-        history.shift();
+      let firstValidIdx = 0;
+      while (firstValidIdx < history.length && history[firstValidIdx].ts < cutoff) {
+        firstValidIdx++;
+      }
+      // Also enforce max entries limit to prevent unbounded growth
+      const startIdx = Math.max(firstValidIdx, history.length - this.MAX_PRICE_HISTORY_ENTRIES);
+      if (startIdx > 0) {
+        const newHistory = history.slice(startIdx);
+        this.priceHistory.set(snapshot.asset_id, newHistory);
       }
     }
 
@@ -1255,9 +1490,12 @@ export class OrderbookManager extends DurableObject<Env> {
           metadata: trigger.metadata,
         };
 
-        // Fire webhook asynchronously (don't block event processing)
-        this.dispatchTriggerWebhook(trigger, event).catch((err) =>
-          console.error(`[Trigger] Webhook dispatch failed for ${triggerId}:`, err)
+        // Fire webhook truly asynchronously using waitUntil
+        // This ensures DO doesn't shutdown before webhook completes while not blocking the hot path
+        this.ctx.waitUntil(
+          this.dispatchTriggerWebhook(trigger, event).catch((err) =>
+            console.error(`[Trigger] Webhook dispatch failed for ${triggerId}:`, err)
+          )
         );
       }
     }
