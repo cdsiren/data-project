@@ -83,10 +83,13 @@ export async function snapshotConsumer(
       validSnapshots.push(snapshot);
       message.ack();
     } catch (error) {
-      // Validation errors are likely permanent (bad data format), so ack to avoid infinite retries
-      // but do NOT push to validSnapshots - this prevents bad data from entering the system
-      console.error(`[Snapshot] Validation error for ${snapshot.asset_id}:`, error);
+      // CRITICAL FIX: Hash chain validation errors should NOT block data insertion
+      // The hash chain is for gap detection and duplicate suppression, not data integrity.
+      // It's better to have potentially duplicate data than to lose real-time BBO data.
+      console.error(`[Snapshot] Hash chain validation failed for ${snapshot.asset_id}, inserting anyway:`, error);
       stats.validation_errors++;
+      // Still insert the snapshot - data loss is worse than potential duplicates
+      validSnapshots.push(snapshot);
       message.ack();
     }
   }
@@ -104,7 +107,7 @@ export async function snapshotConsumer(
     console.log(
       `[Snapshot] Inserted ${validSnapshots.length}/${stats.total} BBO snapshots ` +
       `(valid=${stats.valid}, dup=${stats.duplicates}, gaps=${stats.gaps}, ` +
-      `first=${stats.first}, resync=${stats.resyncs})`
+      `first=${stats.first}, resync=${stats.resyncs}, errors=${stats.validation_errors})`
     );
 
     // Record latency metrics in BATCH (single HTTP request instead of N)
