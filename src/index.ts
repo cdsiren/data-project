@@ -1,5 +1,5 @@
 import { Hono, Context, Next } from "hono";
-import { Env, GoldskyTradeEvent } from "./types";
+import { Env, GoldskyTradeEvent, DeadLetterMessage } from "./types";
 import type {
   BBOSnapshot,
   GapBackfillJob,
@@ -13,8 +13,45 @@ import { gapBackfillConsumer } from "./consumers/gap-backfill-consumer";
 import { tradeTickConsumer } from "./consumers/trade-tick-consumer";
 import { levelChangeConsumer } from "./consumers/level-change-consumer";
 import { fullL2SnapshotConsumer } from "./consumers/full-l2-snapshot-consumer";
+import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
 import { MarketLifecycleService, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { DB_CONFIG } from "./config/database";
+
+// ============================================================
+// SHARD CONFIGURATION
+// Each shard = 1 DO instance = 1 WebSocket connection = max 450 assets
+// This prevents rate limiting by distributing connections across shards
+// ============================================================
+const SHARD_COUNT = 25; // Supports ~11,250 assets (25 × 450)
+
+/**
+ * DJB2 hash function - consistent string hashing
+ */
+function djb2Hash(str: string): number {
+  return Array.from(str).reduce(
+    (acc, char, idx) => ((acc << 5) - acc) + char.charCodeAt(0) + idx,
+    0
+  );
+}
+
+/**
+ * Deterministic shard assignment based on MARKET (condition_id).
+ * This ensures YES and NO tokens for the same market are ALWAYS on the same shard,
+ * which is CRITICAL for arbitrage triggers that need both sides' BBO data.
+ */
+function getShardForMarket(conditionId: string): string {
+  const hash = djb2Hash(conditionId);
+  return `shard-${Math.abs(hash) % SHARD_COUNT}`;
+}
+
+/**
+ * @deprecated Use getShardForMarket instead for market-based routing.
+ * Only use this for backward compatibility or single-asset operations.
+ */
+function getShardForAsset(assetId: string): string {
+  const hash = djb2Hash(assetId);
+  return `shard-${Math.abs(hash) % SHARD_COUNT}`;
+}
 
 /**
  * Load lifecycle webhooks from KV storage (parallel)
@@ -63,6 +100,7 @@ app.post("/webhook/goldsky", authMiddleware, async (c) => {
 
   const subscribedAssets: string[] = [];
   let cacheHits = 0;
+  let cacheMisses = 0;
 
   for (const event of events) {
     // Extract active asset ID (the one that's not "0")
@@ -75,33 +113,54 @@ app.post("/webhook/goldsky", authMiddleware, async (c) => {
     const cacheKey = `market:${activeAssetId}`;
     const cached = await c.env.MARKET_CACHE.get(cacheKey);
 
-    let conditionId = activeAssetId; // Default to asset ID
+    // RELIABILITY: Only subscribe if we have cached metadata with condition_id
+    // This ensures YES/NO pairs are ALWAYS routed to the same shard
+    // Cache miss = skip subscription, 5-minute cron will sync metadata
+    if (!cached) {
+      cacheMisses++;
+      console.warn(
+        `[Goldsky] Cache miss for asset ${activeAssetId.slice(0, 20)}... - skipping subscription (will retry after metadata sync)`
+      );
+      continue;
+    }
+
+    let conditionId: string;
     let tickSize = 0.01;
     let marketEnded = false;
     let negRisk = false;
     let orderMinSize = 0;
 
-    if (cached) {
-      try {
-        const metadata = JSON.parse(cached);
-        conditionId = metadata.condition_id || activeAssetId;
-        tickSize = metadata.order_price_min_tick_size || 0.01;
-        negRisk = metadata.neg_risk === 1 || metadata.neg_risk === true;
-        orderMinSize = metadata.order_min_size || 0;
-        // Check if market has ended
-        if (metadata.end_date) {
-          marketEnded = new Date(metadata.end_date) < new Date();
-        }
-        cacheHits++;
-      } catch {
-        // Use defaults if parse fails
+    try {
+      const metadata = JSON.parse(cached);
+      conditionId = metadata.condition_id;
+
+      // CRITICAL: condition_id is required for market-based sharding
+      if (!conditionId) {
+        console.warn(
+          `[Goldsky] Missing condition_id in cache for asset ${activeAssetId.slice(0, 20)}... - skipping`
+        );
+        continue;
       }
+
+      tickSize = metadata.order_price_min_tick_size || 0.01;
+      negRisk = metadata.neg_risk === 1 || metadata.neg_risk === true;
+      orderMinSize = metadata.order_min_size || 0;
+
+      // Check if market has ended
+      if (metadata.end_date) {
+        marketEnded = new Date(metadata.end_date) < new Date();
+      }
+      cacheHits++;
+    } catch {
+      console.error(`[Goldsky] Failed to parse cache for asset ${activeAssetId.slice(0, 20)}...`);
+      continue;
     }
-    // On cache miss, use defaults - metadata will be synced by 5-minute cron
 
     // Subscribe to orderbook WebSocket if market hasn't ended
+    // CRITICAL: Route by MARKET (condition_id) to ensure YES/NO pairs are on same shard
     if (!marketEnded) {
-      const doId = c.env.ORDERBOOK_MANAGER.idFromName(conditionId);
+      const shardId = getShardForMarket(conditionId);
+      const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardId);
       const stub = c.env.ORDERBOOK_MANAGER.get(doId);
       c.executionCtx.waitUntil(
         stub.fetch("http://do/subscribe", {
@@ -124,6 +183,7 @@ app.post("/webhook/goldsky", authMiddleware, async (c) => {
     events_received: events.length,
     subscriptions_triggered: subscribedAssets.length,
     cache_hits: cacheHits,
+    cache_misses: cacheMisses,
   });
 });
 
@@ -132,34 +192,195 @@ app.get("/health", (c) => {
 });
 
 // ============================================================
-// Low-Latency Trigger Management API
+// Low-Latency Trigger Management API (Sharded)
 // ============================================================
 
-async function proxyToDO(
-  c: Context<{ Bindings: Env }>,
-  endpoint: string,
-  method: string = "GET"
-): Promise<Response> {
-  const conditionId = c.req.param("condition_id");
-  const doId = c.env.ORDERBOOK_MANAGER.idFromName(conditionId);
+// List all triggers across all shards
+app.get("/triggers", authMiddleware, async (c) => {
+  const results = await Promise.all(
+    Array.from({ length: SHARD_COUNT }, async (_, i) => {
+      const doId = c.env.ORDERBOOK_MANAGER.idFromName(`shard-${i}`);
+      const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+      try {
+        const resp = await stub.fetch("http://do/triggers");
+        return resp.json() as Promise<{ triggers: unknown[]; total: number }>;
+      } catch {
+        return { triggers: [], total: 0 };
+      }
+    })
+  );
+
+  const allTriggers = results.flatMap((r) => r.triggers);
+  return c.json({
+    triggers: allTriggers,
+    total: allTriggers.length,
+    shards: SHARD_COUNT,
+  });
+});
+
+// Register a new trigger - routes to shard based on MARKET (condition_id)
+// This ensures triggers are on the same shard as their assets (critical for arbitrage)
+app.post("/triggers", authMiddleware, async (c) => {
+  const body = await c.req.json();
+
+  if (!body.asset_id) {
+    return c.json({ error: "Missing required field: asset_id" }, 400);
+  }
+
+  // Determine condition_id for market-based shard routing
+  let conditionId: string | null = body.condition_id || null;
+
+  if (!conditionId) {
+    // Look up condition_id from cache
+    const cacheKey = `market:${body.asset_id}`;
+    const cached = await c.env.MARKET_CACHE.get(cacheKey);
+
+    if (cached) {
+      try {
+        const metadata = JSON.parse(cached);
+        conditionId = metadata.condition_id;
+      } catch {
+        // Parse failed, continue without condition_id
+      }
+    }
+  }
+
+  // RELIABILITY: Require condition_id for proper shard routing
+  if (!conditionId) {
+    return c.json(
+      {
+        error: "Cannot determine market (condition_id) for asset. " +
+               "Either provide condition_id in request or ensure market metadata is cached.",
+        hint: "Run /lifecycle/check to sync market metadata, or provide condition_id explicitly",
+      },
+      400
+    );
+  }
+
+  // Route by MARKET to ensure trigger is on same shard as both YES/NO tokens
+  const shardId = getShardForMarket(conditionId);
+  const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardId);
   const stub = c.env.ORDERBOOK_MANAGER.get(doId);
 
-  const body = method !== "GET" ? await c.req.text() : undefined;
-  const response = await stub.fetch(`http://do${endpoint}`, {
-    method: method === "DELETE" ? "POST" : method,
-    headers: method !== "GET" ? { "Content-Type": "application/json" } : undefined,
-    body,
+  const response = await stub.fetch("http://do/triggers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 
   return new Response(response.body, {
     status: response.status,
     headers: { "Content-Type": "application/json" },
   });
-}
+});
 
-app.get("/triggers/:condition_id", authMiddleware, (c) => proxyToDO(c, "/triggers"));
-app.post("/triggers/:condition_id", authMiddleware, (c) => proxyToDO(c, "/triggers", "POST"));
-app.delete("/triggers/:condition_id", authMiddleware, (c) => proxyToDO(c, "/triggers/delete", "DELETE"));
+// Delete a trigger - routes by MARKET (condition_id) to correct shard
+app.delete("/triggers", authMiddleware, async (c) => {
+  const body = await c.req.json();
+
+  if (!body.trigger_id) {
+    return c.json({ error: "Missing required field: trigger_id" }, 400);
+  }
+
+  // Need either condition_id or asset_id to route to correct shard
+  if (!body.condition_id && !body.asset_id) {
+    return c.json({ error: "Missing required field: condition_id or asset_id" }, 400);
+  }
+
+  // Determine condition_id for market-based shard routing
+  let conditionId: string | null = body.condition_id || null;
+
+  if (!conditionId && body.asset_id) {
+    // Look up condition_id from cache
+    const cacheKey = `market:${body.asset_id}`;
+    const cached = await c.env.MARKET_CACHE.get(cacheKey);
+
+    if (cached) {
+      try {
+        const metadata = JSON.parse(cached);
+        conditionId = metadata.condition_id;
+      } catch {
+        // Parse failed
+      }
+    }
+  }
+
+  if (!conditionId) {
+    return c.json(
+      {
+        error: "Cannot determine market (condition_id) for routing. " +
+               "Provide condition_id or ensure market metadata is cached.",
+      },
+      400
+    );
+  }
+
+  const shardId = getShardForMarket(conditionId);
+  const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardId);
+  const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+
+  const response = await stub.fetch("http://do/triggers/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trigger_id: body.trigger_id }),
+  });
+
+  return new Response(response.body, {
+    status: response.status,
+    headers: { "Content-Type": "application/json" },
+  });
+});
+
+// ============================================================
+// Shard Monitoring
+// ============================================================
+
+// Get status of all shards - health check and asset distribution
+app.get("/shards/status", authMiddleware, async (c) => {
+  const statuses = await Promise.all(
+    Array.from({ length: SHARD_COUNT }, async (_, i) => {
+      const shardName = `shard-${i}`;
+      const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardName);
+      const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+
+      try {
+        const resp = await stub.fetch("http://do/status");
+        const data = (await resp.json()) as {
+          total_assets: number;
+          connections: Array<{ connected: boolean; asset_count: number }>;
+        };
+        return {
+          shard: i,
+          name: shardName,
+          ...data,
+          healthy: data.connections?.some((conn) => conn.connected) ?? false,
+        };
+      } catch (error) {
+        return {
+          shard: i,
+          name: shardName,
+          total_assets: 0,
+          connections: [],
+          healthy: false,
+          error: String(error),
+        };
+      }
+    })
+  );
+
+  const totalAssets = statuses.reduce((sum, s) => sum + (s.total_assets || 0), 0);
+  const healthyShards = statuses.filter((s) => s.healthy).length;
+
+  return c.json({
+    summary: {
+      total_shards: SHARD_COUNT,
+      healthy_shards: healthyShards,
+      total_assets: totalAssets,
+      avg_assets_per_shard: Math.round(totalAssets / SHARD_COUNT),
+    },
+    shards: statuses,
+  });
+});
 
 // ============================================================
 // Market Lifecycle Webhooks (Resolution & New Markets)
@@ -804,6 +1025,9 @@ async function queueHandler(batch: MessageBatch, env: Env) {
       break;
     case "full-l2-queue":
       await fullL2SnapshotConsumer(batch as MessageBatch<FullL2Snapshot>, env);
+      break;
+    case "dead-letter-queue":
+      await deadLetterConsumer(batch as MessageBatch<DeadLetterMessage>, env);
       break;
   }
 }

@@ -9,8 +9,19 @@ head_sampling_rate = 1
 invocation_logs = true
 
 # ============================================================
-# QUEUES - Optimized batch settings for 10x cost reduction
+# QUEUES - Optimized batch settings with reliability improvements
 # ============================================================
+
+# Dead Letter Queue for failed messages (reliability improvement)
+[[queues.producers]]
+queue = "dead-letter-queue"
+binding = "DEAD_LETTER_QUEUE"
+
+[[queues.consumers]]
+queue = "dead-letter-queue"
+max_batch_size = 50
+max_batch_timeout = 60
+max_retries = 0  # DLQ messages are stored, not retried
 
 [[queues.producers]]
 queue = "orderbook-snapshot-queue"
@@ -20,7 +31,8 @@ binding = "SNAPSHOT_QUEUE"
 queue = "orderbook-snapshot-queue"
 max_batch_size = 100
 max_batch_timeout = 30
-max_retries = 2
+max_retries = 5  # Increased from 2 for better resilience
+dead_letter_queue = "dead-letter-queue"
 
 # Gap backfill queue for recovery
 [[queues.producers]]
@@ -31,7 +43,8 @@ binding = "GAP_BACKFILL_QUEUE"
 queue = "gap-backfill-queue"
 max_batch_size = 10
 max_batch_timeout = 60
-max_retries = 2
+max_retries = 5
+dead_letter_queue = "dead-letter-queue"
 
 # Trade tick queue for execution-level data (backtesting)
 [[queues.producers]]
@@ -42,7 +55,8 @@ binding = "TRADE_QUEUE"
 queue = "trade-tick-queue"
 max_batch_size = 100
 max_batch_timeout = 30
-max_retries = 2
+max_retries = 5
+dead_letter_queue = "dead-letter-queue"
 
 # Level change queue for order placements/cancellations
 [[queues.producers]]
@@ -53,7 +67,8 @@ binding = "LEVEL_CHANGE_QUEUE"
 queue = "level-change-queue"
 max_batch_size = 100
 max_batch_timeout = 30
-max_retries = 2
+max_retries = 5
+dead_letter_queue = "dead-letter-queue"
 
 # Full L2 snapshot queue (periodic every 5 min)
 [[queues.producers]]
@@ -64,7 +79,8 @@ binding = "FULL_L2_QUEUE"
 queue = "full-l2-queue"
 max_batch_size = 50
 max_batch_timeout = 60
-max_retries = 2
+max_retries = 5
+dead_letter_queue = "dead-letter-queue"
 
 # ============================================================
 # DURABLE OBJECTS

@@ -226,3 +226,27 @@ ALTER TABLE polymarket.ob_level_changes ADD INDEX IF NOT EXISTS idx_change_type 
 -- Async inserts are enabled via URL parameters:
 --   ?async_insert=1&wait_for_async_insert=1
 -- ============================================================
+
+
+-- ============================================================
+-- DEAD LETTER MESSAGES - Failed queue messages for debugging
+-- Stores messages that failed processing after max retries
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS polymarket.dead_letter_messages (
+    original_queue LowCardinality(String),
+    message_type LowCardinality(String),  -- 'bbo_snapshot', 'gap_backfill', etc.
+    payload String,                        -- JSON serialized original message
+    error String,
+    failed_at DateTime64(3, 'UTC'),
+    received_at DateTime64(3, 'UTC'),
+    retry_count UInt8
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(failed_at)
+ORDER BY (original_queue, message_type, failed_at)
+TTL failed_at + INTERVAL 30 DAY
+SETTINGS index_granularity = 8192;
+
+-- Index for debugging by error message
+ALTER TABLE polymarket.dead_letter_messages ADD INDEX IF NOT EXISTS idx_error error TYPE tokenbf_v1(10240, 3, 0) GRANULARITY 4;

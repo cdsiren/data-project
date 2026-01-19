@@ -10,6 +10,7 @@ export const DB_CONFIG = {
     OB_SNAPSHOTS: "ob_snapshots",
     OB_BBO: "ob_bbo",
     OB_LEVEL_CHANGES: "ob_level_changes",
+    DEAD_LETTER: "dead_letter_messages",
   },
 } as const;
 

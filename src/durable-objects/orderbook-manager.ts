@@ -27,7 +27,14 @@ interface ConnectionState {
   pendingAssets: Set<string>; // Assets awaiting confirmation
   lastPing: number;
   subscriptionSent: boolean; // Track if we've sent subscription for current connection
+  abortController: AbortController | null; // For cleanup of event listeners
 }
+
+/**
+ * Per-WebSocket timeout state to prevent race conditions.
+ * Using WeakMap ensures no memory leaks if WebSocket objects linger.
+ */
+const wsTimeoutState = new WeakMap<WebSocket, { cleared: boolean }>();
 
 interface PoolState {
   assetToConnection: [string, string][];
@@ -72,6 +79,8 @@ export class OrderbookManager extends DurableObject<Env> {
   private priceHistory: Map<string, PriceHistoryEntry[]> = new Map(); // asset_id -> price history for PRICE_MOVE
   // Latest BBO per asset for arbitrage trigger evaluation
   private latestBBO: Map<string, { best_bid: number | null; best_ask: number | null; ts: number }> = new Map();
+  // CRITICAL PATH OPTIMIZATION: Pre-cached HMAC keys for webhook signing (avoids crypto.subtle.importKey on hot path)
+  private hmacKeyCache: Map<string, CryptoKey> = new Map();
   private readonly PRICE_HISTORY_MAX_AGE_MS = 60000; // Keep 60s of price history
   private readonly MAX_PRICE_HISTORY_ENTRIES = 1000; // Safety limit to prevent unbounded growth
   private readonly MAX_TRIGGERS_PER_ASSET = 50; // Prevent trigger spam
@@ -89,6 +98,11 @@ export class OrderbookManager extends DurableObject<Env> {
   private readonly MAX_SUBSCRIPTION_RETRIES = 3;
   private subscriptionFailures: Map<string, number> = new Map(); // Track failures per asset
 
+  // Queue backpressure tracking
+  private queueFailures: Map<string, { count: number; lastFailure: number }> = new Map();
+  private readonly QUEUE_FAILURE_THRESHOLD = 5;
+  private readonly QUEUE_FAILURE_WINDOW_MS = 60000;
+
   // Nautilus-style connection buffering to avoid rate limits
   private initialConnectionDelayMs: number = 5000; // Base delay, will be adjusted with DO ID stagger
   private readonly RATE_LIMIT_BASE_BACKOFF_MS = 60000; // Start at 60s backoff on 429 errors (increased from 30s)
@@ -97,46 +111,131 @@ export class OrderbookManager extends DurableObject<Env> {
   private rateLimitCount: number = 0; // Track consecutive rate limits for exponential backoff
   private connectionAttempts: number = 0; // Track consecutive failures
   private nextAlarmTime: number | null = null; // Track scheduled alarm to prevent duplicates
+  private shardId: string = "unknown"; // Shard identifier for logging
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.SNAPSHOT_INTERVAL_MS = parseInt(env.SNAPSHOT_INTERVAL_MS) || 1000;
 
-    // Stagger initial connection delay based on DO ID to prevent thundering herd
-    // Each DO gets a unique 0-60 second offset based on its ID hash
-    // Use a better hash function for more uniform distribution
+    // Shard-aware connection stagger to prevent thundering herd
+    // Each shard waits: 5s base + (shardIndex * 3s) + random jitter
+    // This ensures connections are established in sequence: shard-0 first, then shard-1, etc.
     const doIdStr = this.ctx.id.toString();
-    const doIdHash = Array.from(doIdStr).reduce((acc, char, idx) => {
-      return ((acc << 5) - acc) + char.charCodeAt(0) + idx;
-    }, 0);
-    const staggerMs = (Math.abs(doIdHash) % 60) * 1000; // 0-60 second stagger
+
+    // Try to extract shard index from DO name (e.g., "shard-5" -> 5)
+    // Fall back to hash-based stagger for non-shard DOs
+    const shardMatch = doIdStr.match(/shard-(\d+)/);
+    let staggerMs: number;
+
+    if (shardMatch) {
+      const shardIndex = parseInt(shardMatch[1], 10);
+      this.shardId = `shard-${shardIndex}`;
+      staggerMs = shardIndex * 3000; // 3 seconds between each shard
+      console.log(`[DO ${this.shardId}] Stagger delay: ${staggerMs}ms`);
+    } else {
+      // Fallback for non-shard DOs (legacy or global)
+      this.shardId = doIdStr.slice(0, 12);
+      const doIdHash = Array.from(doIdStr).reduce((acc, char, idx) => {
+        return ((acc << 5) - acc) + char.charCodeAt(0) + idx;
+      }, 0);
+      staggerMs = (Math.abs(doIdHash) % 60) * 1000; // 0-60 second stagger
+    }
+
     this.initialConnectionDelayMs = 5000 + staggerMs;
 
-    // Restore state on wake
+    // Restore state on wake with comprehensive validation
     this.ctx.blockConcurrencyWhile(async () => {
-      const stored = await this.ctx.storage.get<PoolState>("poolState");
+      try {
+        const stored = await this.ctx.storage.get<PoolState>("poolState");
 
-      if (stored) {
-        this.assetToConnection = new Map(stored.assetToConnection);
-        this.assetToMarket = new Map(stored.assetToMarket);
-        this.tickSizes = new Map(stored.tickSizes);
-        this.negRisk = new Map(stored.negRisk || []);
-        this.orderMinSizes = new Map(stored.orderMinSizes || []);
-
-        // Restore triggers
-        if (stored.triggers) {
-          for (const trigger of stored.triggers) {
-            this.triggers.set(trigger.id, trigger);
-            if (!this.triggersByAsset.has(trigger.asset_id)) {
-              this.triggersByAsset.set(trigger.asset_id, new Set());
-            }
-            this.triggersByAsset.get(trigger.asset_id)!.add(trigger.id);
-          }
-          console.log(`[DO] Restored ${this.triggers.size} triggers`);
+        if (!stored) {
+          console.log(`[DO ${this.shardId}] No persisted state found, starting fresh`);
+          return;
         }
 
-        // Rebuild connection asset sets
+        // ============================================================
+        // CRITICAL: Validate stored state structure before using it
+        // Corrupted or stale data could cause crashes or incorrect behavior
+        // ============================================================
+        if (!this.validateStoredState(stored)) {
+          console.error(`[DO ${this.shardId}] Invalid stored state structure, discarding`);
+          await this.ctx.storage.delete("poolState");
+          return;
+        }
+
+        // Restore maps with error handling
+        try {
+          this.assetToConnection = new Map(stored.assetToConnection);
+          this.assetToMarket = new Map(stored.assetToMarket);
+          this.tickSizes = new Map(stored.tickSizes);
+          this.negRisk = new Map(stored.negRisk || []);
+          this.orderMinSizes = new Map(stored.orderMinSizes || []);
+        } catch (mapError) {
+          console.error(`[DO ${this.shardId}] Failed to restore maps from stored arrays:`, mapError);
+          await this.emergencyStateReset("map_restore_failed");
+          return;
+        }
+
+        // Validate restored data consistency
+        const assetCount = this.assetToConnection.size;
+        const marketCount = this.assetToMarket.size;
+
+        if (assetCount > 0 && marketCount === 0) {
+          console.warn(
+            `[DO ${this.shardId}] Inconsistent state: ${assetCount} assets but 0 markets. ` +
+            `Clearing connections to force resync.`
+          );
+          await this.emergencyStateReset("inconsistent_asset_market_mapping");
+          return;
+        }
+
+        console.log(
+          `[DO ${this.shardId}] Restored state: ${assetCount} assets, ${marketCount} markets, ` +
+          `${this.tickSizes.size} tick sizes`
+        );
+
+        // Restore triggers with validation
+        if (stored.triggers && Array.isArray(stored.triggers)) {
+          let validTriggers = 0;
+          let invalidTriggers = 0;
+
+          for (const trigger of stored.triggers) {
+            // Validate trigger structure
+            if (!trigger.id || !trigger.asset_id || !trigger.condition || !trigger.webhook_url) {
+              console.warn(`[DO ${this.shardId}] Skipping invalid trigger:`, trigger.id || "unknown");
+              invalidTriggers++;
+              continue;
+            }
+
+            try {
+              this.triggers.set(trigger.id, trigger);
+              if (!this.triggersByAsset.has(trigger.asset_id)) {
+                this.triggersByAsset.set(trigger.asset_id, new Set());
+              }
+              this.triggersByAsset.get(trigger.asset_id)!.add(trigger.id);
+              validTriggers++;
+            } catch (triggerError) {
+              console.error(`[DO ${this.shardId}] Failed to restore trigger ${trigger.id}:`, triggerError);
+              invalidTriggers++;
+            }
+          }
+
+          if (validTriggers > 0 || invalidTriggers > 0) {
+            console.log(
+              `[DO ${this.shardId}] Restored triggers: ${validTriggers} valid, ${invalidTriggers} invalid/skipped`
+            );
+          }
+        }
+
+        // Rebuild connection asset sets with validation
         for (const [assetId, connId] of this.assetToConnection) {
+          // Validate connection ID
+          if (!connId || typeof connId !== "string") {
+            console.warn(`[DO ${this.shardId}] Invalid connId for asset ${assetId}, skipping`);
+            this.assetToConnection.delete(assetId);
+            continue;
+          }
+
           if (!this.connections.has(connId)) {
             this.connections.set(connId, {
               ws: null,
@@ -144,6 +243,7 @@ export class OrderbookManager extends DurableObject<Env> {
               pendingAssets: new Set(),
               lastPing: 0,
               subscriptionSent: false,
+              abortController: null,
             });
           }
           this.connections.get(connId)!.assets.add(assetId);
@@ -152,16 +252,107 @@ export class OrderbookManager extends DurableObject<Env> {
         // Nautilus-style: Don't reconnect immediately on wake
         // Schedule delayed connection with jitter to avoid thundering herd
         if (this.connections.size > 0) {
-          const jitter = Math.random() * 10000; // 0-10s random jitter (increased from 5s)
+          const jitter = Math.random() * 10000; // 0-10s random jitter
           const delay = this.initialConnectionDelayMs + jitter;
           console.log(
-            `[DO] Waking with ${this.connections.size} connections, ${this.assetToConnection.size} assets. ` +
+            `[DO ${this.shardId}] Waking with ${this.connections.size} connections, ${this.assetToConnection.size} assets. ` +
             `Scheduling connection in ${Math.round(delay)}ms (stagger=${Math.round(this.initialConnectionDelayMs - 5000)}ms)`
           );
           await this.ctx.storage.setAlarm(Date.now() + delay);
         }
+      } catch (error) {
+        console.error(`[DO ${this.shardId}] Critical error during state restoration:`, error);
+        await this.emergencyStateReset("critical_error");
       }
     });
+  }
+
+  /**
+   * Validate stored state structure before attempting to use it.
+   * Returns false if state is corrupted or has unexpected structure.
+   */
+  private validateStoredState(stored: PoolState): boolean {
+    // Check required array fields exist and are arrays
+    if (!Array.isArray(stored.assetToConnection)) {
+      console.error(`[DO ${this.shardId}] Invalid state: assetToConnection is not an array`);
+      return false;
+    }
+    if (!Array.isArray(stored.assetToMarket)) {
+      console.error(`[DO ${this.shardId}] Invalid state: assetToMarket is not an array`);
+      return false;
+    }
+    if (!Array.isArray(stored.tickSizes)) {
+      console.error(`[DO ${this.shardId}] Invalid state: tickSizes is not an array`);
+      return false;
+    }
+
+    // Validate array entries are tuples (spot check first few entries)
+    const checkTuples = (arr: unknown[], name: string): boolean => {
+      for (let i = 0; i < Math.min(arr.length, 5); i++) {
+        const entry = arr[i];
+        if (!Array.isArray(entry) || entry.length !== 2) {
+          console.error(`[DO ${this.shardId}] Invalid state: ${name}[${i}] is not a valid tuple`);
+          return false;
+        }
+      }
+      return true;
+    };
+
+    if (!checkTuples(stored.assetToConnection, "assetToConnection")) return false;
+    if (!checkTuples(stored.assetToMarket, "assetToMarket")) return false;
+    if (!checkTuples(stored.tickSizes, "tickSizes")) return false;
+
+    // Optional fields - validate if present
+    if (stored.negRisk !== undefined && !Array.isArray(stored.negRisk)) {
+      console.error(`[DO ${this.shardId}] Invalid state: negRisk is not an array`);
+      return false;
+    }
+    if (stored.orderMinSizes !== undefined && !Array.isArray(stored.orderMinSizes)) {
+      console.error(`[DO ${this.shardId}] Invalid state: orderMinSizes is not an array`);
+      return false;
+    }
+    if (stored.triggers !== undefined && !Array.isArray(stored.triggers)) {
+      console.error(`[DO ${this.shardId}] Invalid state: triggers is not an array`);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Emergency reset of all in-memory state and storage.
+   * Called when state is corrupted and cannot be recovered.
+   * Better to start fresh than crash repeatedly.
+   */
+  private async emergencyStateReset(reason: string): Promise<void> {
+    console.error(`[DO ${this.shardId}] EMERGENCY STATE RESET triggered: ${reason}`);
+
+    // Clear all in-memory state
+    this.connections.clear();
+    this.assetToConnection.clear();
+    this.assetToMarket.clear();
+    this.tickSizes.clear();
+    this.negRisk.clear();
+    this.orderMinSizes.clear();
+    this.localBooks.clear();
+    this.lastQuotes.clear();
+    this.lastFullL2SnapshotTs.clear();
+    this.triggers.clear();
+    this.triggersByAsset.clear();
+    this.lastTriggerFire.clear();
+    this.priceHistory.clear();
+    this.latestBBO.clear();
+    this.hmacKeyCache.clear();
+    this.subscriptionFailures.clear();
+    this.queueFailures.clear();
+
+    // Clear corrupted storage
+    try {
+      await this.ctx.storage.delete("poolState");
+      console.log(`[DO ${this.shardId}] Cleared corrupted poolState from storage`);
+    } catch (deleteError) {
+      console.error(`[DO ${this.shardId}] Failed to clear corrupted state:`, deleteError);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -335,6 +526,7 @@ export class OrderbookManager extends DurableObject<Env> {
       pendingAssets: new Set(),
       lastPing: 0,
       subscriptionSent: false,
+      abortController: null,
     });
 
     await this.reconnect(connId, 0);
@@ -356,7 +548,11 @@ export class OrderbookManager extends DurableObject<Env> {
       return;
     }
 
-    // Close existing connection
+    // Cleanup existing connection and event listeners
+    if (state.abortController) {
+      state.abortController.abort(); // This removes all event listeners added with this signal
+      state.abortController = null;
+    }
     if (state.ws) {
       try {
         state.ws.close();
@@ -391,25 +587,42 @@ export class OrderbookManager extends DurableObject<Env> {
       const ws = new WebSocket(this.env.CLOB_WSS_URL);
       state.ws = ws;
 
-      // Set up connection timeout with race condition protection
-      let connectionTimeout: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-        // Check both readyState and that we're still referencing this WS instance
-        if (ws.readyState === WebSocket.CONNECTING && state.ws === ws) {
+      // Create AbortController for this connection's event listeners
+      const abortController = new AbortController();
+      state.abortController = abortController;
+      const signal = abortController.signal;
+
+      // RACE CONDITION FIX: Use immutable timeout state per WebSocket instance
+      // This prevents the timeout callback from acting on stale state
+      const timeoutState = { cleared: false };
+      wsTimeoutState.set(ws, timeoutState);
+
+      const connectionTimeout = setTimeout(() => {
+        // Check if this timeout was already cleared by another handler
+        if (timeoutState.cleared) return;
+
+        // Only act if this WS is still the active connection AND still connecting
+        if (state.ws === ws && ws.readyState === WebSocket.CONNECTING) {
           console.error(`[WS ${connId}] Connection timeout after ${this.CONNECTION_TIMEOUT_MS}ms`);
+          timeoutState.cleared = true;
           ws.close();
           state.ws = null;
           // Schedule retry with backoff
           this.scheduleAlarm(this.RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt));
         }
-        connectionTimeout = null;
       }, this.CONNECTION_TIMEOUT_MS);
+
+      // Helper to clear timeout safely
+      const clearConnectionTimeout = () => {
+        if (!timeoutState.cleared) {
+          timeoutState.cleared = true;
+          clearTimeout(connectionTimeout);
+        }
+      };
 
       ws.addEventListener("open", () => {
         // Clear timeout on successful connection
-        if (connectionTimeout) {
-          clearTimeout(connectionTimeout);
-          connectionTimeout = null;
-        }
+        clearConnectionTimeout();
 
         // Reset rate limit and failure tracking on successful connection
         this.connectionAttempts = 0;
@@ -433,19 +646,16 @@ export class OrderbookManager extends DurableObject<Env> {
 
         // Schedule alarm for PING heartbeat
         this.scheduleAlarm(this.PING_INTERVAL_MS);
-      });
+      }, { signal });
 
       ws.addEventListener("message", (event) => {
         state.lastPing = Date.now();
         this.handleMessage(event.data as string, connId);
-      });
+      }, { signal });
 
       ws.addEventListener("close", (event) => {
         // Clear timeout if still pending
-        if (connectionTimeout) {
-          clearTimeout(connectionTimeout);
-          connectionTimeout = null;
-        }
+        clearConnectionTimeout();
 
         // Code 1006 = abnormal closure (connection failed)
         // Code 1000 = normal closure
@@ -475,14 +685,12 @@ export class OrderbookManager extends DurableObject<Env> {
 
         console.log(`[WS ${connId}] Scheduling reconnect in ${Math.round(delay)}ms (attempt ${this.connectionAttempts + 1})`);
         this.scheduleAlarm(delay);
-      });
+      }, { signal });
 
       ws.addEventListener("error", (event) => {
         // Clear timeout on error
-        if (connectionTimeout) {
-          clearTimeout(connectionTimeout);
-          connectionTimeout = null;
-        }
+        clearConnectionTimeout();
+
         // Extract useful error info using type guard
         const errorInfo = this.isErrorEvent(event)
           ? event.message
@@ -504,7 +712,7 @@ export class OrderbookManager extends DurableObject<Env> {
 
           this.rateLimitedUntil = Date.now() + totalBackoff;
           console.error(
-            `[WS ${connId}] RATE LIMITED (429) - exponential backoff ${Math.round(totalBackoff / 1000)}s ` +
+            `[DO ${this.shardId}] RATE LIMITED (429) - exponential backoff ${Math.round(totalBackoff / 1000)}s ` +
             `(attempt ${this.rateLimitCount}, base=${baseBackoff / 1000}s, jitter=${Math.round(jitter / 1000)}s)`
           );
           // Schedule retry after rate limit backoff
@@ -513,7 +721,7 @@ export class OrderbookManager extends DurableObject<Env> {
           console.error(`[WS ${connId}] Error: ${errorInfo}`);
           this.connectionAttempts++;
         }
-      });
+      }, { signal });
     } catch (error) {
       console.error(`[WS ${connId}] Connection failed:`, error);
       // Schedule retry
@@ -632,10 +840,11 @@ export class OrderbookManager extends DurableObject<Env> {
     this.cleanupAssetState(assetId);
   }
 
-  private async handleBookEvent(
+  // CRITICAL PATH OPTIMIZATION: Fully synchronous book event handling
+  private handleBookEvent(
     event: PolymarketBookEvent,
     ingestionTs: number
-  ): Promise<void> {
+  ): void {
     const sourceTs = parseInt(event.timestamp);
     const conditionId = this.assetToMarket.get(event.asset_id) || event.market;
     const tickSize = this.tickSizes.get(event.asset_id) || 0.01;
@@ -678,7 +887,10 @@ export class OrderbookManager extends DurableObject<Env> {
       neg_risk: this.negRisk.get(event.asset_id),
       order_min_size: this.orderMinSizes.get(event.asset_id),
     };
-    await this.sendToQueue("FULL_L2_QUEUE", this.env.FULL_L2_QUEUE, fullL2Snapshot);
+    // CRITICAL PATH OPTIMIZATION: Fire-and-forget queue send (non-blocking)
+    this.ctx.waitUntil(
+      this.sendToQueue("FULL_L2_QUEUE", this.env.FULL_L2_QUEUE, fullL2Snapshot)
+    );
     this.lastFullL2SnapshotTs.set(event.asset_id, sourceTs);
 
     const bestBid = bids[0]?.price ?? null;
@@ -705,11 +917,13 @@ export class OrderbookManager extends DurableObject<Env> {
       return; // Duplicate, skip
     }
 
-    // Queue for processing (async, goes through batching)
-    await this.sendToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, snapshot);
+    // CRITICAL PATH OPTIMIZATION: Fire-and-forget queue send (non-blocking)
+    this.ctx.waitUntil(
+      this.sendToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, snapshot)
+    );
 
-    // LOW-LATENCY: Evaluate triggers immediately (bypasses queues)
-    await this.evaluateTriggers(snapshot);
+    // LOW-LATENCY: Evaluate triggers synchronously (bypasses queues)
+    this.evaluateTriggersSync(snapshot);
   }
 
   /**
@@ -719,13 +933,16 @@ export class OrderbookManager extends DurableObject<Env> {
    * OPTIMIZED: Tracks best bid/ask incrementally to avoid O(n log n) sorting on every update.
    * Only performs full scan when best level is removed.
    *
+   * CRITICAL PATH OPTIMIZATION: Fully synchronous to minimize latency.
+   * Queue sends are fire-and-forget via ctx.waitUntil.
+   *
    * Note: asset_id is inside each price_change, not at the event level
    * A single event can contain changes for multiple assets
    */
-  private async handlePriceChangeEvent(
+  private handlePriceChangeEvent(
     event: PolymarketPriceChangeEvent,
     ingestionTs: number
-  ): Promise<void> {
+  ): void {
     const sourceTs = parseInt(event.timestamp);
 
     // Group price changes by asset_id (each change has its own asset_id)
@@ -843,9 +1060,14 @@ export class OrderbookManager extends DurableObject<Env> {
       localBook.sequence++;
       localBook.last_update_ts = sourceTs;
 
+      // CRITICAL PATH OPTIMIZATION: Collect all queue operations for parallel fire-and-forget
+      const queueOperations: Promise<boolean>[] = [];
+
       // Send level changes to queue (batch for efficiency)
       if (levelChanges.length > 0) {
-        await this.sendBatchToQueue("LEVEL_CHANGE_QUEUE", this.env.LEVEL_CHANGE_QUEUE, levelChanges);
+        queueOperations.push(
+          this.sendBatchToQueue("LEVEL_CHANGE_QUEUE", this.env.LEVEL_CHANGE_QUEUE, levelChanges)
+        );
       }
 
       // Check if it's time for a periodic full L2 snapshot (every 5 minutes)
@@ -870,7 +1092,9 @@ export class OrderbookManager extends DurableObject<Env> {
           order_min_size: this.orderMinSizes.get(assetId),
         };
 
-        await this.sendToQueue("FULL_L2_QUEUE", this.env.FULL_L2_QUEUE, fullL2Snapshot);
+        queueOperations.push(
+          this.sendToQueue("FULL_L2_QUEUE", this.env.FULL_L2_QUEUE, fullL2Snapshot)
+        );
         this.lastFullL2SnapshotTs.set(assetId, sourceTs);
       }
 
@@ -894,14 +1118,25 @@ export class OrderbookManager extends DurableObject<Env> {
       );
 
       if (!snapshot) {
+        // Still need to fire-and-forget pending queue operations before continuing
+        if (queueOperations.length > 0) {
+          this.ctx.waitUntil(Promise.all(queueOperations));
+        }
         continue; // Duplicate, skip
       }
 
-      // Queue for processing (async, goes through batching)
-      await this.sendToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, snapshot);
+      // Add snapshot queue to the batch
+      queueOperations.push(
+        this.sendToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, snapshot)
+      );
 
-      // LOW-LATENCY: Evaluate triggers immediately (bypasses queues)
-      await this.evaluateTriggers(snapshot);
+      // CRITICAL PATH OPTIMIZATION: Fire-and-forget all queue sends in parallel (non-blocking)
+      if (queueOperations.length > 0) {
+        this.ctx.waitUntil(Promise.all(queueOperations));
+      }
+
+      // LOW-LATENCY: Evaluate triggers synchronously (bypasses queues)
+      this.evaluateTriggersSync(snapshot);
     }
   }
 
@@ -1039,6 +1274,11 @@ export class OrderbookManager extends DurableObject<Env> {
       }
     }
 
+    // Periodic cleanup: Remove stale price history (every ~10th alarm, ~100s)
+    if (startTime % 100000 < this.PING_INTERVAL_MS) {
+      this.cleanupPriceHistory();
+    }
+
     // Schedule next alarm if we have active connections
     if (hasActiveConnections || this.connections.size > 0) {
       await this.scheduleAlarm(this.PING_INTERVAL_MS);
@@ -1046,6 +1286,47 @@ export class OrderbookManager extends DurableObject<Env> {
 
     const elapsed = Date.now() - startTime;
     console.log(`[Alarm] Completed in ${elapsed}ms - pings=${pingCount}, reconnects=${reconnectCount}`);
+  }
+
+  /**
+   * Clean up stale price history to prevent memory leaks.
+   * Removes history for unsubscribed assets and old entries.
+   */
+  private cleanupPriceHistory(): void {
+    const now = Date.now();
+    let cleaned = 0;
+
+    for (const [assetId, history] of this.priceHistory) {
+      // Remove if asset is not subscribed
+      if (!this.assetToConnection.has(assetId)) {
+        this.priceHistory.delete(assetId);
+        cleaned++;
+        continue;
+      }
+
+      // Remove if no active PRICE_MOVE triggers for this asset
+      const triggerIds = this.triggersByAsset.get(assetId);
+      const hasPriceMoveTrigger = triggerIds && Array.from(triggerIds).some(id => {
+        const t = this.triggers.get(id);
+        return t?.enabled && t.condition.type === "PRICE_MOVE";
+      });
+
+      if (!hasPriceMoveTrigger) {
+        this.priceHistory.delete(assetId);
+        cleaned++;
+        continue;
+      }
+
+      // Remove if last entry is too old (2x max age)
+      if (history.length > 0 && now - history[history.length - 1].ts > this.PRICE_HISTORY_MAX_AGE_MS * 2) {
+        this.priceHistory.delete(assetId);
+        cleaned++;
+      }
+    }
+
+    if (cleaned > 0) {
+      console.log(`[Alarm] Cleaned price history for ${cleaned} assets`);
+    }
   }
 
   private async persistState(): Promise<void> {
@@ -1071,34 +1352,79 @@ export class OrderbookManager extends DurableObject<Env> {
   }
 
   /**
-   * Safe queue send with error handling - prevents crashes from queue failures
+   * Check if queue is healthy (not too many recent failures)
+   */
+  private isQueueHealthy(queueName: string): boolean {
+    const failures = this.queueFailures.get(queueName);
+    if (!failures) return true;
+
+    const now = Date.now();
+    if (now - failures.lastFailure > this.QUEUE_FAILURE_WINDOW_MS) {
+      this.queueFailures.delete(queueName);
+      return true;
+    }
+
+    return failures.count < this.QUEUE_FAILURE_THRESHOLD;
+  }
+
+  private recordQueueFailure(queueName: string): void {
+    const now = Date.now();
+    const current = this.queueFailures.get(queueName);
+
+    if (current && now - current.lastFailure < this.QUEUE_FAILURE_WINDOW_MS) {
+      current.count++;
+      current.lastFailure = now;
+    } else {
+      this.queueFailures.set(queueName, { count: 1, lastFailure: now });
+    }
+  }
+
+  private recordQueueSuccess(queueName: string): void {
+    this.queueFailures.delete(queueName);
+  }
+
+  /**
+   * Safe queue send with backpressure - throttles when queue is unhealthy
    */
   private async sendToQueue<T>(
     queueName: string,
     queue: { send: (msg: T) => Promise<void> },
     message: T
   ): Promise<boolean> {
+    // Throttle 90% of messages when queue is unhealthy
+    if (!this.isQueueHealthy(queueName) && Math.random() > 0.1) {
+      return false;
+    }
+
     try {
       await queue.send(message);
+      this.recordQueueSuccess(queueName);
       return true;
     } catch (error) {
+      this.recordQueueFailure(queueName);
       console.error(`[Queue] Failed to send to ${queueName}:`, error);
       return false;
     }
   }
 
   /**
-   * Safe batch queue send with error handling
+   * Safe batch queue send with backpressure
    */
   private async sendBatchToQueue<T>(
     queueName: string,
     queue: { sendBatch: (messages: { body: T }[]) => Promise<void> },
     messages: T[]
   ): Promise<boolean> {
+    if (!this.isQueueHealthy(queueName) && Math.random() > 0.1) {
+      return false;
+    }
+
     try {
       await queue.sendBatch(messages.map((body) => ({ body })));
+      this.recordQueueSuccess(queueName);
       return true;
     } catch (error) {
+      this.recordQueueFailure(queueName);
       console.error(`[Queue] Failed to send batch to ${queueName} (${messages.length} items):`, error);
       return false;
     }
@@ -1138,6 +1464,8 @@ export class OrderbookManager extends DurableObject<Env> {
       for (const triggerId of triggerIds) {
         this.triggers.delete(triggerId);
         this.lastTriggerFire.delete(triggerId);
+        // Clean up cached HMAC keys
+        this.hmacKeyCache.delete(triggerId);
       }
       this.triggersByAsset.delete(assetId);
     }
@@ -1385,6 +1713,9 @@ export class OrderbookManager extends DurableObject<Env> {
       this.triggers.delete(trigger_id);
       this.triggersByAsset.get(trigger.asset_id)?.delete(trigger_id);
 
+      // Invalidate cached HMAC key
+      this.invalidateHmacKeyCache(trigger_id);
+
       // If wildcard, remove from all assets
       if (trigger.asset_id === "*") {
         for (const assetTriggers of this.triggersByAsset.values()) {
@@ -1403,9 +1734,11 @@ export class OrderbookManager extends DurableObject<Env> {
 
   // ============================================================
   // TRIGGER EVALUATION - Called on every BBO update
+  // CRITICAL PATH OPTIMIZATION: Fully synchronous to minimize latency
+  // Only webhook dispatch is async (via waitUntil)
   // ============================================================
 
-  private async evaluateTriggers(snapshot: BBOSnapshot): Promise<void> {
+  private evaluateTriggersSync(snapshot: BBOSnapshot): void {
     // Store latest BBO for arbitrage calculations
     this.latestBBO.set(snapshot.asset_id, {
       best_bid: snapshot.best_bid,
@@ -1452,6 +1785,9 @@ export class OrderbookManager extends DurableObject<Env> {
       }
     }
 
+    // CRITICAL PATH OPTIMIZATION: Collect all fired events for potential batched dispatch
+    const firedEvents: { trigger: Trigger; event: TriggerEvent }[] = [];
+
     for (const triggerId of triggerIdsToCheck) {
       const trigger = this.triggers.get(triggerId);
       if (!trigger || !trigger.enabled) continue;
@@ -1490,14 +1826,22 @@ export class OrderbookManager extends DurableObject<Env> {
           metadata: trigger.metadata,
         };
 
-        // Fire webhook truly asynchronously using waitUntil
-        // This ensures DO doesn't shutdown before webhook completes while not blocking the hot path
-        this.ctx.waitUntil(
-          this.dispatchTriggerWebhook(trigger, event).catch((err) =>
-            console.error(`[Trigger] Webhook dispatch failed for ${triggerId}:`, err)
-          )
-        );
+        firedEvents.push({ trigger, event });
       }
+    }
+
+    // Fire webhooks asynchronously using waitUntil (non-blocking)
+    // This ensures DO doesn't shutdown before webhooks complete while not blocking the hot path
+    if (firedEvents.length > 0) {
+      this.ctx.waitUntil(
+        Promise.all(
+          firedEvents.map(({ trigger, event }) =>
+            this.dispatchTriggerWebhook(trigger, event).catch((err) =>
+              console.error(`[Trigger] Webhook dispatch failed for ${trigger.id}:`, err)
+            )
+          )
+        )
+      );
     }
   }
 
@@ -1668,6 +2012,37 @@ export class OrderbookManager extends DurableObject<Env> {
     return { fired: false, actualValue: 0 };
   }
 
+  /**
+   * CRITICAL PATH OPTIMIZATION: Get or create cached HMAC key for webhook signing
+   * Avoids expensive crypto.subtle.importKey on every webhook dispatch (100-500μs savings)
+   */
+  private async getOrCreateHmacKey(triggerId: string, secret: string): Promise<CryptoKey> {
+    // Check cache first
+    let key = this.hmacKeyCache.get(triggerId);
+    if (key) {
+      return key;
+    }
+
+    // Import and cache the key
+    const encoder = new TextEncoder();
+    key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    this.hmacKeyCache.set(triggerId, key);
+    return key;
+  }
+
+  /**
+   * Invalidate cached HMAC key when trigger is deleted or secret changes
+   */
+  private invalidateHmacKeyCache(triggerId: string): void {
+    this.hmacKeyCache.delete(triggerId);
+  }
+
   private async dispatchTriggerWebhook(trigger: Trigger, event: TriggerEvent): Promise<void> {
     const body = JSON.stringify(event);
     const headers: Record<string, string> = {
@@ -1676,16 +2051,10 @@ export class OrderbookManager extends DurableObject<Env> {
       "X-Trigger-Type": trigger.condition.type,
     };
 
-    // Add HMAC signature if secret is configured
+    // Add HMAC signature if secret is configured (using cached key for performance)
     if (trigger.webhook_secret) {
+      const key = await this.getOrCreateHmacKey(trigger.id, trigger.webhook_secret);
       const encoder = new TextEncoder();
-      const key = await crypto.subtle.importKey(
-        "raw",
-        encoder.encode(trigger.webhook_secret),
-        { name: "HMAC", hash: "SHA-256" },
-        false,
-        ["sign"]
-      );
       const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
       headers["X-Trigger-Signature"] = btoa(String.fromCharCode(...new Uint8Array(signature)));
     }

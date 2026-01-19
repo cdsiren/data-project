@@ -17,6 +17,7 @@ export interface Env {
   TRADE_QUEUE: Queue<TradeTick>;
   LEVEL_CHANGE_QUEUE: Queue<OrderbookLevelChange>;
   FULL_L2_QUEUE: Queue<FullL2Snapshot>;
+  DEAD_LETTER_QUEUE: Queue<DeadLetterMessage>;
 
   // Durable Objects
   ORDERBOOK_MANAGER: DurableObjectNamespace;
@@ -115,4 +116,14 @@ export interface MarketEventRecord {
   event_id: string;
   market_id: string; // Foreign key to MarketMetadataRecord.id
   title: string;
+}
+
+// Dead Letter Queue message for failed processing
+export interface DeadLetterMessage {
+  original_queue: string;
+  message_type: "bbo_snapshot" | "gap_backfill" | "trade_tick" | "level_change" | "full_l2";
+  payload: unknown;
+  error: string;
+  failed_at: string;
+  retry_count: number;
 }

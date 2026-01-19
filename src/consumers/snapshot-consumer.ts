@@ -1,21 +1,10 @@
 // src/consumers/snapshot-consumer.ts
-// Writes BBO snapshots directly to ClickHouse with hash chain validation
-// Aggregation is handled by ClickHouse materialized views (more efficient)
+// BBO snapshots with hash chain validation for gap detection
 
 import type { Env } from "../types";
 import type { BBOSnapshot } from "../types/orderbook";
 import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
 import { HashChainValidator } from "../services/hash-chain";
-
-interface ValidationStats {
-  total: number;
-  valid: number;
-  duplicates: number;
-  gaps: number;
-  first: number;
-  resyncs: number;
-  validation_errors: number;
-}
 
 export async function snapshotConsumer(
   batch: MessageBatch<BBOSnapshot>,
@@ -25,102 +14,55 @@ export async function snapshotConsumer(
   const hashChain = new HashChainValidator(env.HASH_CHAIN_CACHE, env.GAP_BACKFILL_QUEUE);
 
   const validSnapshots: BBOSnapshot[] = [];
-  const stats: ValidationStats = {
-    total: batch.messages.length,
-    valid: 0,
-    duplicates: 0,
-    gaps: 0,
-    first: 0,
-    resyncs: 0,
-    validation_errors: 0,
-  };
+  const validMessages: Message<BBOSnapshot>[] = [];
+  let duplicates = 0, gaps = 0, resyncs = 0;
 
-  // Process each snapshot with hash chain validation
   for (const message of batch.messages) {
     const snapshot = message.body;
 
-    // Resync snapshots (from gap backfill) bypass hash chain validation
+    // Resyncs bypass hash chain validation
     if (snapshot.is_resync) {
-      stats.resyncs++;
+      resyncs++;
       validSnapshots.push(snapshot);
-      message.ack();
+      validMessages.push(message);
       continue;
     }
 
     try {
-      const validation = await hashChain.validateAndUpdate(
-        snapshot.asset_id,
-        snapshot.book_hash,
-        snapshot.source_ts
-      );
+      const v = await hashChain.validateAndUpdate(snapshot.asset_id, snapshot.book_hash, snapshot.source_ts);
 
-      if (validation.isDuplicate) {
-        stats.duplicates++;
+      if (v.isDuplicate) {
+        duplicates++;
         message.ack();
         continue;
       }
 
-      if (validation.gapDetected) {
-        stats.gaps++;
-        await clickhouse.recordGapEvent(
-          snapshot.asset_id,
-          validation.previousHash || "UNKNOWN",
-          snapshot.book_hash,
-          validation.gapDurationMs || 0
-        ).catch((err) => console.error("[Snapshot] Failed to record gap event:", err));
-
-        console.warn(
-          `[Snapshot] GAP DETECTED: ${snapshot.asset_id} ` +
-          `gap=${validation.gapDurationMs}ms seq=${validation.sequence}`
-        );
+      if (v.gapDetected) {
+        gaps++;
+        clickhouse.recordGapEvent(snapshot.asset_id, v.previousHash || "UNKNOWN", snapshot.book_hash, v.gapDurationMs || 0)
+          .catch(e => console.error("[Snapshot] Gap event failed:", e));
       }
 
-      if (validation.isFirst) {
-        stats.first++;
-      }
-
-      stats.valid++;
       validSnapshots.push(snapshot);
-      message.ack();
-    } catch (error) {
-      // CRITICAL FIX: Hash chain validation errors should NOT block data insertion
-      // The hash chain is for gap detection and duplicate suppression, not data integrity.
-      // It's better to have potentially duplicate data than to lose real-time BBO data.
-      console.error(`[Snapshot] Hash chain validation failed for ${snapshot.asset_id}, inserting anyway:`, error);
-      stats.validation_errors++;
-      // Still insert the snapshot - data loss is worse than potential duplicates
+      validMessages.push(message);
+    } catch {
+      // Hash chain errors shouldn't block data - insert anyway
       validSnapshots.push(snapshot);
-      message.ack();
+      validMessages.push(message);
     }
   }
 
   if (validSnapshots.length === 0) {
-    if (stats.duplicates > 0) {
-      console.log(`[Snapshot] Skipped ${stats.duplicates} duplicates`);
-    }
+    if (duplicates > 0) console.log(`[Snapshot] Skipped ${duplicates} duplicates`);
     return;
   }
 
-  // Insert directly to ClickHouse (aggregation handled by materialized views)
   try {
     await clickhouse.insertSnapshots(validSnapshots);
-    console.log(
-      `[Snapshot] Inserted ${validSnapshots.length}/${stats.total} BBO snapshots ` +
-      `(valid=${stats.valid}, dup=${stats.duplicates}, gaps=${stats.gaps}, ` +
-      `first=${stats.first}, resync=${stats.resyncs}, errors=${stats.validation_errors})`
-    );
-
-    // Record latency metrics in BATCH (single HTTP request instead of N)
-    const latencyMetrics = validSnapshots.map((snapshot) => ({
-      assetId: snapshot.asset_id,
-      sourceTs: snapshot.source_ts,
-      ingestionTs: snapshot.ingestion_ts,
-      eventType: snapshot.is_resync ? "resync" : "bbo",
-    }));
-
-    clickhouse.recordLatencyBatch(latencyMetrics)
-      .catch((err) => console.error("[Snapshot] Latency recording failed:", err));
+    for (const msg of validMessages) msg.ack();
+    console.log(`[Snapshot] Inserted ${validSnapshots.length}/${batch.messages.length} (dup=${duplicates}, gaps=${gaps}, resync=${resyncs})`);
   } catch (error) {
-    console.error("[Snapshot] ClickHouse insert failed:", error);
+    console.error("[Snapshot] Insert failed, retrying:", error);
+    for (const msg of validMessages) msg.retry();
   }
 }
