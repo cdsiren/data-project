@@ -10,8 +10,6 @@ import type {
 } from "../types/orderbook";
 import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
 
-const MAX_RETRIES = 3;
-
 interface CLOBBookResponse {
   market: string;
   asset_id: string;
@@ -31,17 +29,8 @@ export async function gapBackfillConsumer(
   for (const message of batch.messages) {
     const job = message.body;
 
-    if (job.retry_count >= MAX_RETRIES) {
-      console.error(`[GapBackfill] Max retries reached for ${job.asset_id}`);
-      await clickhouse.recordGapEvent(
-        job.asset_id,
-        job.last_known_hash,
-        "UNKNOWN",
-        Date.now() - job.gap_detected_at
-      );
-      message.ack();
-      continue;
-    }
+    // Note: Cloudflare's retry mechanism handles max retries (5 per wrangler.toml)
+    // Messages exceeding max_retries automatically go to dead-letter-queue
 
     try {
       // Fetch current orderbook from REST API
@@ -122,19 +111,13 @@ export async function gapBackfillConsumer(
       message.ack();
     } catch (error) {
       console.error(
-        `[GapBackfill] Attempt ${job.retry_count + 1} failed for ${
-          job.asset_id
-        }:`,
+        `[GapBackfill] Failed for ${job.asset_id}:`,
         error
       );
 
-      // Requeue with incremented retry
-      await env.GAP_BACKFILL_QUEUE.send({
-        ...job,
-        retry_count: job.retry_count + 1,
-      });
-
-      message.ack();
+      // Use Cloudflare's built-in retry mechanism instead of manual re-queue
+      // This prevents message accumulation on repeated failures
+      message.retry();
     }
   }
 }

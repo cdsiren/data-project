@@ -782,8 +782,7 @@ export class OrderbookManager extends DurableObject<Env> {
       return;
     }
 
-    const ingestionTs =
-      performance.now() * 1000 + performance.timeOrigin * 1000; // Microseconds
+    const ingestionTs = Date.now() * 1000; // Microseconds
 
     try {
       const event = JSON.parse(data) as PolymarketWSEvent;
@@ -1759,7 +1758,7 @@ export class OrderbookManager extends DurableObject<Env> {
 
     if (triggerIdsToCheck.size === 0) return;
 
-    const now = performance.now() * 1000 + performance.timeOrigin * 1000; // Microseconds
+    const now = Date.now() * 1000; // Microseconds
 
     // Update price history for PRICE_MOVE triggers
     // OPTIMIZATION: Only track history if we have active triggers (prevents memory leak)
