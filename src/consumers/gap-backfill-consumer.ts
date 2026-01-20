@@ -9,6 +9,8 @@ import type {
   FullL2Snapshot,
 } from "../types/orderbook";
 import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
+import { getDefaultMarketSource, getMarketType } from "../config/database";
+import type { MarketSource } from "../core/enums";
 
 interface CLOBBookResponse {
   market: string;
@@ -56,17 +58,31 @@ export async function gapBackfillConsumer(
         size: parseFloat(a.size),
       }));
 
-      // Extract BBO from parsed data
-      const bestBid = bids[0]?.price ?? null;
-      const bestAsk = asks[0]?.price ?? null;
-      const bidSize = bids[0]?.size ?? null;
-      const askSize = asks[0]?.size ?? null;
+      // CRITICAL FIX: Polymarket returns bids ASCENDING (lowest first) and asks DESCENDING (highest first)
+      // Best bid = HIGHEST bid price (max), Best ask = LOWEST ask price (min)
+      const bestBidLevel = bids.length > 0
+        ? bids.reduce((best, curr) => curr.price > best.price ? curr : best)
+        : null;
+      const bestAskLevel = asks.length > 0
+        ? asks.reduce((best, curr) => curr.price < best.price ? curr : best)
+        : null;
+
+      const bestBid = bestBidLevel?.price ?? null;
+      const bestAsk = bestAskLevel?.price ?? null;
+      const bidSize = bestBidLevel?.size ?? null;
+      const askSize = bestAskLevel?.size ?? null;
       const midPrice = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null;
       const spread = bestBid && bestAsk ? bestAsk - bestBid : null;
       const spreadBps = midPrice && spread ? (spread / midPrice) * 10000 : null;
 
       // Create BBO snapshot for tick-level data
+      // Use market_source from job if available, otherwise default to polymarket
+      const marketSource = (job.market_source ?? getDefaultMarketSource()) as MarketSource;
+      const marketType = job.market_type ?? getMarketType(marketSource);
+
       const bboSnapshot: BBOSnapshot = {
+        market_source: marketSource,
+        market_type: marketType,
         asset_id: book.asset_id,
         token_id: book.asset_id,
         condition_id: book.market,
@@ -86,6 +102,8 @@ export async function gapBackfillConsumer(
 
       // Create full L2 snapshot for depth recovery
       const fullL2Snapshot: FullL2Snapshot = {
+        market_source: marketSource,
+        market_type: marketType,
         asset_id: book.asset_id,
         token_id: book.asset_id,
         condition_id: book.market,

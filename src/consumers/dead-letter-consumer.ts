@@ -2,7 +2,8 @@
 // Stores failed messages to ClickHouse for analysis and potential recovery
 
 import type { Env, DeadLetterMessage } from "../types";
-import { getFullTableName } from "../config/database";
+import { getFullTableName, getDefaultMarketSource, getMarketType } from "../config/database";
+import type { MarketSource } from "../core/enums";
 import { buildAsyncInsertUrl, buildClickHouseHeaders } from "../services/clickhouse-client";
 
 /**
@@ -25,7 +26,11 @@ export async function deadLetterConsumer(
 
   const rows = batch.messages.map((m) => {
     const msg = m.body;
+    const marketSource = msg.market_source ?? getDefaultMarketSource();
+    const marketType = msg.market_type ?? getMarketType(marketSource as MarketSource);
     return {
+      market_source: marketSource,
+      market_type: marketType,
       original_queue: msg.original_queue,
       message_type: msg.message_type,
       payload: JSON.stringify(msg.payload),

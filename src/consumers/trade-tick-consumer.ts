@@ -2,7 +2,8 @@
 import type { Env } from "../types";
 import type { TradeTick } from "../types/orderbook";
 import { toClickHouseDateTime64, toClickHouseDateTime64Micro } from "../utils/datetime";
-import { getFullTableName } from "../config/database";
+import { getFullTableName, getDefaultMarketSource, getMarketType } from "../config/database";
+import type { MarketSource } from "../core/enums";
 import { insertRows, handleBatchResult } from "../services/clickhouse-utils";
 
 export async function tradeTickConsumer(
@@ -11,16 +12,22 @@ export async function tradeTickConsumer(
 ): Promise<void> {
   if (batch.messages.length === 0) return;
 
-  const rows = batch.messages.map(m => ({
-    asset_id: m.body.asset_id,
-    condition_id: m.body.condition_id,
-    trade_id: m.body.trade_id,
-    price: m.body.price,
-    size: m.body.size,
-    side: m.body.side,
-    source_ts: toClickHouseDateTime64(m.body.source_ts),
-    ingestion_ts: toClickHouseDateTime64Micro(m.body.ingestion_ts),
-  }));
+  const rows = batch.messages.map(m => {
+    const marketSource = m.body.market_source ?? getDefaultMarketSource();
+    const marketType = m.body.market_type ?? getMarketType(marketSource as MarketSource);
+    return {
+      market_source: marketSource,
+      market_type: marketType,
+      asset_id: m.body.asset_id,
+      condition_id: m.body.condition_id,
+      trade_id: m.body.trade_id,
+      price: m.body.price,
+      size: m.body.size,
+      side: m.body.side,
+      source_ts: toClickHouseDateTime64(m.body.source_ts),
+      ingestion_ts: toClickHouseDateTime64Micro(m.body.ingestion_ts),
+    };
+  });
 
   const result = await insertRows(env, getFullTableName("TRADE_TICKS"), rows);
   handleBatchResult(batch.messages, result, "TradeTick");

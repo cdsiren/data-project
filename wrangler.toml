@@ -132,6 +132,45 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 SNAPSHOT_INTERVAL_MS = "60000"
 
+# Multi-market configuration
+# Each market defines its adapter, connection settings, and market-specific config
+# To add a new market: add an entry here and implement the adapter in /src/adapters/{market}/
+MARKETS_CONFIG = '''
+[
+  {
+    "market_source": "polymarket",
+    "market_type": "prediction",
+    "enabled": true,
+    "ws_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+    "metadata_api_url": "https://gamma-api.polymarket.com",
+    "adapter_class": "PolymarketConnector",
+    "config": {
+      "max_instruments_per_ws": 500,
+      "price_range": [0.0, 1.0],
+      "heartbeat_interval_ms": 30000,
+      "reconnect_base_delay_ms": 1000,
+      "reconnect_max_delay_ms": 30000
+    }
+  },
+  {
+    "market_source": "kalshi",
+    "market_type": "prediction",
+    "enabled": false,
+    "ws_url": "wss://trading-api.kalshi.com/v1/ws",
+    "metadata_api_url": "https://api.kalshi.com/v1",
+    "adapter_class": "KalshiConnector",
+    "config": {
+      "max_instruments_per_ws": 100,
+      "price_range": [0.0, 1.0],
+      "heartbeat_interval_ms": 10000,
+      "reconnect_base_delay_ms": 1000,
+      "reconnect_max_delay_ms": 30000,
+      "requires_auth": true
+    }
+  }
+]
+'''
+
 # Secrets (set with: wrangler secret put SECRET_NAME)
 # CLICKHOUSE_URL - Full URL to ClickHouse HTTP interface
 # CLICKHOUSE_USER - ClickHouse username

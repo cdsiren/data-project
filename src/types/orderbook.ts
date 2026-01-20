@@ -1,226 +1,41 @@
 // src/types/orderbook.ts
-// New types for orderbook handling - import into existing types.ts if needed
+// Re-exports canonical types from core for backward compatibility
+// Polymarket-specific types are imported from adapters/polymarket/types.ts
 
-/**
- * Polymarket WebSocket book event
- * This is what we receive from wss://ws-subscriptions-clob.polymarket.com
- */
-export interface PolymarketBookEvent {
-  event_type: "book";
-  asset_id: string;
-  market: string; // condition_id
-  bids: Array<{ price: string; size: string }>;
-  asks: Array<{ price: string; size: string }>;
-  timestamp: string; // Unix ms as string
-  hash: string; // Critical for gap detection
-}
+// ============================================================
+// CANONICAL TYPES (from core - single source of truth)
+// market_source is REQUIRED in all canonical types
+// ============================================================
+export type {
+  BBOSnapshot,
+  TradeTick,
+  LocalOrderbook,
+  OrderbookLevelChange,
+  FullL2Snapshot,
+  GapBackfillJob,
+  HashChainState,
+  RealtimeTick,
+  EnhancedOrderbookSnapshot,
+} from "../core/orderbook";
 
-/**
- * Polymarket price_change event - incremental orderbook updates
- * Note: asset_id is inside each price_change, not at top level
- */
-export interface PolymarketPriceChangeEvent {
-  event_type: "price_change";
-  market: string; // condition_id at top level
-  price_changes: Array<{
-    asset_id: string; // Asset ID is per-change, not per-event
-    side: "BUY" | "SELL";
-    price: string;
-    size: string;
-    hash?: string;
-    best_bid?: string;
-    best_ask?: string;
-  }>;
-  timestamp: string;
-}
+// Re-export enums from core
+export type { TickDirection, LevelChangeType } from "../core/enums";
 
-export interface PolymarketLastTradePriceEvent {
-  event_type: "last_trade_price";
-  asset_id: string;
-  market: string;
-  price: string;
-  size: string;
-  side: "BUY" | "SELL";
-  timestamp: string;
-}
+// ============================================================
+// POLYMARKET-SPECIFIC TYPES (from adapters)
+// These are market-specific WebSocket event types
+// ============================================================
+export type {
+  PolymarketBookEvent,
+  PolymarketPriceChangeEvent,
+  PolymarketLastTradePriceEvent,
+  PolymarketTickSizeChangeEvent,
+  PolymarketWSEvent,
+} from "../adapters/polymarket/types";
 
-export interface PolymarketTickSizeChangeEvent {
-  event_type: "tick_size_change";
-  asset_id: string;
-  market: string;
-  old_tick_size: string;
-  new_tick_size: string;
-  timestamp: string;
-}
-
-export type PolymarketWSEvent =
-  | PolymarketBookEvent
-  | PolymarketPriceChangeEvent
-  | PolymarketLastTradePriceEvent
-  | PolymarketTickSizeChangeEvent;
-
-/**
- * Trade tick for execution-level data (critical for backtesting)
- */
-export interface TradeTick {
-  asset_id: string;
-  condition_id: string;
-  trade_id: string;
-  price: number;
-  size: number;
-  side: "BUY" | "SELL";
-  source_ts: number;
-  ingestion_ts: number;
-}
-
-/**
- * Tick direction for market microstructure analysis
- */
-export type TickDirection = "UP" | "DOWN" | "UNCHANGED";
-
-/**
- * Local orderbook state maintained in Durable Object
- */
-export interface LocalOrderbook {
-  asset_id: string;
-  condition_id: string;
-  bids: Map<number, number>; // price -> size
-  asks: Map<number, number>; // price -> size
-  tick_size: number;
-  last_hash: string;
-  last_update_ts: number;
-  sequence: number;
-}
-
-/**
- * Enhanced snapshot with gap detection and HFT fields
- * Follows CCXT/Nautilus Trader patterns for professional trading
- */
-export interface EnhancedOrderbookSnapshot {
-  asset_id: string;
-  token_id: string;
-  condition_id: string;
-  source_ts: number; // Polymarket's timestamp (microseconds for HFT precision)
-  ingestion_ts: number; // Our receipt timestamp (microseconds for precision)
-  book_hash: string; // For gap detection
-  bids: Array<{ price: number; size: number }>;
-  asks: Array<{ price: number; size: number }>;
-  best_bid: number | null;
-  best_ask: number | null;
-  mid_price: number | null;
-  spread: number | null;
-  spread_bps: number | null;
-  tick_size: number;
-  is_resync: boolean; // True if from gap backfill
-  sequence_number: number;
-
-  // HFT fields - market microstructure
-  tick_direction?: TickDirection; // Price movement vs previous tick
-  crossed?: boolean; // True if bid >= ask (error condition)
-
-  // Depth metrics (pre-computed for speed)
-  bid_depth_5?: number; // Sum of top 5 bid sizes
-  ask_depth_5?: number; // Sum of top 5 ask sizes
-  bid_depth_10?: number; // Sum of top 10 bid sizes
-  ask_depth_10?: number; // Sum of top 10 ask sizes
-  total_bid_depth?: number; // Total bid book depth
-  total_ask_depth?: number; // Total ask book depth
-
-  // Polymarket-specific
-  outcome?: "YES" | "NO"; // Which outcome this orderbook represents
-  neg_risk?: boolean; // Negative risk market flag
-  order_min_size?: number; // Minimum order size for this market
-
-  // ISO 8601 datetime for CCXT compatibility
-  datetime?: string;
-}
-
-/**
- * BBO (Best Bid/Offer) snapshot - lightweight alternative to full L2
- * Reduces data volume by ~20-50x while preserving essential price info
- * Use this for high-frequency tick storage
- */
-export interface BBOSnapshot {
-  asset_id: string;
-  token_id: string;
-  condition_id: string;
-  source_ts: number;
-  ingestion_ts: number;
-  book_hash: string;
-
-  // Top-of-book only (instead of full L2 arrays)
-  best_bid: number | null;
-  best_ask: number | null;
-  bid_size: number | null;  // Size at best bid
-  ask_size: number | null;  // Size at best ask
-  mid_price: number | null;
-  spread_bps: number | null;
-
-  tick_size: number;
-  is_resync: boolean;
-  sequence_number: number;
-  neg_risk?: boolean;
-  order_min_size?: number;
-}
-
-/**
- * Order book level change - tracks order placements, cancellations, and updates
- * Captures the delta when a price level changes in the order book
- */
-export type LevelChangeType = "ADD" | "REMOVE" | "UPDATE";
-
-export interface OrderbookLevelChange {
-  asset_id: string;
-  condition_id: string;
-  source_ts: number;
-  ingestion_ts: number;
-  side: "BUY" | "SELL";
-  price: number;
-  old_size: number;      // Previous size at this level (0 if new level)
-  new_size: number;      // New size at this level (0 if removed)
-  size_delta: number;    // new_size - old_size (positive = added, negative = removed)
-  change_type: LevelChangeType;
-  book_hash: string;
-  sequence_number: number;
-}
-
-/**
- * Full L2 snapshot for periodic deep orderbook capture
- * Stored every 5 minutes to preserve depth data while minimizing storage
- */
-export interface FullL2Snapshot {
-  asset_id: string;
-  token_id: string;
-  condition_id: string;
-  source_ts: number;
-  ingestion_ts: number;
-  book_hash: string;
-  bids: Array<{ price: number; size: number }>;
-  asks: Array<{ price: number; size: number }>;
-  tick_size: number;
-  sequence_number: number;
-  neg_risk?: boolean;
-  order_min_size?: number;
-}
-
-/**
- * Gap backfill job for recovery queue
- */
-export interface GapBackfillJob {
-  asset_id: string;
-  last_known_hash: string;
-  gap_detected_at: number;
-  retry_count: number;
-}
-
-/**
- * Hash chain state stored in KV
- */
-export interface HashChainState {
-  hash: string;
-  timestamp: number;
-  sequence: number;
-}
+// ============================================================
+// AGGREGATION TYPES (used for time-series analytics)
+// ============================================================
 
 /**
  * Aggregated 1-minute OHLC bar for orderbook snapshots
@@ -270,24 +85,6 @@ export interface AggregatedSnapshot {
   last_hash: string;
   sequence_start: number; // First sequence number in bar
   sequence_end: number; // Last sequence number in bar
-}
-
-/**
- * Realtime tick for trigger-based alerts (24h TTL)
- * HFT-grade: includes tick direction, crossed detection, sequence
- */
-export interface RealtimeTick {
-  asset_id: string;
-  source_ts: number; // Microseconds
-  best_bid: number | null;
-  best_ask: number | null;
-  mid_price: number | null;
-  spread_bps: number | null;
-  tick_direction: TickDirection;
-  crossed: boolean; // True if bid >= ask (error condition)
-  book_hash: string;
-  sequence_number: number;
-  ingestion_ts: number; // Microseconds
 }
 
 // ============================================================

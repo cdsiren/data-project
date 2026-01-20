@@ -29,7 +29,13 @@ export async function snapshotConsumer(
     }
 
     try {
-      const v = await hashChain.validateAndUpdate(snapshot.asset_id, snapshot.book_hash, snapshot.source_ts);
+      const v = await hashChain.validateAndUpdate(
+        snapshot.asset_id,
+        snapshot.book_hash,
+        snapshot.source_ts,
+        snapshot.market_source,
+        snapshot.market_type
+      );
 
       if (v.isDuplicate) {
         duplicates++;
@@ -39,8 +45,14 @@ export async function snapshotConsumer(
 
       if (v.gapDetected) {
         gaps++;
-        clickhouse.recordGapEvent(snapshot.asset_id, v.previousHash || "UNKNOWN", snapshot.book_hash, v.gapDurationMs || 0)
-          .catch(e => console.error("[Snapshot] Gap event failed:", e));
+        clickhouse.recordGapEvent(
+          snapshot.asset_id,
+          v.previousHash || "UNKNOWN",
+          snapshot.book_hash,
+          v.gapDurationMs || 0,
+          snapshot.market_source,
+          snapshot.market_type
+        ).catch(e => console.error("[Snapshot] Gap event failed:", e));
       }
 
       validSnapshots.push(snapshot);
@@ -67,6 +79,8 @@ export async function snapshotConsumer(
         sourceTs: s.source_ts,
         ingestionTs: s.ingestion_ts,
         eventType: "bbo_snapshot",
+        marketSource: s.market_source,
+        marketType: s.market_type,
       }))
     ).catch(e => console.error("[Snapshot] Latency recording failed:", e));
 

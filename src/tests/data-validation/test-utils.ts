@@ -121,11 +121,19 @@ export async function fetchLiveSpreads(tokenId: string): Promise<{
     if (!response.ok) {
       // Fall back to computing from orderbook if spread endpoint unavailable
       const book = await fetchLiveOrderbook(tokenId);
-      if (!book || !book.bids[0] || !book.asks[0]) {
+      if (!book || book.bids.length === 0 || book.asks.length === 0) {
         return null;
       }
-      const bestBid = parseFloat(book.bids[0].price);
-      const bestAsk = parseFloat(book.asks[0].price);
+      // CRITICAL: Polymarket returns bids ASCENDING (lowest first) and asks DESCENDING (highest first)
+      // Best bid = MAX(bids), Best ask = MIN(asks)
+      const bestBid = book.bids.reduce((max, b) => {
+        const price = parseFloat(b.price);
+        return price > max ? price : max;
+      }, 0);
+      const bestAsk = book.asks.reduce((min, a) => {
+        const price = parseFloat(a.price);
+        return min === 0 || price < min ? price : min;
+      }, 0);
       const mid = (bestBid + bestAsk) / 2;
       const spread = bestAsk - bestBid;
       return { spread, mid, best_bid: bestBid, best_ask: bestAsk };
@@ -166,8 +174,20 @@ export async function fetchOrderbookSummary(tokenId: string): Promise<{
       return null;
     }
 
-    const bestBid = book.bids[0] ? parseFloat(book.bids[0].price) : 0;
-    const bestAsk = book.asks[0] ? parseFloat(book.asks[0].price) : 0;
+    // CRITICAL: Polymarket returns bids ASCENDING (lowest first) and asks DESCENDING (highest first)
+    // Best bid = MAX(bids), Best ask = MIN(asks)
+    const bestBid = book.bids.length > 0
+      ? book.bids.reduce((max, b) => {
+          const price = parseFloat(b.price);
+          return price > max ? price : max;
+        }, 0)
+      : 0;
+    const bestAsk = book.asks.length > 0
+      ? book.asks.reduce((min, a) => {
+          const price = parseFloat(a.price);
+          return min === 0 || price < min ? price : min;
+        }, 0)
+      : 0;
     const midPrice = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : 0;
     const spread = bestAsk - bestBid;
     const spreadBps = midPrice > 0 ? (spread / midPrice) * 10000 : 0;

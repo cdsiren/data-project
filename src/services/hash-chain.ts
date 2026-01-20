@@ -45,7 +45,9 @@ export class HashChainValidator {
   async validateAndUpdate(
     assetId: string,
     newHash: string,
-    sourceTs: number
+    sourceTs: number,
+    marketSource?: string,
+    marketType?: string
   ): Promise<{
     valid: boolean;
     isDuplicate: boolean;
@@ -118,6 +120,8 @@ export class HashChainValidator {
 
       // Fire-and-forget queue job - gap detection is best-effort
       this.gapQueue.send({
+        market_source: marketSource || "polymarket",
+        market_type: marketType,
         asset_id: assetId,
         last_known_hash: lastState.hash,
         gap_detected_at: Date.now(),

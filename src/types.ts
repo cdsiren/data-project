@@ -5,6 +5,7 @@ import type {
   OrderbookLevelChange,
   FullL2Snapshot,
 } from "./types/orderbook";
+import type { MarketSource, MarketType } from "./core/enums";
 
 export interface Env {
   // KV Namespaces
@@ -120,6 +121,8 @@ export interface MarketEventRecord {
 
 // Dead Letter Queue message for failed processing
 export interface DeadLetterMessage {
+  market_source?: MarketSource;
+  market_type?: MarketType;
   original_queue: string;
   message_type: "bbo_snapshot" | "gap_backfill" | "trade_tick" | "level_change" | "full_l2";
   payload: unknown;

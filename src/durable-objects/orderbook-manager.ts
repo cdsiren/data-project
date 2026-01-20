@@ -14,12 +14,13 @@ import type {
   LocalOrderbook,
   OrderbookLevelChange,
   FullL2Snapshot,
-  LevelChangeType,
   Trigger,
   TriggerEvent,
   TriggerRegistration,
   PriceHistoryEntry,
 } from "../types/orderbook";
+import type { MarketSource, LevelChangeType } from "../core/enums";
+import { getDefaultMarketSource } from "../config/database";
 
 interface ConnectionState {
   ws: WebSocket | null;
@@ -39,6 +40,7 @@ const wsTimeoutState = new WeakMap<WebSocket, { cleared: boolean }>();
 interface PoolState {
   assetToConnection: [string, string][];
   assetToMarket: [string, string][];
+  assetToMarketSource?: [string, MarketSource][]; // For multi-market support
   tickSizes: [string, number][];
   negRisk: [string, boolean][];
   orderMinSizes: [string, number][];
@@ -58,6 +60,7 @@ export class OrderbookManager extends DurableObject<Env> {
   private connections: Map<string, ConnectionState> = new Map();
   private assetToConnection: Map<string, string> = new Map();
   private assetToMarket: Map<string, string> = new Map(); // asset_id -> condition_id
+  private assetToMarketSource: Map<string, MarketSource> = new Map(); // asset_id -> market_source (for multi-market support)
   private tickSizes: Map<string, number> = new Map();
   private negRisk: Map<string, boolean> = new Map(); // asset_id -> neg_risk flag
   private orderMinSizes: Map<string, number> = new Map(); // asset_id -> order_min_size
@@ -167,6 +170,7 @@ export class OrderbookManager extends DurableObject<Env> {
         try {
           this.assetToConnection = new Map(stored.assetToConnection);
           this.assetToMarket = new Map(stored.assetToMarket);
+          this.assetToMarketSource = new Map(stored.assetToMarketSource || []);
           this.tickSizes = new Map(stored.tickSizes);
           this.negRisk = new Map(stored.negRisk || []);
           this.orderMinSizes = new Map(stored.orderMinSizes || []);
@@ -331,6 +335,7 @@ export class OrderbookManager extends DurableObject<Env> {
     this.connections.clear();
     this.assetToConnection.clear();
     this.assetToMarket.clear();
+    this.assetToMarketSource.clear();
     this.tickSizes.clear();
     this.negRisk.clear();
     this.orderMinSizes.clear();
@@ -389,9 +394,12 @@ export class OrderbookManager extends DurableObject<Env> {
       tick_size?: number;
       neg_risk?: boolean;
       order_min_size?: number;
+      market_source?: MarketSource; // Multi-market support
     };
 
-    const { condition_id, token_ids, tick_size, neg_risk, order_min_size } = body;
+    const { condition_id, token_ids, tick_size, neg_risk, order_min_size, market_source } = body;
+    // Default to polymarket for backward compatibility
+    const effectiveMarketSource = market_source ?? getDefaultMarketSource();
     let subscribed = 0;
 
     for (const tokenId of token_ids) {
@@ -407,6 +415,7 @@ export class OrderbookManager extends DurableObject<Env> {
 
       // Store market mapping and metadata
       this.assetToMarket.set(tokenId, condition_id);
+      this.assetToMarketSource.set(tokenId, effectiveMarketSource);
       if (tick_size) this.tickSizes.set(tokenId, tick_size);
       if (neg_risk !== undefined) this.negRisk.set(tokenId, neg_risk);
       if (order_min_size !== undefined) this.orderMinSizes.set(tokenId, order_min_size);
@@ -446,17 +455,34 @@ export class OrderbookManager extends DurableObject<Env> {
   private async handleUnsubscribe(request: Request): Promise<Response> {
     const { token_ids } = (await request.json()) as { token_ids: string[] };
 
+    // Track connections that may need cleanup
+    const connectionsToCheck = new Set<string>();
+
     for (const tokenId of token_ids) {
       const connId = this.assetToConnection.get(tokenId);
       if (connId) {
         this.assetToConnection.delete(tokenId);
         this.assetToMarket.delete(tokenId);
-        this.connections.get(connId)?.assets.delete(tokenId);
-        this.connections.get(connId)?.pendingAssets.delete(tokenId);
+        const conn = this.connections.get(connId);
+        if (conn) {
+          conn.assets.delete(tokenId);
+          conn.pendingAssets.delete(tokenId);
+          connectionsToCheck.add(connId);
+        }
       }
 
       // Use consolidated cleanup method
       this.cleanupAssetState(tokenId);
+    }
+
+    // CRITICAL: Clean up empty connections to prevent memory leaks
+    for (const connId of connectionsToCheck) {
+      const conn = this.connections.get(connId);
+      if (conn && conn.assets.size === 0) {
+        await this.cleanupConnection(conn);
+        this.connections.delete(connId);
+        console.log(`[DO ${this.shardId}] Cleaned up empty connection ${connId}`);
+      }
     }
 
     await this.persistState();
@@ -533,6 +559,56 @@ export class OrderbookManager extends DurableObject<Env> {
     return connId;
   }
 
+  /**
+   * CRITICAL: Complete cleanup of WebSocket connection and all associated resources.
+   * MUST be called and awaited before creating a new connection to prevent memory leaks.
+   *
+   * This method:
+   * 1. Aborts all event listeners via AbortController
+   * 2. Closes the WebSocket and waits for close to complete
+   * 3. Clears all references to prevent leaks
+   */
+  private async cleanupConnection(state: ConnectionState): Promise<void> {
+    // 1. Abort all event listeners FIRST (prevents handlers from firing during cleanup)
+    if (state.abortController) {
+      state.abortController.abort();
+      state.abortController = null;
+    }
+
+    // 2. Close WebSocket and wait for it to finish
+    if (state.ws) {
+      const ws = state.ws;
+      state.ws = null; // Clear reference immediately to prevent double cleanup
+
+      try {
+        // If already closed/closing, skip
+        if (ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
+          ws.close();
+
+          // CRITICAL: Wait for close to complete (with timeout)
+          await new Promise<void>((resolve) => {
+            const checkInterval = 50; // Check every 50ms
+            const maxWaitMs = 2000; // Max 2 seconds
+            let elapsed = 0;
+
+            const checkClosed = () => {
+              if (ws.readyState === WebSocket.CLOSED || elapsed >= maxWaitMs) {
+                resolve();
+              } else {
+                elapsed += checkInterval;
+                setTimeout(checkClosed, checkInterval);
+              }
+            };
+            checkClosed();
+          });
+        }
+      } catch (error) {
+        // Log but continue cleanup even if close fails
+        console.warn(`[WS] Error during cleanup:`, error);
+      }
+    }
+  }
+
   private async reconnect(connId: string, attempt: number): Promise<void> {
     const state = this.connections.get(connId);
     if (!state) return;
@@ -548,19 +624,8 @@ export class OrderbookManager extends DurableObject<Env> {
       return;
     }
 
-    // Cleanup existing connection and event listeners
-    if (state.abortController) {
-      state.abortController.abort(); // This removes all event listeners added with this signal
-      state.abortController = null;
-    }
-    if (state.ws) {
-      try {
-        state.ws.close();
-      } catch {
-        // Ignore close errors
-      }
-      state.ws = null;
-    }
+    // CRITICAL: Complete cleanup before creating new connection (prevents memory leaks)
+    await this.cleanupConnection(state);
 
     // Reset subscription state on reconnect
     state.subscriptionSent = false;
@@ -860,6 +925,7 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // Initialize/reset local orderbook state (Nautilus-style L2_MBP)
     const localBook: LocalOrderbook = {
+      market_source: this.assetToMarketSource.get(event.asset_id) ?? getDefaultMarketSource(),
       asset_id: event.asset_id,
       condition_id: conditionId,
       bids: new Map(bids.map((b) => [b.price, b.size])),
@@ -873,6 +939,7 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // Emit full L2 snapshot on book event (initial snapshot or resync)
     const fullL2Snapshot: FullL2Snapshot = {
+      market_source: this.assetToMarketSource.get(event.asset_id) ?? getDefaultMarketSource(),
       asset_id: event.asset_id,
       token_id: event.asset_id,
       condition_id: conditionId,
@@ -892,10 +959,19 @@ export class OrderbookManager extends DurableObject<Env> {
     );
     this.lastFullL2SnapshotTs.set(event.asset_id, sourceTs);
 
-    const bestBid = bids[0]?.price ?? null;
-    const bestAsk = asks[0]?.price ?? null;
-    const bidSize = bids[0]?.size ?? null;
-    const askSize = asks[0]?.size ?? null;
+    // CRITICAL FIX: Polymarket returns bids ASCENDING (lowest first) and asks DESCENDING (highest first)
+    // Best bid = HIGHEST bid price (max), Best ask = LOWEST ask price (min)
+    const bestBidLevel = bids.length > 0
+      ? bids.reduce((best, curr) => curr.price > best.price ? curr : best)
+      : null;
+    const bestAskLevel = asks.length > 0
+      ? asks.reduce((best, curr) => curr.price < best.price ? curr : best)
+      : null;
+
+    const bestBid = bestBidLevel?.price ?? null;
+    const bestAsk = bestAskLevel?.price ?? null;
+    const bidSize = bestBidLevel?.size ?? null;
+    const askSize = bestAskLevel?.size ?? null;
 
     // Use consolidated BBO extraction (handles duplicate suppression)
     const snapshot = this.extractBBOSnapshot(
@@ -1002,6 +1078,7 @@ export class OrderbookManager extends DurableObject<Env> {
 
         // Emit level change event
         levelChanges.push({
+          market_source: this.assetToMarketSource.get(assetId) ?? getDefaultMarketSource(),
           asset_id: assetId,
           condition_id: conditionId,
           source_ts: sourceTs,
@@ -1077,6 +1154,7 @@ export class OrderbookManager extends DurableObject<Env> {
         const sortedAsks = this.getSortedLevels(localBook.asks, false);
 
         const fullL2Snapshot: FullL2Snapshot = {
+          market_source: this.assetToMarketSource.get(assetId) ?? getDefaultMarketSource(),
           asset_id: assetId,
           token_id: assetId,
           condition_id: conditionId,
@@ -1150,6 +1228,7 @@ export class OrderbookManager extends DurableObject<Env> {
     const conditionId = this.assetToMarket.get(event.asset_id) || event.market;
 
     const tradeTick: TradeTick = {
+      market_source: this.assetToMarketSource.get(event.asset_id) ?? getDefaultMarketSource(),
       asset_id: event.asset_id,
       condition_id: conditionId,
       trade_id: `${event.asset_id}-${sourceTs}-${crypto.randomUUID().slice(0, 8)}`,
@@ -1332,6 +1411,7 @@ export class OrderbookManager extends DurableObject<Env> {
     await this.ctx.storage.put("poolState", {
       assetToConnection: Array.from(this.assetToConnection.entries()),
       assetToMarket: Array.from(this.assetToMarket.entries()),
+      assetToMarketSource: Array.from(this.assetToMarketSource.entries()),
       tickSizes: Array.from(this.tickSizes.entries()),
       negRisk: Array.from(this.negRisk.entries()),
       orderMinSizes: Array.from(this.orderMinSizes.entries()),
@@ -1450,6 +1530,7 @@ export class OrderbookManager extends DurableObject<Env> {
     this.tickSizes.delete(assetId);
     this.negRisk.delete(assetId);
     this.orderMinSizes.delete(assetId);
+    this.assetToMarketSource.delete(assetId);
     this.localBooks.delete(assetId);
     this.lastQuotes.delete(assetId);
     this.lastFullL2SnapshotTs.delete(assetId);
@@ -1525,6 +1606,7 @@ export class OrderbookManager extends DurableObject<Env> {
     const spreadBps = midPrice && spread ? (spread / midPrice) * 10000 : null;
 
     return {
+      market_source: this.assetToMarketSource.get(assetId) ?? getDefaultMarketSource(),
       asset_id: assetId,
       token_id: assetId,
       condition_id: conditionId,
@@ -1770,17 +1852,18 @@ export class OrderbookManager extends DurableObject<Env> {
       }
       history.push({ ts: snapshot.source_ts, mid_price: snapshot.mid_price });
 
-      // OPTIMIZATION: Prune old entries using slice instead of shift (O(n) vs O(n²))
+      // CRITICAL: Prune on EVERY update to prevent unbounded growth
+      // Uses splice() for in-place modification (no new array allocation)
       const cutoff = snapshot.source_ts - this.PRICE_HISTORY_MAX_AGE_MS;
       let firstValidIdx = 0;
       while (firstValidIdx < history.length && history[firstValidIdx].ts < cutoff) {
         firstValidIdx++;
       }
-      // Also enforce max entries limit to prevent unbounded growth
+      // Enforce both time-based and count-based limits
       const startIdx = Math.max(firstValidIdx, history.length - this.MAX_PRICE_HISTORY_ENTRIES);
       if (startIdx > 0) {
-        const newHistory = history.slice(startIdx);
-        this.priceHistory.set(snapshot.asset_id, newHistory);
+        // In-place pruning - no new array allocation, guaranteed memory safety
+        history.splice(0, startIdx);
       }
     }
 
