@@ -6,13 +6,9 @@ import type { MarketSource, MarketType } from "../core/enums";
 
 /**
  * Mapping from market source to market type
- * Following CCXT's market.type pattern
  */
 export const MARKET_SOURCE_TO_TYPE: Record<MarketSource, MarketType> = {
   polymarket: "prediction",
-  kalshi: "prediction",
-  uniswap: "dex",
-  binance: "cex",
 } as const;
 
 export const DB_CONFIG = {
@@ -76,14 +72,12 @@ export function getMarketType(source: MarketSource): MarketType {
  * Check if a market source is valid
  */
 export function isValidMarketSource(source: string): source is MarketSource {
-  const validSources: MarketSource[] = ["polymarket", "kalshi", "uniswap", "binance"];
-  return validSources.includes(source as MarketSource);
+  return source === "polymarket";
 }
 
 /**
  * Check if a market type is valid
  */
 export function isValidMarketType(type: string): type is MarketType {
-  const validTypes: MarketType[] = ["prediction", "dex", "cex"];
-  return validTypes.includes(type as MarketType);
+  return type === "prediction";
 }

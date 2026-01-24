@@ -47,7 +47,7 @@ export interface TriggerCondition {
  */
 export interface Trigger {
   id: string;                     // Unique trigger ID
-  market_source: MarketSource;    // Market this trigger is for
+  market_source?: MarketSource;   // Market this trigger is for (optional for legacy compatibility)
   asset_id: string;               // Asset to monitor (or "*" for all in market)
   condition: TriggerCondition;
   webhook_url: string;            // URL to POST when trigger fires
@@ -65,7 +65,7 @@ export interface Trigger {
 export interface TriggerEvent {
   trigger_id: string;
   trigger_type: TriggerType;
-  market_source: MarketSource;
+  market_source?: MarketSource;   // Optional for legacy compatibility
   asset_id: string;
   condition_id: string;
   fired_at: number;               // Microsecond timestamp

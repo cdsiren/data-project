@@ -177,7 +177,7 @@ describe("P2: Performance", () => {
           sum(rows) as raw_rows,
           sum(bytes_on_disk) as raw_bytes
         FROM system.parts
-        WHERE database = 'polymarket'
+        WHERE database = 'trading_data'
           AND active = 1
         GROUP BY table
         ORDER BY raw_bytes DESC
@@ -280,7 +280,7 @@ describe("P2: Performance", () => {
           sum(rows) as rows,
           formatReadableSize(sum(bytes_on_disk)) as size
         FROM system.parts
-        WHERE database = 'polymarket'
+        WHERE database = 'trading_data'
           AND table = 'ob_snapshots'
           AND active = 1
         GROUP BY partition

@@ -73,16 +73,22 @@ export async function snapshotConsumer(
     await clickhouse.insertSnapshots(validSnapshots);
 
     // Record latency metrics for monitoring (fire-and-forget, don't block main flow)
-    clickhouse.recordLatencyBatch(
-      validSnapshots.map(s => ({
-        assetId: s.asset_id,
-        sourceTs: s.source_ts,
-        ingestionTs: s.ingestion_ts,
-        eventType: "bbo_snapshot",
-        marketSource: s.market_source,
-        marketType: s.market_type,
-      }))
-    ).catch(e => console.error("[Snapshot] Latency recording failed:", e));
+    // COST OPTIMIZATION: Sample 1% of snapshots for latency recording
+    // This reduces ob_latency inserts by 99% while still providing
+    // statistically valid p50/p95/p99 percentiles for monitoring
+    const sampledSnapshots = validSnapshots.filter(() => Math.random() < 0.01);
+    if (sampledSnapshots.length > 0) {
+      clickhouse.recordLatencyBatch(
+        sampledSnapshots.map(s => ({
+          assetId: s.asset_id,
+          sourceTs: s.source_ts,
+          ingestionTs: s.ingestion_ts,
+          eventType: "bbo_snapshot",
+          marketSource: s.market_source,
+          marketType: s.market_type,
+        }))
+      ).catch(e => console.error("[Snapshot] Latency recording failed:", e));
+    }
 
     for (const msg of validMessages) msg.ack();
     console.log(`[Snapshot] Inserted ${validSnapshots.length}/${batch.messages.length} (dup=${duplicates}, gaps=${gaps}, resync=${resyncs})`);

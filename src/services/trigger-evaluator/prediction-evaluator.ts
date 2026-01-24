@@ -9,9 +9,8 @@ import type {
   TriggerEvaluationResult,
 } from "../../core/triggers";
 import type { BBOSnapshot } from "../../core/orderbook";
-import { BaseTriggerEvaluator } from "../../adapters/base/trigger-evaluator";
-import type { ITriggerEvaluator } from "../../adapters/base/trigger-evaluator";
-import { GenericTriggerEvaluator } from "./base-evaluator";
+import { BaseTriggerEvaluator, GenericTriggerEvaluator } from "./base-evaluator";
+import type { ITriggerEvaluator } from "./base-evaluator";
 
 /**
  * Prediction market trigger evaluator

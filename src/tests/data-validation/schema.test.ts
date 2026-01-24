@@ -53,14 +53,14 @@ describe("P3: Schema Validation", () => {
       const query = `
         SELECT name
         FROM system.tables
-        WHERE database = 'polymarket'
+        WHERE database = 'trading_data'
         ORDER BY name
       `;
 
       const result = await executeQuery<{ name: string }>(config, query);
       const actualTables = result.data.map((r) => r.name);
 
-      console.log(`\nTables in polymarket database:`);
+      console.log(`\nTables in trading_data database:`);
       for (const table of actualTables) {
         const expected = expectedTables.includes(table) ? "✓" : " ";
         console.log(`  ${expected} ${table}`);
@@ -87,7 +87,7 @@ describe("P3: Schema Validation", () => {
       const query = `
         SELECT name, type
         FROM system.columns
-        WHERE database = 'polymarket' AND table = 'ob_snapshots'
+        WHERE database = 'trading_data' AND table = 'ob_snapshots'
         ORDER BY position
       `;
 
@@ -136,7 +136,7 @@ describe("P3: Schema Validation", () => {
       const query = `
         SELECT name, type
         FROM system.columns
-        WHERE database = 'polymarket' AND table = 'trade_ticks'
+        WHERE database = 'trading_data' AND table = 'trade_ticks'
         ORDER BY position
       `;
 

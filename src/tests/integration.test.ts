@@ -109,7 +109,7 @@ describe("ClickHouse Database Integration", () => {
 
     const response = await fetch(
       `${CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        "SELECT name FROM system.databases WHERE name = 'polymarket' FORMAT JSON"
+        "SELECT name FROM system.databases WHERE name = 'trading_data' FORMAT JSON"
       )}`,
       { method: "GET", headers: getHeaders() }
     );
@@ -125,7 +125,7 @@ describe("ClickHouse Database Integration", () => {
 
     const response = await fetch(
       `${CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        "SELECT name FROM system.tables WHERE database = 'polymarket' AND name = 'ob_snapshots' FORMAT JSON"
+        "SELECT name FROM system.tables WHERE database = 'trading_data' AND name = 'ob_snapshots' FORMAT JSON"
       )}`,
       { method: "GET", headers: getHeaders() }
     );
@@ -185,7 +185,7 @@ describe("ClickHouse Database Integration", () => {
 
     // Insert
     const insertResponse = await fetch(
-      `${CLICKHOUSE_URL}/?query=INSERT INTO polymarket.ob_snapshots FORMAT JSONEachRow`,
+      `${CLICKHOUSE_URL}/?query=INSERT INTO trading_data.ob_snapshots FORMAT JSONEachRow`,
       {
         method: "POST",
         headers: getHeaders(),
@@ -201,7 +201,7 @@ describe("ClickHouse Database Integration", () => {
     // Read back
     const readResponse = await fetch(
       `${CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        `SELECT * FROM polymarket.ob_snapshots WHERE asset_id = '${testSnapshot.asset_id}' FORMAT JSON`
+        `SELECT * FROM trading_data.ob_snapshots WHERE asset_id = '${testSnapshot.asset_id}' FORMAT JSON`
       )}`,
       { method: "GET", headers: getHeaders() }
     );
@@ -221,7 +221,7 @@ describe("ClickHouse Database Integration", () => {
     // Cleanup - delete test data
     await fetch(
       `${CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        `ALTER TABLE polymarket.ob_snapshots DELETE WHERE asset_id = '${testSnapshot.asset_id}'`
+        `ALTER TABLE trading_data.ob_snapshots DELETE WHERE asset_id = '${testSnapshot.asset_id}'`
       )}`,
       { method: "POST", headers: getHeaders() }
     );
@@ -249,7 +249,7 @@ describe("ClickHouse Database Integration", () => {
     const body = snapshots.map((s) => JSON.stringify(s)).join("\n");
 
     const insertResponse = await fetch(
-      `${CLICKHOUSE_URL}/?query=INSERT INTO polymarket.ob_snapshots FORMAT JSONEachRow`,
+      `${CLICKHOUSE_URL}/?query=INSERT INTO trading_data.ob_snapshots FORMAT JSONEachRow`,
       {
         method: "POST",
         headers: getHeaders(),
@@ -264,7 +264,7 @@ describe("ClickHouse Database Integration", () => {
     // Verify count
     const countResponse = await fetch(
       `${CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        `SELECT count() as cnt FROM polymarket.ob_snapshots WHERE condition_id = '${batchId}_condition' FORMAT JSON`
+        `SELECT count() as cnt FROM trading_data.ob_snapshots WHERE condition_id = '${batchId}_condition' FORMAT JSON`
       )}`,
       { method: "GET", headers: getHeaders() }
     );
@@ -276,7 +276,7 @@ describe("ClickHouse Database Integration", () => {
     // Cleanup
     await fetch(
       `${CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        `ALTER TABLE polymarket.ob_snapshots DELETE WHERE condition_id = '${batchId}_condition'`
+        `ALTER TABLE trading_data.ob_snapshots DELETE WHERE condition_id = '${batchId}_condition'`
       )}`,
       { method: "POST", headers: getHeaders() }
     );
@@ -401,7 +401,7 @@ describe("End-to-End Pipeline Test", () => {
     };
 
     const insertResponse = await fetch(
-      `${CLICKHOUSE_URL}/?query=INSERT INTO polymarket.ob_snapshots FORMAT JSONEachRow`,
+      `${CLICKHOUSE_URL}/?query=INSERT INTO trading_data.ob_snapshots FORMAT JSONEachRow`,
       {
         method: "POST",
         headers,
@@ -416,7 +416,7 @@ describe("End-to-End Pipeline Test", () => {
 
     const readResponse = await fetch(
       `${CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        `SELECT * FROM polymarket.ob_snapshots WHERE asset_id = '${snapshot.asset_id}' FORMAT JSON`
+        `SELECT * FROM trading_data.ob_snapshots WHERE asset_id = '${snapshot.asset_id}' FORMAT JSON`
       )}`,
       { method: "GET", headers }
     );
@@ -441,7 +441,7 @@ describe("End-to-End Pipeline Test", () => {
     // 5. Cleanup
     await fetch(
       `${CLICKHOUSE_URL}/?query=${encodeURIComponent(
-        `ALTER TABLE polymarket.ob_snapshots DELETE WHERE asset_id = '${snapshot.asset_id}'`
+        `ALTER TABLE trading_data.ob_snapshots DELETE WHERE asset_id = '${snapshot.asset_id}'`
       )}`,
       { method: "POST", headers }
     );

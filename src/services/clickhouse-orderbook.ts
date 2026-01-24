@@ -8,6 +8,18 @@ import { buildAsyncInsertUrl, buildClickHouseHeaders } from "./clickhouse-client
 /** Valid market sources - must match MarketSource type in core/enums.ts */
 const VALID_MARKET_SOURCES = new Set(["polymarket", "kalshi", "uniswap", "binance"]);
 
+/** Gap event row for batched insert */
+interface GapEventRow {
+  market_source: string;
+  market_type: string;
+  asset_id: string;
+  detected_at: string;
+  last_known_hash: string;
+  new_hash: string;
+  gap_duration_ms: number;
+  resolution: string;
+}
+
 /**
  * Validate and normalize market_source to prevent data corruption.
  * Returns default if invalid to ensure data is never lost.
@@ -31,6 +43,14 @@ function validateMarketSource(value: string | undefined): string {
 export class ClickHouseOrderbookClient {
   private baseUrl: string;
   private headers: HeadersInit;
+
+  // Gap event buffering for cost optimization
+  // Batches gap events to reduce HTTP overhead (flushes on size or timeout)
+  private static gapEventBuffer: GapEventRow[] = [];
+  private static readonly GAP_EVENT_BUFFER_SIZE = 100;
+  private static readonly GAP_EVENT_FLUSH_INTERVAL_MS = 5000;
+  private static gapEventFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private static gapEventFlushPromise: Promise<void> | null = null;
 
   constructor(env: Env) {
     this.baseUrl = env.CLICKHOUSE_URL;
@@ -120,7 +140,9 @@ export class ClickHouseOrderbookClient {
   }
 
   /**
-   * Record gap event
+   * Record gap event with buffering for cost optimization.
+   * Gap events are batched and flushed on size (100) or timeout (5s).
+   * This reduces HTTP overhead from ~1.3M individual inserts to ~13K batched inserts.
    */
   async recordGapEvent(
     assetId: string,
@@ -132,7 +154,7 @@ export class ClickHouseOrderbookClient {
   ): Promise<void> {
     const effectiveMarketSource = validateMarketSource(marketSource);
     const effectiveMarketType = marketType ?? getMarketType(effectiveMarketSource as MarketSource);
-    const row = {
+    const row: GapEventRow = {
       market_source: effectiveMarketSource,
       market_type: effectiveMarketType,
       asset_id: assetId,
@@ -143,9 +165,65 @@ export class ClickHouseOrderbookClient {
       resolution: "PENDING",
     };
 
-    await fetch(
-      buildAsyncInsertUrl(this.baseUrl, getFullTableName("OB_GAP_EVENTS")),
-      { method: "POST", headers: this.headers, body: JSON.stringify(row) }
-    );
+    // Add to buffer
+    ClickHouseOrderbookClient.gapEventBuffer.push(row);
+
+    // Schedule flush timer if not already set
+    if (ClickHouseOrderbookClient.gapEventFlushTimer === null) {
+      ClickHouseOrderbookClient.gapEventFlushTimer = setTimeout(() => {
+        this.flushGapEvents().catch((e) =>
+          console.error("[ClickHouse] Gap event flush failed:", e)
+        );
+      }, ClickHouseOrderbookClient.GAP_EVENT_FLUSH_INTERVAL_MS);
+    }
+
+    // Flush immediately if buffer is full
+    if (ClickHouseOrderbookClient.gapEventBuffer.length >= ClickHouseOrderbookClient.GAP_EVENT_BUFFER_SIZE) {
+      await this.flushGapEvents();
+    }
+  }
+
+  /**
+   * Flush buffered gap events to ClickHouse.
+   * Uses locking to prevent concurrent flushes.
+   */
+  private async flushGapEvents(): Promise<void> {
+    // Wait for any in-progress flush to complete
+    if (ClickHouseOrderbookClient.gapEventFlushPromise) {
+      await ClickHouseOrderbookClient.gapEventFlushPromise;
+    }
+
+    // Clear timer
+    if (ClickHouseOrderbookClient.gapEventFlushTimer) {
+      clearTimeout(ClickHouseOrderbookClient.gapEventFlushTimer);
+      ClickHouseOrderbookClient.gapEventFlushTimer = null;
+    }
+
+    // Take ownership of buffer
+    const buffer = ClickHouseOrderbookClient.gapEventBuffer;
+    if (buffer.length === 0) return;
+    ClickHouseOrderbookClient.gapEventBuffer = [];
+
+    // Perform flush with lock
+    ClickHouseOrderbookClient.gapEventFlushPromise = (async () => {
+      try {
+        const body = buffer.map((r) => JSON.stringify(r)).join("\n");
+        const response = await fetch(
+          buildAsyncInsertUrl(this.baseUrl, getFullTableName("OB_GAP_EVENTS")),
+          { method: "POST", headers: this.headers, body }
+        );
+
+        if (!response.ok) {
+          const error = await response.text();
+          console.error(`[ClickHouse] Gap event batch insert failed: ${error}`);
+        } else {
+          console.log(`[ClickHouse] Flushed ${buffer.length} gap events`);
+        }
+      } finally {
+        ClickHouseOrderbookClient.gapEventFlushPromise = null;
+      }
+    })();
+
+    await ClickHouseOrderbookClient.gapEventFlushPromise;
   }
 }

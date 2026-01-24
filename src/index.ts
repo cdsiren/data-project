@@ -45,15 +45,6 @@ function getShardForMarket(conditionId: string): string {
 }
 
 /**
- * @deprecated Use getShardForMarket instead for market-based routing.
- * Only use this for backward compatibility or single-asset operations.
- */
-function getShardForAsset(assetId: string): string {
-  const hash = djb2Hash(assetId);
-  return `shard-${Math.abs(hash) % SHARD_COUNT}`;
-}
-
-/**
  * Load lifecycle webhooks from KV storage (parallel)
  */
 async function loadLifecycleWebhooks(env: Env): Promise<MarketLifecycleWebhook[]> {
@@ -1051,10 +1042,40 @@ async function scheduledHandler(
     }
 
     ctx.waitUntil(
-      lifecycle.runCheck().then((results) => {
+      lifecycle.runCheck().then(async (results) => {
         console.log(
           `[Scheduled] Lifecycle check complete: ${results.resolutions} resolutions, ${results.new_markets} new markets, ${results.metadata_synced} metadata synced`
         );
+
+        // CRITICAL: Unsubscribe resolved markets to prevent false gap events
+        // This fixes the root cause of 1.3M+ daily false gap events
+        for (const event of results.resolutionEvents) {
+          for (const tokenId of event.token_ids) {
+            const shardId = getShardForMarket(event.condition_id);
+            const doId = env.ORDERBOOK_MANAGER.idFromName(shardId);
+            const stub = env.ORDERBOOK_MANAGER.get(doId);
+
+            try {
+              await stub.fetch(new Request("https://do/unsubscribe", {
+                method: "POST",
+                body: JSON.stringify({ token_ids: [tokenId] }),
+              }));
+              console.log(`[Scheduled] Unsubscribed ${tokenId.slice(0, 20)}... from ${shardId}`);
+            } catch (err) {
+              console.error(`[Scheduled] Failed to unsubscribe ${tokenId}:`, err);
+            }
+          }
+
+          // Clean up hash chain cache for both YES and NO tokens
+          // This prevents stale hash chain state from triggering false gaps
+          for (const tokenId of event.token_ids) {
+            try {
+              await env.HASH_CHAIN_CACHE.delete(`chain:${tokenId}`);
+            } catch (err) {
+              console.error(`[Scheduled] Failed to clean hash chain for ${tokenId}:`, err);
+            }
+          }
+        }
       })
     );
   }

@@ -572,7 +572,7 @@ describe("P0: Mathematical Consistency", () => {
             asset_id,
             minute,
             finalizeAggregation(tick_count_state) as mv_count
-          FROM polymarket.mv_ob_bbo_1m
+          FROM trading_data.mv_ob_bbo_1m
           WHERE minute >= now() - INTERVAL 1 HOUR
             AND minute < now() - INTERVAL 5 MINUTE
         )

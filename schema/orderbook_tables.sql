@@ -6,7 +6,7 @@
 -- L2 Orderbook Snapshots
 -- Primary storage for orderbook state over time
 -- NOTE: Uses Decimal128(18) for price data to avoid floating-point precision errors
-CREATE TABLE IF NOT EXISTS polymarket.ob_snapshots (
+CREATE TABLE IF NOT EXISTS trading_data.ob_snapshots (
     asset_id String,
     condition_id String,
     source_ts DateTime64(3, 'UTC'),      -- Polymarket's timestamp
@@ -66,11 +66,11 @@ TTL source_ts + INTERVAL 90 DAY
 SETTINGS index_granularity = 8192;
 
 -- Index for hash lookups (gap detection queries)
-ALTER TABLE polymarket.ob_snapshots ADD INDEX IF NOT EXISTS idx_book_hash book_hash TYPE bloom_filter GRANULARITY 4;
+ALTER TABLE trading_data.ob_snapshots ADD INDEX IF NOT EXISTS idx_book_hash book_hash TYPE bloom_filter GRANULARITY 4;
 
 
 -- Gap Detection Audit Log
-CREATE TABLE IF NOT EXISTS polymarket.ob_gap_events (
+CREATE TABLE IF NOT EXISTS trading_data.ob_gap_events (
     asset_id String,
     detected_at DateTime64(3, 'UTC'),
     last_known_hash String,
@@ -86,7 +86,7 @@ ORDER BY (asset_id, detected_at);
 
 
 -- Ingestion Latency Metrics
-CREATE TABLE IF NOT EXISTS polymarket.ob_latency (
+CREATE TABLE IF NOT EXISTS trading_data.ob_latency (
     asset_id String,
     source_ts DateTime64(3, 'UTC'),
     ingestion_ts DateTime64(6, 'UTC'),
@@ -103,7 +103,7 @@ TTL source_ts + INTERVAL 7 DAY;
 -- NOTE: Uses AggregatingMergeTree with State functions for correct aggregation on merge.
 -- Query with: SELECT asset_id, hour, countMerge(snapshot_count), avgMerge(avg_spread_bps_state), ...
 -- SummingMergeTree would corrupt avg() results by summing averages during part merges.
-CREATE MATERIALIZED VIEW IF NOT EXISTS polymarket.mv_ob_hourly_stats
+CREATE MATERIALIZED VIEW IF NOT EXISTS trading_data.mv_ob_hourly_stats
 ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(hour)
 ORDER BY (asset_id, hour)
@@ -118,12 +118,12 @@ SELECT
     avgState(total_bid_depth) as avg_bid_depth_state,
     avgState(total_ask_depth) as avg_ask_depth_state,
     avgState(book_imbalance) as avg_imbalance_state
-FROM polymarket.ob_snapshots
+FROM trading_data.ob_snapshots
 GROUP BY asset_id, hour;
 
 
 -- Latency Percentiles View
-CREATE MATERIALIZED VIEW IF NOT EXISTS polymarket.mv_ob_latency_hourly
+CREATE MATERIALIZED VIEW IF NOT EXISTS trading_data.mv_ob_latency_hourly
 ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMMDD(hour)
 ORDER BY hour
@@ -136,7 +136,7 @@ SELECT
     quantileState(0.99)(latency_ms) as p99_state,
     maxState(latency_ms) as max_state,
     countState() as count_state
-FROM polymarket.ob_latency
+FROM trading_data.ob_latency
 GROUP BY hour;
 
 
@@ -147,7 +147,7 @@ GROUP BY hour;
 
 -- Main BBO table (target for buffer flush)
 -- NOTE: Uses Decimal128(18) for price data to avoid floating-point precision errors
-CREATE TABLE IF NOT EXISTS polymarket.ob_bbo (
+CREATE TABLE IF NOT EXISTS trading_data.ob_bbo (
     asset_id String,
     condition_id String,
     source_ts DateTime64(3, 'UTC'),
@@ -186,7 +186,7 @@ SETTINGS index_granularity = 8192;
 -- Captures every add/remove/update event at each price level
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS polymarket.ob_level_changes (
+CREATE TABLE IF NOT EXISTS trading_data.ob_level_changes (
     asset_id String,
     condition_id String,
     source_ts DateTime64(3, 'UTC'),
@@ -212,7 +212,7 @@ TTL source_ts + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
 -- Index for change type analysis
-ALTER TABLE polymarket.ob_level_changes ADD INDEX IF NOT EXISTS idx_change_type change_type TYPE set(3) GRANULARITY 4;
+ALTER TABLE trading_data.ob_level_changes ADD INDEX IF NOT EXISTS idx_change_type change_type TYPE set(3) GRANULARITY 4;
 
 
 -- ============================================================
@@ -233,7 +233,7 @@ ALTER TABLE polymarket.ob_level_changes ADD INDEX IF NOT EXISTS idx_change_type 
 -- Stores messages that failed processing after max retries
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS polymarket.dead_letter_messages (
+CREATE TABLE IF NOT EXISTS trading_data.dead_letter_messages (
     original_queue LowCardinality(String),
     message_type LowCardinality(String),  -- 'bbo_snapshot', 'gap_backfill', etc.
     payload String,                        -- JSON serialized original message
@@ -249,4 +249,4 @@ TTL failed_at + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
 -- Index for debugging by error message
-ALTER TABLE polymarket.dead_letter_messages ADD INDEX IF NOT EXISTS idx_error error TYPE tokenbf_v1(10240, 3, 0) GRANULARITY 4;
+ALTER TABLE trading_data.dead_letter_messages ADD INDEX IF NOT EXISTS idx_error error TYPE tokenbf_v1(10240, 3, 0) GRANULARITY 4;

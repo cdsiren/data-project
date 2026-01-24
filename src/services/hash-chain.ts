@@ -108,7 +108,10 @@ export class HashChainValidator {
 
     // Check for suspicious time gap (potential missed messages)
     const timeDelta = sourceTs - lastState.timestamp;
-    const MAX_EXPECTED_GAP_MS = 5000; // 5 seconds
+    // Increased from 5s to 30s to tolerate normal reconnection delays (typically 5-15s)
+    // This reduces false positive gap events while still catching real data gaps
+    // (exchange issues typically last minutes, not seconds)
+    const MAX_EXPECTED_GAP_MS = 30000; // 30 seconds
 
     let gapDetected = false;
     if (timeDelta > MAX_EXPECTED_GAP_MS) {

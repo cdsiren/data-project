@@ -41,6 +41,17 @@ export async function gapBackfillConsumer(
       );
 
       if (!response.ok) {
+        if (response.status === 404) {
+          // Market no longer exists (resolved) - clean up and don't retry
+          // This is expected for resolved markets and not an error
+          console.log(
+            `[GapBackfill] Market ${job.asset_id.slice(0, 20)}... no longer exists (404), cleaning up`
+          );
+          // Clean up stale hash chain state to prevent future false gaps
+          await env.HASH_CHAIN_CACHE.delete(`chain:${job.asset_id}`);
+          message.ack(); // Acknowledge - don't retry resolved markets
+          continue;
+        }
         throw new Error(`CLOB API error: ${response.status}`);
       }
 

@@ -1,28 +1,20 @@
 // src/core/enums.ts
-// Market-agnostic enums for the multi-market trading framework
+// Core enums for the trading data framework
 
 /**
- * Supported market sources (exchanges/platforms)
- * Add new markets here as they're integrated
+ * Supported market sources
  */
-export type MarketSource = "polymarket" | "kalshi" | "uniswap" | "binance";
+export type MarketSource = "polymarket";
 
 /**
- * Market categories for grouping similar markets
- * Used for shared types and trigger logic
+ * Market categories
  */
-export type MarketType = "prediction" | "dex" | "cex";
+export type MarketType = "prediction";
 
 /**
- * Instrument types across all markets
- * Determines applicable triggers and normalization logic
+ * Instrument types
  */
-export type InstrumentType =
-  | "BINARY_OPTION"   // Polymarket YES/NO, Kalshi binary
-  | "MULTI_OUTCOME"   // Kalshi multi-outcome events
-  | "SPOT"            // DEX/CEX spot pairs
-  | "PERPETUAL"       // Perp futures
-  | "AMM_POOL";       // Uniswap LP pools
+export type InstrumentType = "BINARY_OPTION";
 
 /**
  * Order side (consistent across all markets)

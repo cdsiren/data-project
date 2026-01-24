@@ -97,7 +97,10 @@ export class OrderbookManager extends DurableObject<Env> {
   private readonly PING_INTERVAL_MS = 10000; // Send PING every 10 seconds
   private readonly CONNECTION_TIMEOUT_MS = 15000; // Timeout for WebSocket connection attempts (increased from 5s)
   private readonly SNAPSHOT_INTERVAL_MS: number;
-  private readonly FULL_L2_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes for full L2 snapshots
+  // COST OPTIMIZATION: Increased from 5 minutes to 30 minutes
+  // Full L2 snapshots are only needed for gap recovery, not backtesting
+  // BBO (tick-level) data is preserved at full resolution for strategies
+  private readonly FULL_L2_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes for full L2 snapshots
   private readonly MAX_SUBSCRIPTION_RETRIES = 3;
   private subscriptionFailures: Map<string, number> = new Map(); // Track failures per asset
 
@@ -1140,7 +1143,10 @@ export class OrderbookManager extends DurableObject<Env> {
       const queueOperations: Promise<boolean>[] = [];
 
       // Send level changes to queue (batch for efficiency)
-      if (levelChanges.length > 0) {
+      // COST OPTIMIZATION: Sample 10% of level changes to reduce volume by 90%
+      // Level changes are useful for order flow analysis but not required for backtesting
+      // This preserves enough data for future analysis while reducing ClickHouse costs
+      if (levelChanges.length > 0 && Math.random() < 0.1) {
         queueOperations.push(
           this.sendBatchToQueue("LEVEL_CHANGE_QUEUE", this.env.LEVEL_CHANGE_QUEUE, levelChanges)
         );

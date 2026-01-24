@@ -19,8 +19,8 @@ binding = "DEAD_LETTER_QUEUE"
 
 [[queues.consumers]]
 queue = "dead-letter-queue"
-max_batch_size = 50
-max_batch_timeout = 60
+max_batch_size = 100      # Increased from 50 for better batching
+max_batch_timeout = 120   # Increased from 60s - debug data not latency-sensitive
 max_retries = 0  # DLQ messages are stored, not retried
 
 [[queues.producers]]
@@ -29,19 +29,19 @@ binding = "SNAPSHOT_QUEUE"
 
 [[queues.consumers]]
 queue = "orderbook-snapshot-queue"
-max_batch_size = 100
-max_batch_timeout = 30
-max_retries = 5  # Increased from 2 for better resilience
+max_batch_size = 200      # Increased from 100 for better batching
+max_batch_timeout = 60    # Increased from 30s to accumulate larger batches
+max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 
-# Gap backfill queue for recovery
+# Gap backfill queue for recovery - keep small for quick recovery
 [[queues.producers]]
 queue = "gap-backfill-queue"
 binding = "GAP_BACKFILL_QUEUE"
 
 [[queues.consumers]]
 queue = "gap-backfill-queue"
-max_batch_size = 10
+max_batch_size = 10       # Keep at 10 - needs quick recovery
 max_batch_timeout = 60
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
@@ -53,8 +53,8 @@ binding = "TRADE_QUEUE"
 
 [[queues.consumers]]
 queue = "trade-tick-queue"
-max_batch_size = 100
-max_batch_timeout = 30
+max_batch_size = 200      # Increased from 100 for better batching
+max_batch_timeout = 60    # Increased from 30s - low volume, can wait
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 
@@ -65,20 +65,20 @@ binding = "LEVEL_CHANGE_QUEUE"
 
 [[queues.consumers]]
 queue = "level-change-queue"
-max_batch_size = 100
-max_batch_timeout = 30
+max_batch_size = 250      # Increased from 100 - highest volume queue
+max_batch_timeout = 60    # Increased from 30s to accumulate larger batches
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 
-# Full L2 snapshot queue (periodic every 5 min)
+# Full L2 snapshot queue (periodic every 30 min after Phase 6)
 [[queues.producers]]
 queue = "full-l2-queue"
 binding = "FULL_L2_QUEUE"
 
 [[queues.consumers]]
 queue = "full-l2-queue"
-max_batch_size = 50
-max_batch_timeout = 60
+max_batch_size = 100      # Increased from 50 for better batching
+max_batch_timeout = 120   # Increased from 60s - large payloads benefit from more batching
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 
