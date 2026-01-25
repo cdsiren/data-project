@@ -1,0 +1,22 @@
+// Application constants
+
+export const SSE_CONFIG = {
+  MAX_EVENTS: 20,
+  RECONNECT_BASE_DELAY_MS: 3000,
+  RECONNECT_BACKOFF_FACTOR: 1.5,
+  MAX_RECONNECT_ATTEMPTS: 10,
+} as const;
+
+export const QUERY_CONFIG = {
+  TOP_MARKET_REFRESH_MS: 10 * 60 * 1000,
+  TOP_MARKET_STALE_MS: 9 * 60 * 1000,
+  OHLC_REFRESH_MS: 60 * 1000,
+  OHLC_STALE_MS: 30 * 1000,
+  DEFAULT_STALE_MS: 30 * 1000,
+} as const;
+
+export const CHART_CONFIG = {
+  HEIGHT: 400,
+  DEFAULT_WIDTH: 800,
+  RESIZE_DEBOUNCE_MS: 150,
+} as const;

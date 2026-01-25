@@ -1,10 +1,14 @@
 {
   "name": "polymarket-enrichment",
   "version": "1.0.0",
-  "description": "Cloudflare Workers project for enriching on-chain Polymarket data",
+  "description": "Cloudflare Workers project for low latency event notifications based on crypto data",
   "main": "src/index.ts",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "concurrently --kill-others -n worker,app -c blue,green \"wrangler dev --port 8787\" \"pnpm --filter @indication/app dev\"",
+    "dev:worker": "wrangler dev --port 8787",
+    "dev:app": "pnpm --filter @indication/app dev",
+    "build:app": "pnpm --filter @indication/app build",
+    "deploy:app": "pnpm --filter @indication/app deploy",
     "deploy": "wrangler deploy",
     "test": "vitest"
   },
@@ -13,8 +17,10 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240909.0",
+    "concurrently": "^9.2.1",
+    "dotenv": "^17.2.3",
     "typescript": "^5.3.0",
-    "wrangler": "^3.72.0",
-    "vitest": "^1.0.0"
+    "vitest": "^1.0.0",
+    "wrangler": "^3.72.0"
   }
 }

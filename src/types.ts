@@ -22,6 +22,7 @@ export interface Env {
 
   // Durable Objects
   ORDERBOOK_MANAGER: DurableObjectNamespace;
+  TRIGGER_EVENT_BUFFER: DurableObjectNamespace;
 
   // Environment Variables
   GAMMA_API_URL: string;
@@ -30,25 +31,7 @@ export interface Env {
   CLICKHOUSE_URL: string;
   CLICKHOUSE_USER: string;
   CLICKHOUSE_TOKEN: string;
-  WEBHOOK_API_KEY: string;
-}
-
-export interface GoldskyTradeEvent {
-  id: string;
-  transaction_hash: string | null;
-  timestamp: string;
-  order_hash: string | null;
-  maker: string;
-  taker: string;
-  maker_asset_id: string;
-  taker_asset_id: string;
-  maker_amount_filled: string;
-  taker_amount_filled: string;
-  fee: string;
-  chain_id: number;
-  _gs_chain: string;
-  _gs_gid: string;
-  is_deleted: number;
+  VITE_DASHBOARD_API_KEY: string;  // Required key for dashboard API access
 }
 
 // Polymarket API Response Types

@@ -12,7 +12,7 @@
  * - CLICKHOUSE_TOKEN: ClickHouse password/API key
  */
 
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import {
   getClickHouseConfig,
   executeQuery,

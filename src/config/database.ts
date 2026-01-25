@@ -81,3 +81,47 @@ export function isValidMarketSource(source: string): source is MarketSource {
 export function isValidMarketType(type: string): type is MarketType {
   return type === "prediction";
 }
+
+/**
+ * Normalized market info result
+ */
+export interface NormalizedMarketInfo {
+  source: MarketSource;
+  type: MarketType;
+}
+
+/**
+ * Normalize market source and type in a single call.
+ * Eliminates duplicate defaulting logic across consumers.
+ *
+ * @param marketSource - Optional market source from message
+ * @param marketType - Optional market type from message
+ * @returns Normalized source and type with defaults applied
+ */
+export function normalizeMarketInfo(
+  marketSource?: string,
+  marketType?: string
+): NormalizedMarketInfo {
+  // Validate and default market source
+  const source: MarketSource = (marketSource && isValidMarketSource(marketSource))
+    ? marketSource
+    : getDefaultMarketSource();
+
+  // Validate and default market type (derives from source if not provided)
+  const type: MarketType = (marketType && isValidMarketType(marketType))
+    ? marketType
+    : getMarketType(source);
+
+  return { source, type };
+}
+
+/**
+ * Get batch defaults for market info (computed once per batch).
+ * Use this at the start of a consumer batch to avoid repeated function calls.
+ */
+export function getBatchMarketDefaults(): NormalizedMarketInfo {
+  return {
+    source: getDefaultMarketSource(),
+    type: getDefaultMarketType(),
+  };
+}

@@ -6,7 +6,13 @@ interface Env {
 	GAMMA_API_URL: "https://gamma-api.polymarket.com";
 	CLOB_WSS_URL: "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 	SNAPSHOT_INTERVAL_MS: "60000";
+	MARKETS_CONFIG: "[\n  {\n    \"market_source\": \"polymarket\",\n    \"market_type\": \"prediction\",\n    \"enabled\": true,\n    \"ws_url\": \"wss://ws-subscriptions-clob.polymarket.com/ws/market\",\n    \"metadata_api_url\": \"https://gamma-api.polymarket.com\",\n    \"adapter_class\": \"PolymarketConnector\",\n    \"config\": {\n      \"max_instruments_per_ws\": 500,\n      \"price_range\": [0.0, 1.0],\n      \"heartbeat_interval_ms\": 30000,\n      \"reconnect_base_delay_ms\": 1000,\n      \"reconnect_max_delay_ms\": 30000\n    }\n  },\n  {\n    \"market_source\": \"kalshi\",\n    \"market_type\": \"prediction\",\n    \"enabled\": false,\n    \"ws_url\": \"wss://trading-api.kalshi.com/v1/ws\",\n    \"metadata_api_url\": \"https://api.kalshi.com/v1\",\n    \"adapter_class\": \"KalshiConnector\",\n    \"config\": {\n      \"max_instruments_per_ws\": 100,\n      \"price_range\": [0.0, 1.0],\n      \"heartbeat_interval_ms\": 10000,\n      \"reconnect_base_delay_ms\": 1000,\n      \"reconnect_max_delay_ms\": 30000,\n      \"requires_auth\": true\n    }\n  }\n]\n";
+	CLICKHOUSE_URL: string;
+	CLICKHOUSE_USER: string;
+	CLICKHOUSE_TOKEN: string;
+	WEBHOOK_API_KEY: string;
 	ORDERBOOK_MANAGER: DurableObjectNamespace<import("./src/index").OrderbookManager>;
+	TRIGGER_EVENT_BUFFER: DurableObjectNamespace<import("./src/index").TriggerEventBuffer>;
 	DEAD_LETTER_QUEUE: Queue;
 	SNAPSHOT_QUEUE: Queue;
 	GAP_BACKFILL_QUEUE: Queue;

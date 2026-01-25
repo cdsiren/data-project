@@ -2,8 +2,7 @@
 import type { Env } from "../types";
 import type { OrderbookLevelChange } from "../types/orderbook";
 import { toClickHouseDateTime64, toClickHouseDateTime64Micro } from "../utils/datetime";
-import { getFullTableName, getDefaultMarketSource, getMarketType } from "../config/database";
-import type { MarketSource } from "../core/enums";
+import { getFullTableName, getBatchMarketDefaults, normalizeMarketInfo } from "../config/database";
 import { insertRows, handleBatchResult } from "../services/clickhouse-utils";
 
 export async function levelChangeConsumer(
@@ -12,12 +11,18 @@ export async function levelChangeConsumer(
 ): Promise<void> {
   if (batch.messages.length === 0) return;
 
+  // OPTIMIZATION: Pre-compute defaults once per batch instead of per-message
+  const defaults = getBatchMarketDefaults();
+
   const rows = batch.messages.map(m => {
-    const marketSource = m.body.market_source ?? getDefaultMarketSource();
-    const marketType = m.body.market_type ?? getMarketType(marketSource as MarketSource);
+    // Use pre-computed defaults when no override provided
+    const { source, type } = m.body.market_source
+      ? normalizeMarketInfo(m.body.market_source, m.body.market_type)
+      : defaults;
+
     return {
-      market_source: marketSource,
-      market_type: marketType,
+      market_source: source,
+      market_type: type,
       asset_id: m.body.asset_id,
       condition_id: m.body.condition_id,
       source_ts: toClickHouseDateTime64(m.body.source_ts),

@@ -39,6 +39,7 @@ export class PredictionMarketTriggerEvaluator extends BaseTriggerEvaluator {
       ...this.genericEvaluator.getSupportedTypes(),
       "ARBITRAGE_BUY",
       "ARBITRAGE_SELL",
+      "MULTI_OUTCOME_ARBITRAGE",
     ];
   }
 
@@ -106,7 +107,11 @@ export class PredictionMarketTriggerEvaluator extends BaseTriggerEvaluator {
       return this.notFired();
     }
 
-    // Check if counterpart data is stale
+    // CRITICAL: Check BOTH explicit stale flag AND time delta to prevent false signals
+    // Stale flag is set proactively when counterpart data is old relative to new updates
+    if (counterpartBBO.stale) {
+      return this.notFired();
+    }
     if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > this.STALE_DATA_THRESHOLD_MS) {
       return this.notFired();
     }
@@ -162,7 +167,11 @@ export class PredictionMarketTriggerEvaluator extends BaseTriggerEvaluator {
       return this.notFired();
     }
 
-    // Check if counterpart data is stale
+    // CRITICAL: Check BOTH explicit stale flag AND time delta to prevent false signals
+    // Stale flag is set proactively when counterpart data is old relative to new updates
+    if (counterpartBBO.stale) {
+      return this.notFired();
+    }
     if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > this.STALE_DATA_THRESHOLD_MS) {
       return this.notFired();
     }

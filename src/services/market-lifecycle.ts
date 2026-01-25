@@ -5,6 +5,7 @@
 
 import type { Env, PolymarketMarket, MarketMetadataRecord, MarketEventRecord } from "../types";
 import { buildAsyncInsertUrlWithColumns } from "./clickhouse-client";
+import { WebhookSigner } from "./webhook-signer";
 import { DB_CONFIG } from "../config/database";
 
 interface GammaMarket {
@@ -218,19 +219,8 @@ export class MarketLifecycleService {
                 "X-Event-Type": event.event_type,
               };
 
-              // Add HMAC signature if secret is configured
-              if (webhook.secret) {
-                const encoder = new TextEncoder();
-                const key = await crypto.subtle.importKey(
-                  "raw",
-                  encoder.encode(webhook.secret),
-                  { name: "HMAC", hash: "SHA-256" },
-                  false,
-                  ["sign"]
-                );
-                const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
-                headers["X-Signature"] = btoa(String.fromCharCode(...new Uint8Array(signature)));
-              }
+              // Add HMAC signature if secret is configured (using shared utility)
+              await WebhookSigner.addSignatureHeader(headers, body, webhook.secret);
 
               const response = await fetch(webhook.url, {
                 method: "POST",

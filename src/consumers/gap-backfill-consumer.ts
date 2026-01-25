@@ -9,8 +9,9 @@ import type {
   FullL2Snapshot,
 } from "../types/orderbook";
 import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
-import { getDefaultMarketSource, getMarketType } from "../config/database";
-import type { MarketSource } from "../core/enums";
+import { MarketCleanupService } from "../services/market-cleanup";
+import { classifyHttpError } from "../services/clickhouse-utils";
+import { normalizeMarketInfo } from "../config/database";
 
 interface CLOBBookResponse {
   market: string;
@@ -20,6 +21,18 @@ interface CLOBBookResponse {
   bids: Array<{ price: string; size: string }>;
   asks: Array<{ price: string; size: string }>;
   tick_size: string;
+}
+
+/**
+ * Normalize condition_id to decimal format.
+ * CLOB API returns hex (0x...), Gamma API returns decimal.
+ * We standardize on decimal to match live data path.
+ */
+function normalizeConditionId(conditionId: string): string {
+  if (conditionId.startsWith("0x")) {
+    return BigInt(conditionId).toString();
+  }
+  return conditionId;
 }
 
 export async function gapBackfillConsumer(
@@ -41,18 +54,32 @@ export async function gapBackfillConsumer(
       );
 
       if (!response.ok) {
-        if (response.status === 404) {
+        const body = await response.text().catch(() => "");
+        const classified = classifyHttpError(response.status, body);
+
+        if (classified.severity === "permanent") {
           // Market no longer exists (resolved) - clean up and don't retry
           // This is expected for resolved markets and not an error
           console.log(
-            `[GapBackfill] Market ${job.asset_id.slice(0, 20)}... no longer exists (404), cleaning up`
+            `[GapBackfill] Market ${job.asset_id.slice(0, 20)}... ${classified.message}, cleaning up`
           );
-          // Clean up stale hash chain state to prevent future false gaps
-          await env.HASH_CHAIN_CACHE.delete(`chain:${job.asset_id}`);
+          // Use coordinated cleanup service to prevent race conditions
+          // with scheduled handler (idempotent, won't duplicate work)
+          const cleanupService = new MarketCleanupService(env, () => "");
+          await cleanupService.cleanupAsset(job.asset_id);
           message.ack(); // Acknowledge - don't retry resolved markets
           continue;
         }
-        throw new Error(`CLOB API error: ${response.status}`);
+
+        if (!classified.shouldRetry) {
+          // Client error - log and ack to prevent infinite retry
+          console.error(`[GapBackfill] Non-retryable error for ${job.asset_id.slice(0, 20)}...: ${classified.message}`);
+          message.ack();
+          continue;
+        }
+
+        // Transient or rate limit - throw to trigger retry
+        throw new Error(`CLOB API error: ${classified.message}`);
       }
 
       const book = (await response.json()) as CLOBBookResponse;
@@ -87,16 +114,18 @@ export async function gapBackfillConsumer(
       const spreadBps = midPrice && spread ? (spread / midPrice) * 10000 : null;
 
       // Create BBO snapshot for tick-level data
-      // Use market_source from job if available, otherwise default to polymarket
-      const marketSource = (job.market_source ?? getDefaultMarketSource()) as MarketSource;
-      const marketType = job.market_type ?? getMarketType(marketSource);
+      // Use normalizeMarketInfo for consistent defaulting
+      const { source: marketSource, type: marketType } = normalizeMarketInfo(
+        job.market_source,
+        job.market_type
+      );
 
       const bboSnapshot: BBOSnapshot = {
         market_source: marketSource,
         market_type: marketType,
         asset_id: book.asset_id,
         token_id: book.asset_id,
-        condition_id: book.market,
+        condition_id: normalizeConditionId(book.market),
         source_ts: sourceTs,
         ingestion_ts: now * 1000,
         book_hash: book.hash,
@@ -117,7 +146,7 @@ export async function gapBackfillConsumer(
         market_type: marketType,
         asset_id: book.asset_id,
         token_id: book.asset_id,
-        condition_id: book.market,
+        condition_id: normalizeConditionId(book.market),
         source_ts: sourceTs,
         ingestion_ts: now * 1000,
         book_hash: book.hash,

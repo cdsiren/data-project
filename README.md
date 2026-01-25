@@ -76,9 +76,6 @@ wrangler secret put CLICKHOUSE_URL
 
 wrangler secret put CLICKHOUSE_TOKEN
 # Enter your ClickHouse access token
-
-wrangler secret put WEBHOOK_API_KEY
-# Enter a secure API key for Goldsky to use (e.g., generate with: openssl rand -hex 32)
 ```
 
 ### 5. Create ClickHouse Tables

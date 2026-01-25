@@ -89,12 +89,17 @@ dead_letter_queue = "dead-letter-queue"
 
 [durable_objects]
 bindings = [
-  { name = "ORDERBOOK_MANAGER", class_name = "OrderbookManager" }
+  { name = "ORDERBOOK_MANAGER", class_name = "OrderbookManager" },
+  { name = "TRIGGER_EVENT_BUFFER", class_name = "TriggerEventBuffer" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["OrderbookManager"]
+
+[[migrations]]
+tag = "v4"
+new_classes = ["TriggerEventBuffer"]
 
 [[migrations]]
 tag = "v2"
@@ -176,4 +181,4 @@ MARKETS_CONFIG = '''
 # CLICKHOUSE_URL - Full URL to ClickHouse HTTP interface
 # CLICKHOUSE_USER - ClickHouse username
 # CLICKHOUSE_TOKEN - ClickHouse password/API key
-# WEBHOOK_API_KEY - API key for Goldsky webhook authentication
+# VITE_DASHBOARD_API_KEY - API key for dashboard and API access

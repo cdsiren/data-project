@@ -1,12 +1,9 @@
 import type { Env } from "../types";
 import type { BBOSnapshot } from "../types/orderbook";
 import { toClickHouseDateTime64, toClickHouseDateTime64Micro } from "../utils/datetime";
-import { getFullTableName, getDefaultMarketSource, getDefaultMarketType, getMarketType } from "../config/database";
-import type { MarketSource } from "../core/enums";
+import { getFullTableName, normalizeMarketInfo, getBatchMarketDefaults } from "../config/database";
 import { buildAsyncInsertUrl, buildClickHouseHeaders } from "./clickhouse-client";
-
-/** Valid market sources - must match MarketSource type in core/enums.ts */
-const VALID_MARKET_SOURCES = new Set(["polymarket", "kalshi", "uniswap", "binance"]);
+import { executeInsert } from "./clickhouse-utils";
 
 /** Gap event row for batched insert */
 interface GapEventRow {
@@ -18,20 +15,6 @@ interface GapEventRow {
   new_hash: string;
   gap_duration_ms: number;
   resolution: string;
-}
-
-/**
- * Validate and normalize market_source to prevent data corruption.
- * Returns default if invalid to ensure data is never lost.
- */
-function validateMarketSource(value: string | undefined): string {
-  if (!value || !VALID_MARKET_SOURCES.has(value)) {
-    if (value) {
-      console.warn(`[ClickHouse] Invalid market_source "${value}", using default`);
-    }
-    return getDefaultMarketSource();
-  }
-  return value;
 }
 
 /**
@@ -60,16 +43,23 @@ export class ClickHouseOrderbookClient {
   /**
    * Insert BBO (best bid/offer) snapshots in batch
    * Optimized: stores only top-of-book instead of full L2 depth (~20-50x less data)
+   * Now uses circuit breaker for reliability.
    */
   async insertSnapshots(snapshots: BBOSnapshot[]): Promise<void> {
     if (snapshots.length === 0) return;
 
+    // Pre-compute defaults once for the batch
+    const defaults = getBatchMarketDefaults();
+
     const rows = snapshots.map((s) => {
-      const marketSource = validateMarketSource(s.market_source);
-      const marketType = s.market_type ?? getMarketType(marketSource as MarketSource);
+      // Use normalizeMarketInfo for consistent defaulting
+      const { source, type } = s.market_source
+        ? normalizeMarketInfo(s.market_source, s.market_type)
+        : defaults;
+
       return {
-        market_source: marketSource,
-        market_type: marketType,
+        market_source: source,
+        market_type: type,
         asset_id: s.asset_id,
         condition_id: s.condition_id,
         source_ts: toClickHouseDateTime64(s.source_ts),
@@ -91,14 +81,15 @@ export class ClickHouseOrderbookClient {
 
     const body = rows.map((r) => JSON.stringify(r)).join("\n");
 
-    const response = await fetch(
+    // Use executeInsert with circuit breaker for reliability
+    const result = await executeInsert(
       buildAsyncInsertUrl(this.baseUrl, getFullTableName("OB_BBO")),
-      { method: "POST", headers: this.headers, body }
+      this.headers,
+      body
     );
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`ClickHouse insert failed: ${error}`);
+    if (!result.success) {
+      throw new Error(`ClickHouse insert failed: ${result.error}`);
     }
   }
 
@@ -118,12 +109,17 @@ export class ClickHouseOrderbookClient {
   ): Promise<void> {
     if (metrics.length === 0) return;
 
+    // Pre-compute defaults once for the batch
+    const defaults = getBatchMarketDefaults();
+
     const rows = metrics.map((m) => {
-      const marketSource = validateMarketSource(m.marketSource);
-      const marketType = m.marketType ?? getMarketType(marketSource as MarketSource);
+      const { source, type } = m.marketSource
+        ? normalizeMarketInfo(m.marketSource, m.marketType)
+        : defaults;
+
       return {
-        market_source: marketSource,
-        market_type: marketType,
+        market_source: source,
+        market_type: type,
         asset_id: m.assetId,
         source_ts: toClickHouseDateTime64(m.sourceTs),
         ingestion_ts: toClickHouseDateTime64Micro(m.ingestionTs),
@@ -133,6 +129,7 @@ export class ClickHouseOrderbookClient {
 
     const body = rows.map((r) => JSON.stringify(r)).join("\n");
 
+    // Fire-and-forget for latency metrics (non-critical)
     await fetch(
       buildAsyncInsertUrl(this.baseUrl, getFullTableName("OB_LATENCY")),
       { method: "POST", headers: this.headers, body }
@@ -152,11 +149,10 @@ export class ClickHouseOrderbookClient {
     marketSource?: string,
     marketType?: string
   ): Promise<void> {
-    const effectiveMarketSource = validateMarketSource(marketSource);
-    const effectiveMarketType = marketType ?? getMarketType(effectiveMarketSource as MarketSource);
+    const { source, type } = normalizeMarketInfo(marketSource, marketType);
     const row: GapEventRow = {
-      market_source: effectiveMarketSource,
-      market_type: effectiveMarketType,
+      market_source: source,
+      market_type: type,
       asset_id: assetId,
       detected_at: toClickHouseDateTime64(Date.now()),
       last_known_hash: lastKnownHash,

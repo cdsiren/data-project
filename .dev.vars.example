@@ -4,4 +4,4 @@
 CLICKHOUSE_URL=https://your-instance.clickhouse.cloud:8443
 CLICKHOUSE_USER=default
 CLICKHOUSE_TOKEN=your-clickhouse-password
-WEBHOOK_API_KEY=your-webhook-api-key
+VITE_DASHBOARD_API_KEY=your-dashboard-api-key

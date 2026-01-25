@@ -20,6 +20,7 @@ import type {
   PriceHistoryEntry,
 } from "../types/orderbook";
 import type { MarketSource, LevelChangeType } from "../core/enums";
+import type { TriggerType } from "../core/triggers";
 import { getDefaultMarketSource } from "../config/database";
 
 interface ConnectionState {
@@ -81,12 +82,32 @@ export class OrderbookManager extends DurableObject<Env> {
   private lastTriggerFire: Map<string, number> = new Map(); // trigger_id -> last fire timestamp
   private priceHistory: Map<string, PriceHistoryEntry[]> = new Map(); // asset_id -> price history for PRICE_MOVE
   // Latest BBO per asset for arbitrage trigger evaluation
-  private latestBBO: Map<string, { best_bid: number | null; best_ask: number | null; ts: number }> = new Map();
+  // Includes stale flag to prevent false arbitrage signals from mismatched YES/NO data
+  private latestBBO: Map<string, { best_bid: number | null; best_ask: number | null; ts: number; stale: boolean }> = new Map();
+  // Market relationships for arbitrage: maps asset_id -> Set of related asset_ids (YES/NO pairs)
+  // Used to proactively mark counterpart BBO as stale when primary updates
+  private marketRelationships: Map<string, Set<string>> = new Map();
   // CRITICAL PATH OPTIMIZATION: Pre-cached HMAC keys for webhook signing (avoids crypto.subtle.importKey on hot path)
   private hmacKeyCache: Map<string, CryptoKey> = new Map();
   private readonly PRICE_HISTORY_MAX_AGE_MS = 60000; // Keep 60s of price history
   private readonly MAX_PRICE_HISTORY_ENTRIES = 1000; // Safety limit to prevent unbounded growth
   private readonly MAX_TRIGGERS_PER_ASSET = 50; // Prevent trigger spam
+
+  // ============================================================
+  // HFT TRIGGER STATE MAPS
+  // Additional state tracking for advanced market making triggers
+  // ============================================================
+  // QUOTE_VELOCITY: Track BBO update counts per asset
+  private updateCounts: Map<string, { count: number; windowStartUs: number }> = new Map();
+  // MID_PRICE_TREND: Track consecutive price moves
+  private trendTracker: Map<string, { lastMid: number; consecutiveMoves: number; direction: "UP" | "DOWN" }> = new Map();
+  // IMBALANCE_SHIFT: Track imbalance history (capped at 100 entries per asset)
+  private imbalanceHistory: Map<string, { imbalance: number; ts: number }[]> = new Map();
+  private readonly MAX_IMBALANCE_HISTORY_ENTRIES = 100;
+  // STALE_QUOTE: Track last update timestamp per asset
+  private lastUpdateTs: Map<string, number> = new Map();
+  // LARGE_FILL: Track previous BBO for size delta calculation
+  private previousBBO: Map<string, { bid_size: number | null; ask_size: number | null }> = new Map();
 
   // Polymarket allows max 500 instruments per connection
   // We use 450 to leave headroom for pending subscriptions during updates
@@ -353,6 +374,13 @@ export class OrderbookManager extends DurableObject<Env> {
     this.hmacKeyCache.clear();
     this.subscriptionFailures.clear();
     this.queueFailures.clear();
+    this.marketRelationships.clear();
+    // Clear HFT trigger state maps
+    this.updateCounts.clear();
+    this.trendTracker.clear();
+    this.imbalanceHistory.clear();
+    this.lastUpdateTs.clear();
+    this.previousBBO.clear();
 
     // Clear corrupted storage
     try {
@@ -1363,6 +1391,9 @@ export class OrderbookManager extends DurableObject<Env> {
       this.cleanupPriceHistory();
     }
 
+    // Check for stale quotes - evaluated in alarm since they detect absence of updates
+    this.checkStaleQuotes();
+
     // Schedule next alarm if we have active connections
     if (hasActiveConnections || this.connections.size > 0) {
       await this.scheduleAlarm(this.PING_INTERVAL_MS);
@@ -1377,7 +1408,8 @@ export class OrderbookManager extends DurableObject<Env> {
    * Removes history for unsubscribed assets and old entries.
    */
   private cleanupPriceHistory(): void {
-    const now = Date.now();
+    // Convert to microseconds since history timestamps are in microseconds
+    const nowUs = Date.now() * 1000;
     let cleaned = 0;
 
     for (const [assetId, history] of this.priceHistory) {
@@ -1402,7 +1434,9 @@ export class OrderbookManager extends DurableObject<Env> {
       }
 
       // Remove if last entry is too old (2x max age)
-      if (history.length > 0 && now - history[history.length - 1].ts > this.PRICE_HISTORY_MAX_AGE_MS * 2) {
+      // PRICE_HISTORY_MAX_AGE_MS is in ms, convert to microseconds for comparison
+      const maxAgeUs = this.PRICE_HISTORY_MAX_AGE_MS * 1000 * 2;
+      if (history.length > 0 && nowUs - history[history.length - 1].ts > maxAgeUs) {
         this.priceHistory.delete(assetId);
         cleaned++;
       }
@@ -1410,6 +1444,89 @@ export class OrderbookManager extends DurableObject<Env> {
 
     if (cleaned > 0) {
       console.log(`[Alarm] Cleaned price history for ${cleaned} assets`);
+    }
+  }
+
+  /**
+   * Check for stale quotes and fire STALE_QUOTE triggers.
+   * Called from alarm() handler since these triggers detect absence of updates.
+   */
+  private checkStaleQuotes(): void {
+    const now = Date.now() * 1000; // Microseconds
+    const firedEvents: { trigger: Trigger; event: TriggerEvent }[] = [];
+
+    // Find all STALE_QUOTE triggers
+    for (const [triggerId, trigger] of this.triggers) {
+      if (!trigger.enabled || trigger.condition.type !== "STALE_QUOTE") continue;
+
+      const threshold = trigger.condition.threshold; // staleness in ms
+
+      // For wildcard triggers, check all assets
+      const assetsToCheck = trigger.asset_id === "*"
+        ? Array.from(this.assetToConnection.keys())
+        : [trigger.asset_id];
+
+      for (const assetId of assetsToCheck) {
+        const lastUpdate = this.lastUpdateTs.get(assetId);
+        if (lastUpdate === undefined) continue;
+
+        // Check cooldown
+        const cooldownKey = `${triggerId}:${assetId}`;
+        const lastFire = this.lastTriggerFire.get(cooldownKey) || 0;
+        if (now - lastFire < trigger.cooldown_ms * 1000) continue;
+
+        // Calculate staleness (convert source_ts from ms to us for comparison)
+        const staleMs = (now - lastUpdate * 1000) / 1000;
+
+        if (staleMs > threshold) {
+          this.lastTriggerFire.set(cooldownKey, now);
+
+          const latestBBO = this.latestBBO.get(assetId);
+          const conditionId = this.assetToMarket.get(assetId) || "unknown";
+
+          const event: TriggerEvent = {
+            trigger_id: triggerId,
+            trigger_type: "STALE_QUOTE",
+            asset_id: assetId,
+            condition_id: conditionId,
+            fired_at: Math.floor(now),
+            latency_us: 0, // N/A for stale quote detection
+
+            best_bid: latestBBO?.best_bid ?? null,
+            best_ask: latestBBO?.best_ask ?? null,
+            bid_size: null,
+            ask_size: null,
+            mid_price: latestBBO?.best_bid && latestBBO?.best_ask
+              ? (latestBBO.best_bid + latestBBO.best_ask) / 2
+              : null,
+            spread_bps: null,
+
+            threshold: trigger.condition.threshold,
+            actual_value: staleMs,
+            stale_ms: staleMs,
+
+            book_hash: "stale",
+            sequence_number: 0,
+            metadata: trigger.metadata,
+          };
+
+          firedEvents.push({ trigger, event });
+        }
+      }
+    }
+
+    // Fire webhooks asynchronously
+    if (firedEvents.length > 0) {
+      console.log(`[Alarm] Detected ${firedEvents.length} stale quote(s)`);
+      this.ctx.waitUntil(
+        Promise.all(
+          firedEvents.map(({ trigger, event }) =>
+            this.dispatchTriggerWebhook(trigger, event).catch((err) =>
+              console.error(`[Trigger] Stale quote webhook failed for ${trigger.id}:`, err)
+            )
+          )
+        )
+      );
     }
   }
 
@@ -1543,6 +1660,22 @@ export class OrderbookManager extends DurableObject<Env> {
     this.subscriptionFailures.delete(assetId);
     this.priceHistory.delete(assetId);
     this.latestBBO.delete(assetId);
+    // Clean up HFT trigger state
+    this.updateCounts.delete(assetId);
+    this.trendTracker.delete(assetId);
+    this.imbalanceHistory.delete(assetId);
+    this.lastUpdateTs.delete(assetId);
+    this.previousBBO.delete(assetId);
+
+    // Clean up market relationships
+    const relatedAssets = this.marketRelationships.get(assetId);
+    if (relatedAssets) {
+      // Remove this asset from all related assets' relationship sets
+      for (const related of relatedAssets) {
+        this.marketRelationships.get(related)?.delete(assetId);
+      }
+      this.marketRelationships.delete(assetId);
+    }
 
     // Clean up triggers for this asset
     const triggerIds = this.triggersByAsset.get(assetId);
@@ -1554,6 +1687,45 @@ export class OrderbookManager extends DurableObject<Env> {
         this.hmacKeyCache.delete(triggerId);
       }
       this.triggersByAsset.delete(assetId);
+    }
+  }
+
+  /**
+   * Register a market relationship between two assets (e.g., YES/NO token pair)
+   * Used to proactively mark counterpart BBO as stale when primary updates
+   */
+  private registerMarketRelationship(assetId1: string, assetId2: string): void {
+    if (!this.marketRelationships.has(assetId1)) {
+      this.marketRelationships.set(assetId1, new Set());
+    }
+    if (!this.marketRelationships.has(assetId2)) {
+      this.marketRelationships.set(assetId2, new Set());
+    }
+    this.marketRelationships.get(assetId1)!.add(assetId2);
+    this.marketRelationships.get(assetId2)!.add(assetId1);
+  }
+
+  /**
+   * Get related assets for a given asset ID (e.g., counterpart YES/NO token)
+   */
+  private getRelatedAssets(assetId: string): string[] {
+    return Array.from(this.marketRelationships.get(assetId) || []);
+  }
+
+  /**
+   * Mark related assets' BBO as potentially stale when a new update arrives
+   * This prevents false arbitrage signals from mismatched YES/NO data
+   */
+  private markRelatedAssetsStale(assetId: string, currentTs: number): void {
+    const relatedAssets = this.marketRelationships.get(assetId);
+    if (!relatedAssets) return;
+
+    const STALE_THRESHOLD_MS = 5000; // 5 seconds
+    for (const related of relatedAssets) {
+      const relatedBBO = this.latestBBO.get(related);
+      if (relatedBBO && currentTs - relatedBBO.ts > STALE_THRESHOLD_MS) {
+        relatedBBO.stale = true;
+      }
     }
   }
 
@@ -1682,6 +1854,51 @@ export class OrderbookManager extends DurableObject<Env> {
           return `${condition.type} requires condition.counterpart_asset_id`;
         }
         break;
+
+      // HFT trigger validations
+      case "VOLATILITY_SPIKE":
+        if (!condition.window_ms || typeof condition.window_ms !== "number") {
+          return "VOLATILITY_SPIKE requires condition.window_ms (number)";
+        }
+        if (condition.window_ms > this.PRICE_HISTORY_MAX_AGE_MS) {
+          return `window_ms cannot exceed ${this.PRICE_HISTORY_MAX_AGE_MS}ms`;
+        }
+        break;
+
+      case "IMBALANCE_SHIFT":
+        if (!condition.window_ms || typeof condition.window_ms !== "number") {
+          return "IMBALANCE_SHIFT requires condition.window_ms (number)";
+        }
+        break;
+
+      case "QUOTE_VELOCITY":
+        if (!condition.window_ms || typeof condition.window_ms !== "number") {
+          return "QUOTE_VELOCITY requires condition.window_ms (number)";
+        }
+        break;
+
+      case "MID_PRICE_TREND":
+        if (condition.side && !["BID", "ASK"].includes(condition.side)) {
+          return "MID_PRICE_TREND condition.side must be 'BID' or 'ASK' if specified";
+        }
+        break;
+
+      case "LARGE_FILL":
+        if (condition.side && !["BID", "ASK"].includes(condition.side)) {
+          return "LARGE_FILL condition.side must be 'BID' or 'ASK' if specified";
+        }
+        break;
+
+      case "MULTI_OUTCOME_ARBITRAGE":
+        if (!condition.outcome_asset_ids || !Array.isArray(condition.outcome_asset_ids)) {
+          return "MULTI_OUTCOME_ARBITRAGE requires condition.outcome_asset_ids (array)";
+        }
+        if (condition.outcome_asset_ids.length < 2) {
+          return "MULTI_OUTCOME_ARBITRAGE requires at least 2 outcome_asset_ids";
+        }
+        break;
+
+      // MICROPRICE_DIVERGENCE and STALE_QUOTE only need threshold (already validated above)
     }
 
     return null;
@@ -1769,6 +1986,18 @@ export class OrderbookManager extends DurableObject<Env> {
         }
       }
 
+      // CRITICAL: Register market relationship for arbitrage triggers
+      // This enables proactive staleness marking to prevent false signals
+      if (
+        (trigger.condition.type === "ARBITRAGE_BUY" || trigger.condition.type === "ARBITRAGE_SELL") &&
+        trigger.condition.counterpart_asset_id
+      ) {
+        this.registerMarketRelationship(trigger.asset_id, trigger.condition.counterpart_asset_id);
+        console.log(
+          `[Trigger] Registered market relationship: ${trigger.asset_id.slice(0, 12)}... <-> ${trigger.condition.counterpart_asset_id.slice(0, 12)}...`
+        );
+      }
+
       await this.persistState();
 
       console.log(
@@ -1827,11 +2056,17 @@ export class OrderbookManager extends DurableObject<Env> {
 
   private evaluateTriggersSync(snapshot: BBOSnapshot): void {
     // Store latest BBO for arbitrage calculations
+    // Mark as NOT stale since we just received fresh data
     this.latestBBO.set(snapshot.asset_id, {
       best_bid: snapshot.best_bid,
       best_ask: snapshot.best_ask,
       ts: snapshot.source_ts,
+      stale: false,
     });
+
+    // CRITICAL: Mark related assets' BBO as potentially stale
+    // This prevents false arbitrage signals when YES updates but NO is old
+    this.markRelatedAssetsStale(snapshot.asset_id, snapshot.source_ts);
 
     const assetTriggerIds = this.triggersByAsset.get(snapshot.asset_id);
     const wildcardTriggerIds = this.triggersByAsset.get("*");
@@ -1860,9 +2095,10 @@ export class OrderbookManager extends DurableObject<Env> {
 
       // CRITICAL: Prune on EVERY update to prevent unbounded growth
       // Uses splice() for in-place modification (no new array allocation)
-      const cutoff = snapshot.source_ts - this.PRICE_HISTORY_MAX_AGE_MS;
+      // Convert PRICE_HISTORY_MAX_AGE_MS to microseconds (source_ts is in microseconds)
+      const cutoffUs = snapshot.source_ts - (this.PRICE_HISTORY_MAX_AGE_MS * 1000);
       let firstValidIdx = 0;
-      while (firstValidIdx < history.length && history[firstValidIdx].ts < cutoff) {
+      while (firstValidIdx < history.length && history[firstValidIdx].ts < cutoffUs) {
         firstValidIdx++;
       }
       // Enforce both time-based and count-based limits
@@ -1872,6 +2108,83 @@ export class OrderbookManager extends DurableObject<Env> {
         history.splice(0, startIdx);
       }
     }
+
+    // ============================================================
+    // HFT TRIGGER STATE TRACKING
+    // Update state maps needed for advanced triggers
+    // ============================================================
+
+    // STALE_QUOTE: Track last update timestamp
+    this.lastUpdateTs.set(snapshot.asset_id, snapshot.source_ts);
+
+    // QUOTE_VELOCITY: Track update counts in rolling window
+    const updateCount = this.updateCounts.get(snapshot.asset_id);
+    if (updateCount) {
+      // If within same window, increment count
+      const windowMs = 1000; // Default 1 second window (will be overridden by trigger's window_ms)
+      if (snapshot.source_ts - updateCount.windowStartUs < windowMs * 1000) {
+        updateCount.count++;
+      } else {
+        // Start new window
+        updateCount.count = 1;
+        updateCount.windowStartUs = snapshot.source_ts;
+      }
+    } else {
+      this.updateCounts.set(snapshot.asset_id, { count: 1, windowStartUs: snapshot.source_ts });
+    }
+
+    // MID_PRICE_TREND: Track consecutive price moves
+    if (snapshot.mid_price !== null) {
+      const trend = this.trendTracker.get(snapshot.asset_id);
+      if (trend) {
+        if (snapshot.mid_price > trend.lastMid) {
+          // Price went up
+          if (trend.direction === "UP") {
+            trend.consecutiveMoves++;
+          } else {
+            trend.direction = "UP";
+            trend.consecutiveMoves = 1;
+          }
+        } else if (snapshot.mid_price < trend.lastMid) {
+          // Price went down
+          if (trend.direction === "DOWN") {
+            trend.consecutiveMoves++;
+          } else {
+            trend.direction = "DOWN";
+            trend.consecutiveMoves = 1;
+          }
+        }
+        // If equal, keep current state
+        trend.lastMid = snapshot.mid_price;
+      } else {
+        this.trendTracker.set(snapshot.asset_id, {
+          lastMid: snapshot.mid_price,
+          consecutiveMoves: 0,
+          direction: "UP", // Initial direction doesn't matter until we see movement
+        });
+      }
+    }
+
+    // IMBALANCE_SHIFT: Track imbalance history
+    if (snapshot.bid_size !== null && snapshot.ask_size !== null) {
+      const total = snapshot.bid_size + snapshot.ask_size;
+      if (total > 0) {
+        const imbalance = (snapshot.bid_size - snapshot.ask_size) / total;
+        let imbHistory = this.imbalanceHistory.get(snapshot.asset_id);
+        if (!imbHistory) {
+          imbHistory = [];
+          this.imbalanceHistory.set(snapshot.asset_id, imbHistory);
+        }
+        imbHistory.push({ imbalance, ts: snapshot.source_ts });
+        // Prune to max entries
+        if (imbHistory.length > this.MAX_IMBALANCE_HISTORY_ENTRIES) {
+          imbHistory.splice(0, imbHistory.length - this.MAX_IMBALANCE_HISTORY_ENTRIES);
+        }
+      }
+    }
+
+    // LARGE_FILL: Store current BBO sizes for next comparison (after trigger evaluation)
+    // We'll update this AFTER evaluating triggers so we can compare current vs previous
 
     // CRITICAL PATH OPTIMIZATION: Collect all fired events for potential batched dispatch
     const firedEvents: { trigger: Trigger; event: TriggerEvent }[] = [];
@@ -1918,6 +2231,24 @@ export class OrderbookManager extends DurableObject<Env> {
       }
     }
 
+    // ============================================================
+    // GLOBAL TRIGGERS - Always-on triggers for dashboard streaming
+    // These fire without registration and publish directly to SSE
+    // ============================================================
+    const globalEvents = this.evaluateGlobalTriggers(snapshot, now);
+    for (const event of globalEvents) {
+      // Create a synthetic trigger for dispatch
+      const syntheticTrigger: Trigger = {
+        id: event.trigger_id,
+        asset_id: snapshot.asset_id,
+        condition: { type: event.trigger_type, threshold: event.threshold },
+        enabled: true,
+        cooldown_ms: 500, // Fast cooldown for global triggers
+        created_at: 0,
+      };
+      firedEvents.push({ trigger: syntheticTrigger, event });
+    }
+
     // Fire webhooks asynchronously using waitUntil (non-blocking)
     // This ensures DO doesn't shutdown before webhooks complete while not blocking the hot path
     if (firedEvents.length > 0) {
@@ -1931,6 +2262,12 @@ export class OrderbookManager extends DurableObject<Env> {
         )
       );
     }
+
+    // LARGE_FILL: Update previousBBO for next comparison (after trigger evaluation)
+    this.previousBBO.set(snapshot.asset_id, {
+      bid_size: snapshot.bid_size,
+      ask_size: snapshot.ask_size,
+    });
   }
 
   private checkTriggerCondition(
@@ -2012,11 +2349,22 @@ export class OrderbookManager extends DurableObject<Env> {
         const history = this.priceHistory.get(snapshot.asset_id);
         if (!history || history.length === 0) break;
 
-        const windowStart = snapshot.source_ts - window_ms;
-        const oldEntry = history.find((h) => h.ts >= windowStart);
-        if (oldEntry && oldEntry.mid_price > 0) {
+        // Convert window_ms to microseconds (source_ts is in microseconds)
+        const windowStartUs = snapshot.source_ts - (window_ms * 1000);
+
+        // Find oldest entry within the window using explicit loop
+        // History is sorted ascending by timestamp, so first match is oldest in window
+        let baselineEntry: PriceHistoryEntry | null = null;
+        for (let i = 0; i < history.length; i++) {
+          if (history[i].ts >= windowStartUs) {
+            baselineEntry = history[i];
+            break;
+          }
+        }
+
+        if (baselineEntry && baselineEntry.mid_price > 0) {
           const pctChange =
-            Math.abs((snapshot.mid_price - oldEntry.mid_price) / oldEntry.mid_price) * 100;
+            Math.abs((snapshot.mid_price - baselineEntry.mid_price) / baselineEntry.mid_price) * 100;
           if (pctChange >= threshold) {
             return { fired: true, actualValue: pctChange };
           }
@@ -2036,6 +2384,17 @@ export class OrderbookManager extends DurableObject<Env> {
         break;
       }
 
+      case "EMPTY_BOOK": {
+        // Both sides of book are empty - critical market state
+        // Indicates: market halt, liquidity withdrawal, data gap, or pre/post market
+        const bidEmpty = snapshot.bid_size === null || snapshot.bid_size === 0;
+        const askEmpty = snapshot.ask_size === null || snapshot.ask_size === 0;
+        if (bidEmpty && askEmpty) {
+          return { fired: true, actualValue: 0 };
+        }
+        break;
+      }
+
       case "ARBITRAGE_BUY": {
         // YES_ask + NO_ask < threshold means buying both guarantees profit
         // threshold is typically < 1.0 (e.g., 0.99 to account for fees)
@@ -2044,7 +2403,9 @@ export class OrderbookManager extends DurableObject<Env> {
         const counterpartBBO = this.latestBBO.get(counterpart_asset_id);
         if (!counterpartBBO || counterpartBBO.best_ask === null) break;
 
-        // Check if data is stale (more than 5 seconds old)
+        // CRITICAL: Check BOTH explicit stale flag AND time delta to prevent false signals
+        // Stale flag is set proactively when counterpart data is old relative to new updates
+        if (counterpartBBO.stale) break;
         if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > 5000) break;
 
         const sumOfAsks = snapshot.best_ask + counterpartBBO.best_ask;
@@ -2074,7 +2435,9 @@ export class OrderbookManager extends DurableObject<Env> {
         const counterpartBBO = this.latestBBO.get(counterpart_asset_id);
         if (!counterpartBBO || counterpartBBO.best_bid === null) break;
 
-        // Check if data is stale (more than 5 seconds old)
+        // CRITICAL: Check BOTH explicit stale flag AND time delta to prevent false signals
+        // Stale flag is set proactively when counterpart data is old relative to new updates
+        if (counterpartBBO.stale) break;
         if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > 5000) break;
 
         const sumOfBids = snapshot.best_bid + counterpartBBO.best_bid;
@@ -2095,9 +2458,461 @@ export class OrderbookManager extends DurableObject<Env> {
         }
         break;
       }
+
+      // ============================================================
+      // HFT TRIGGERS - Advanced market making signals
+      // ============================================================
+
+      case "VOLATILITY_SPIKE": {
+        // Calculate rolling std dev of mid_price returns over window_ms
+        // AS model spread = 2/γ + γσ²(T-t) — when σ spikes, spreads should widen
+        if (snapshot.mid_price === null || !window_ms) break;
+
+        const history = this.priceHistory.get(snapshot.asset_id);
+        if (!history || history.length < 2) break;
+
+        // Convert window_ms to microseconds
+        const windowStartUs = snapshot.source_ts - (window_ms * 1000);
+
+        // Get entries within window
+        const windowEntries = history.filter(e => e.ts >= windowStartUs);
+        if (windowEntries.length < 2) break;
+
+        // Calculate returns
+        const returns: number[] = [];
+        for (let i = 1; i < windowEntries.length; i++) {
+          const prevPrice = windowEntries[i - 1].mid_price;
+          if (prevPrice > 0) {
+            returns.push((windowEntries[i].mid_price - prevPrice) / prevPrice);
+          }
+        }
+
+        if (returns.length < 2) break;
+
+        // Calculate standard deviation
+        const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+        const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
+        const stdDev = Math.sqrt(variance);
+        const volatilityPct = stdDev * 100;
+
+        if (volatilityPct > threshold) {
+          return {
+            fired: true,
+            actualValue: volatilityPct,
+            arbitrageData: {
+              volatility: volatilityPct,
+            },
+          };
+        }
+        break;
+      }
+
+      case "MICROPRICE_DIVERGENCE": {
+        // Microprice = (best_bid × ask_size + best_ask × bid_size) / (bid_size + ask_size)
+        // Better short-term price predictor than mid. Divergence signals directional momentum.
+        if (snapshot.best_bid === null || snapshot.best_ask === null ||
+            snapshot.bid_size === null || snapshot.ask_size === null ||
+            snapshot.mid_price === null) break;
+
+        const totalSize = snapshot.bid_size + snapshot.ask_size;
+        if (totalSize === 0) break;
+
+        const microprice = (snapshot.best_bid * snapshot.ask_size + snapshot.best_ask * snapshot.bid_size) / totalSize;
+        const divergenceBps = Math.abs((microprice - snapshot.mid_price) / snapshot.mid_price) * 10000;
+
+        if (divergenceBps > threshold) {
+          return {
+            fired: true,
+            actualValue: divergenceBps,
+            arbitrageData: {
+              microprice,
+              microprice_divergence_bps: divergenceBps,
+            },
+          };
+        }
+        break;
+      }
+
+      case "IMBALANCE_SHIFT": {
+        // Detect rapid changes in book imbalance — signals shift in order flow
+        if (!window_ms) break;
+        if (snapshot.bid_size === null || snapshot.ask_size === null) break;
+
+        const total = snapshot.bid_size + snapshot.ask_size;
+        if (total === 0) break;
+
+        const currentImbalance = (snapshot.bid_size - snapshot.ask_size) / total;
+
+        const imbHistory = this.imbalanceHistory.get(snapshot.asset_id);
+        if (!imbHistory || imbHistory.length === 0) break;
+
+        // Find imbalance at window start
+        const windowStartUs = snapshot.source_ts - (window_ms * 1000);
+        let previousImbalance: number | null = null;
+        for (let i = 0; i < imbHistory.length; i++) {
+          if (imbHistory[i].ts >= windowStartUs) {
+            previousImbalance = imbHistory[i].imbalance;
+            break;
+          }
+        }
+
+        if (previousImbalance === null) break;
+
+        const imbalanceDelta = Math.abs(currentImbalance - previousImbalance);
+
+        if (imbalanceDelta > threshold) {
+          return {
+            fired: true,
+            actualValue: imbalanceDelta,
+            arbitrageData: {
+              imbalance_delta: imbalanceDelta,
+              previous_imbalance: previousImbalance,
+              current_imbalance: currentImbalance,
+            },
+          };
+        }
+        break;
+      }
+
+      case "MID_PRICE_TREND": {
+        // Detect consecutive price moves in same direction — crucial for AS inventory management
+        const trend = this.trendTracker.get(snapshot.asset_id);
+        if (!trend) break;
+
+        // Check if side filter matches (optional)
+        if (side === "BID" && trend.direction !== "DOWN") break;
+        if (side === "ASK" && trend.direction !== "UP") break;
+
+        if (trend.consecutiveMoves >= threshold) {
+          return {
+            fired: true,
+            actualValue: trend.consecutiveMoves,
+            arbitrageData: {
+              consecutive_moves: trend.consecutiveMoves,
+              trend_direction: trend.direction,
+            },
+          };
+        }
+        break;
+      }
+
+      case "QUOTE_VELOCITY": {
+        // Detect when other MMs are updating quotes frequently — competitive pressure
+        if (!window_ms) break;
+
+        const updateCount = this.updateCounts.get(snapshot.asset_id);
+        if (!updateCount) break;
+
+        // Calculate updates per second
+        const windowSec = window_ms / 1000;
+        const elapsedUs = snapshot.source_ts - updateCount.windowStartUs;
+        const elapsedSec = elapsedUs / 1000000;
+
+        // Only evaluate if we have at least half the window elapsed
+        if (elapsedSec < windowSec * 0.5) break;
+
+        const updatesPerSecond = updateCount.count / Math.max(elapsedSec, 0.001);
+
+        if (updatesPerSecond > threshold) {
+          return {
+            fired: true,
+            actualValue: updatesPerSecond,
+            arbitrageData: {
+              updates_per_second: updatesPerSecond,
+            },
+          };
+        }
+        break;
+      }
+
+      case "STALE_QUOTE": {
+        // Note: This is primarily evaluated in alarm() handler, but can also fire on BBO update
+        // if the previous update was stale. Evaluated based on lastUpdateTs.
+        // This case is a no-op during normal BBO updates since we just updated lastUpdateTs
+        break;
+      }
+
+      case "MULTI_OUTCOME_ARBITRAGE": {
+        // Sum of all outcome asks < threshold = arbitrage opportunity for N-outcome markets
+        const { outcome_asset_ids } = trigger.condition;
+        if (!outcome_asset_ids || outcome_asset_ids.length < 2) break;
+
+        let sumOfAsks = 0;
+        let validCount = 0;
+
+        for (const assetId of outcome_asset_ids) {
+          const bbo = this.latestBBO.get(assetId);
+          if (!bbo || bbo.best_ask === null) continue;
+
+          // Check staleness (5 second max age)
+          if (Math.abs(snapshot.source_ts - bbo.ts) > 5000) continue;
+
+          sumOfAsks += bbo.best_ask;
+          validCount++;
+        }
+
+        // Need data for all outcomes
+        if (validCount !== outcome_asset_ids.length) break;
+
+        if (sumOfAsks < threshold) {
+          const profitBps = (1 - sumOfAsks) * 10000;
+          return {
+            fired: true,
+            actualValue: sumOfAsks,
+            arbitrageData: {
+              outcome_ask_sum: sumOfAsks,
+              outcome_count: validCount,
+              potential_profit_bps: profitBps,
+            },
+          };
+        }
+        break;
+      }
+
+      case "LARGE_FILL": {
+        // Detect when significant size is removed from the orderbook (whale activity)
+        const prevBBO = this.previousBBO.get(snapshot.asset_id);
+        if (!prevBBO) break;
+
+        let fillNotional = 0;
+        let fillSide: "BID" | "ASK" | null = null;
+        let sizeDelta = 0;
+
+        // Check bid side for size removal
+        if ((!side || side === "BID") && prevBBO.bid_size !== null && snapshot.bid_size !== null) {
+          const bidDelta = snapshot.bid_size - prevBBO.bid_size;
+          if (bidDelta < 0 && snapshot.best_bid !== null) {
+            const notional = Math.abs(bidDelta) * snapshot.best_bid;
+            if (notional > fillNotional) {
+              fillNotional = notional;
+              fillSide = "BID";
+              sizeDelta = bidDelta;
+            }
+          }
+        }
+
+        // Check ask side for size removal
+        if ((!side || side === "ASK") && prevBBO.ask_size !== null && snapshot.ask_size !== null) {
+          const askDelta = snapshot.ask_size - prevBBO.ask_size;
+          if (askDelta < 0 && snapshot.best_ask !== null) {
+            const notional = Math.abs(askDelta) * snapshot.best_ask;
+            if (notional > fillNotional) {
+              fillNotional = notional;
+              fillSide = "ASK";
+              sizeDelta = askDelta;
+            }
+          }
+        }
+
+        if (fillNotional > threshold && fillSide) {
+          return {
+            fired: true,
+            actualValue: fillNotional,
+            arbitrageData: {
+              fill_notional: fillNotional,
+              fill_side: fillSide,
+              size_delta: sizeDelta,
+            },
+          };
+        }
+        break;
+      }
     }
 
     return { fired: false, actualValue: 0 };
+  }
+
+  // Global trigger cooldown tracking (separate from registered triggers)
+  private globalTriggerCooldowns: Map<string, number> = new Map();
+  private readonly GLOBAL_TRIGGER_COOLDOWN_MS = 500; // 500ms cooldown per trigger type per asset
+
+  /**
+   * Evaluate global/built-in triggers that run on every BBO update without registration.
+   * These provide a baseline stream of market events for the dashboard.
+   */
+  private evaluateGlobalTriggers(snapshot: BBOSnapshot, nowUs: number): TriggerEvent[] {
+    const events: TriggerEvent[] = [];
+    const assetId = snapshot.asset_id;
+
+    // Helper to check cooldown and create event
+    const maybeFireGlobal = (
+      triggerType: TriggerType,
+      threshold: number,
+      actualValue: number,
+      extraData?: Partial<TriggerEvent>
+    ): boolean => {
+      const cooldownKey = `global:${assetId}:${triggerType}`;
+      const lastFire = this.globalTriggerCooldowns.get(cooldownKey) || 0;
+
+      if (nowUs - lastFire < this.GLOBAL_TRIGGER_COOLDOWN_MS * 1000) {
+        return false;
+      }
+
+      this.globalTriggerCooldowns.set(cooldownKey, nowUs);
+
+      events.push({
+        trigger_id: `global_${triggerType.toLowerCase()}`,
+        trigger_type: triggerType,
+        asset_id: assetId,
+        condition_id: snapshot.condition_id,
+        fired_at: Math.floor(nowUs),
+        latency_us: Math.floor(nowUs - snapshot.source_ts * 1000),
+
+        best_bid: snapshot.best_bid,
+        best_ask: snapshot.best_ask,
+        bid_size: snapshot.bid_size,
+        ask_size: snapshot.ask_size,
+        mid_price: snapshot.mid_price,
+        spread_bps: snapshot.spread_bps,
+
+        threshold,
+        actual_value: actualValue,
+
+        book_hash: snapshot.book_hash,
+        sequence_number: snapshot.sequence_number,
+        ...extraData,
+      });
+
+      return true;
+    };
+
+    // ============================================================
+    // GLOBAL TRIGGER DEFINITIONS
+    // Sensible defaults that provide useful market signals
+    // ============================================================
+
+    // SPREAD_WIDE: Fire when spread > 200 bps (2%)
+    if (snapshot.spread_bps !== null && snapshot.spread_bps > 200) {
+      maybeFireGlobal("SPREAD_WIDE", 200, snapshot.spread_bps);
+    }
+
+    // SPREAD_NARROW: Fire when spread < 20 bps (0.2%) - very tight
+    if (snapshot.spread_bps !== null && snapshot.spread_bps < 20) {
+      maybeFireGlobal("SPREAD_NARROW", 20, snapshot.spread_bps);
+    }
+
+    // IMBALANCE_BID: Fire when imbalance > 0.6 (strong bid pressure)
+    if (snapshot.bid_size !== null && snapshot.ask_size !== null) {
+      const total = snapshot.bid_size + snapshot.ask_size;
+      if (total > 0) {
+        const imbalance = (snapshot.bid_size - snapshot.ask_size) / total;
+        if (imbalance > 0.6) {
+          maybeFireGlobal("IMBALANCE_BID", 0.6, imbalance);
+        } else if (imbalance < -0.6) {
+          maybeFireGlobal("IMBALANCE_ASK", 0.6, Math.abs(imbalance));
+        }
+      }
+    }
+
+    // CROSSED_BOOK: Always fire (critical condition)
+    if (snapshot.best_bid !== null && snapshot.best_ask !== null && snapshot.best_bid >= snapshot.best_ask) {
+      maybeFireGlobal("CROSSED_BOOK", 0, snapshot.best_bid - snapshot.best_ask);
+    }
+
+    // EMPTY_BOOK: Always fire (critical condition)
+    if ((snapshot.best_bid === null || snapshot.bid_size === 0) &&
+        (snapshot.best_ask === null || snapshot.ask_size === 0)) {
+      maybeFireGlobal("EMPTY_BOOK", 0, 0);
+    }
+
+    // MICROPRICE_DIVERGENCE: Fire when divergence > 50 bps
+    if (snapshot.best_bid !== null && snapshot.best_ask !== null &&
+        snapshot.bid_size !== null && snapshot.ask_size !== null &&
+        snapshot.mid_price !== null) {
+      const totalSize = snapshot.bid_size + snapshot.ask_size;
+      if (totalSize > 0) {
+        const microprice = (snapshot.best_bid * snapshot.ask_size + snapshot.best_ask * snapshot.bid_size) / totalSize;
+        const divergenceBps = Math.abs((microprice - snapshot.mid_price) / snapshot.mid_price) * 10000;
+        if (divergenceBps > 50) {
+          maybeFireGlobal("MICROPRICE_DIVERGENCE", 50, divergenceBps, {
+            microprice,
+            microprice_divergence_bps: divergenceBps,
+          });
+        }
+      }
+    }
+
+    // MID_PRICE_TREND: Fire on 3+ consecutive moves
+    const trend = this.trendTracker.get(assetId);
+    if (trend && trend.consecutiveMoves >= 3) {
+      maybeFireGlobal("MID_PRICE_TREND", 3, trend.consecutiveMoves, {
+        consecutive_moves: trend.consecutiveMoves,
+        trend_direction: trend.direction,
+      });
+    }
+
+    // LARGE_FILL: Fire when > $1000 notional removed
+    const prevBBO = this.previousBBO.get(assetId);
+    if (prevBBO) {
+      let fillNotional = 0;
+      let fillSide: "BID" | "ASK" | null = null;
+      let sizeDelta = 0;
+
+      if (prevBBO.bid_size !== null && snapshot.bid_size !== null && snapshot.best_bid !== null) {
+        const bidDelta = snapshot.bid_size - prevBBO.bid_size;
+        if (bidDelta < 0) {
+          const notional = Math.abs(bidDelta) * snapshot.best_bid;
+          if (notional > fillNotional) {
+            fillNotional = notional;
+            fillSide = "BID";
+            sizeDelta = bidDelta;
+          }
+        }
+      }
+
+      if (prevBBO.ask_size !== null && snapshot.ask_size !== null && snapshot.best_ask !== null) {
+        const askDelta = snapshot.ask_size - prevBBO.ask_size;
+        if (askDelta < 0) {
+          const notional = Math.abs(askDelta) * snapshot.best_ask;
+          if (notional > fillNotional) {
+            fillNotional = notional;
+            fillSide = "ASK";
+            sizeDelta = askDelta;
+          }
+        }
+      }
+
+      if (fillNotional > 1000 && fillSide) {
+        maybeFireGlobal("LARGE_FILL", 1000, fillNotional, {
+          fill_notional: fillNotional,
+          fill_side: fillSide,
+          size_delta: sizeDelta,
+        });
+      }
+    }
+
+    // VOLATILITY_SPIKE: Fire when volatility > 2% (checked with 10s window)
+    if (snapshot.mid_price !== null) {
+      const history = this.priceHistory.get(assetId);
+      if (history && history.length >= 5) {
+        const windowStartUs = snapshot.source_ts - 10000000; // 10 second window
+        const windowEntries = history.filter(e => e.ts >= windowStartUs);
+
+        if (windowEntries.length >= 3) {
+          const returns: number[] = [];
+          for (let i = 1; i < windowEntries.length; i++) {
+            const prevPrice = windowEntries[i - 1].mid_price;
+            if (prevPrice > 0) {
+              returns.push((windowEntries[i].mid_price - prevPrice) / prevPrice);
+            }
+          }
+
+          if (returns.length >= 2) {
+            const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+            const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
+            const volatilityPct = Math.sqrt(variance) * 100;
+
+            if (volatilityPct > 2) {
+              maybeFireGlobal("VOLATILITY_SPIKE", 2, volatilityPct, {
+                volatility: volatilityPct,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    return events;
   }
 
   /**
@@ -2132,28 +2947,37 @@ export class OrderbookManager extends DurableObject<Env> {
   }
 
   private async dispatchTriggerWebhook(trigger: Trigger, event: TriggerEvent): Promise<void> {
-    const body = JSON.stringify(event);
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      "X-Trigger-ID": trigger.id,
-      "X-Trigger-Type": trigger.condition.type,
-    };
+    // Always publish to SSE buffer for dashboard subscribers
+    const bufferPromise = this.publishToEventBuffer(event);
 
-    // Add HMAC signature if secret is configured (using cached key for performance)
-    if (trigger.webhook_secret) {
-      const key = await this.getOrCreateHmacKey(trigger.id, trigger.webhook_secret);
-      const encoder = new TextEncoder();
-      const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
-      headers["X-Trigger-Signature"] = btoa(String.fromCharCode(...new Uint8Array(signature)));
+    // Only dispatch webhook if URL is configured
+    let webhookPromise: Promise<Response | null> = Promise.resolve(null);
+    if (trigger.webhook_url) {
+      const body = JSON.stringify(event);
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "X-Trigger-ID": trigger.id,
+        "X-Trigger-Type": trigger.condition.type,
+      };
+
+      // Add HMAC signature if secret is configured (using cached key for performance)
+      if (trigger.webhook_secret) {
+        const key = await this.getOrCreateHmacKey(trigger.id, trigger.webhook_secret);
+        const encoder = new TextEncoder();
+        const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
+        headers["X-Trigger-Signature"] = btoa(String.fromCharCode(...new Uint8Array(signature)));
+      }
+
+      webhookPromise = fetch(trigger.webhook_url, {
+        method: "POST",
+        headers,
+        body,
+      });
     }
 
-    const response = await fetch(trigger.webhook_url, {
-      method: "POST",
-      headers,
-      body,
-    });
+    const [response] = await Promise.all([webhookPromise, bufferPromise]);
 
-    if (!response.ok) {
+    if (response && !response.ok) {
       console.error(
         `[Trigger] Webhook failed for ${trigger.id}: ${response.status} ${await response.text()}`
       );
@@ -2162,6 +2986,25 @@ export class OrderbookManager extends DurableObject<Env> {
         `[Trigger] Fired ${trigger.id} (${trigger.condition.type}) for ${event.asset_id} ` +
           `@ ${event.actual_value.toFixed(4)}, latency=${Math.round(event.latency_us / 1000)}ms`
       );
+    }
+  }
+
+  /**
+   * Publish trigger event to TriggerEventBuffer for SSE broadcasting
+   */
+  private async publishToEventBuffer(event: TriggerEvent): Promise<void> {
+    try {
+      const doId = this.env.TRIGGER_EVENT_BUFFER.idFromName("global");
+      const stub = this.env.TRIGGER_EVENT_BUFFER.get(doId);
+
+      await stub.fetch(new Request("https://do/publish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(event),
+      }));
+    } catch (error) {
+      // Don't fail the trigger if buffer publish fails
+      console.error("[Trigger] Failed to publish to event buffer:", error);
     }
   }
 }

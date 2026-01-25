@@ -7,8 +7,28 @@ import { buildAsyncInsertUrl, buildClickHouseHeaders } from "./clickhouse-client
 // ERROR CLASSIFICATION
 // ============================================================
 
-export type ErrorType = "transient" | "rate_limit" | "client_error";
+/**
+ * Error severity levels for unified error handling
+ */
+export type ErrorSeverity = "transient" | "rate_limit" | "client_error" | "permanent";
 
+/**
+ * Classified error with metadata for consistent handling
+ */
+export interface ClassifiedError {
+  severity: ErrorSeverity;
+  shouldRetry: boolean;
+  backoffMs?: number;
+  message: string;
+}
+
+// Backwards compatibility alias
+export type ErrorType = ErrorSeverity;
+
+/**
+ * Classify an error from ClickHouse or general exceptions.
+ * Used by consumers to determine retry behavior.
+ */
 export function classifyError(error: unknown): ErrorType {
   const msg = String(error);
 
@@ -32,6 +52,94 @@ export function classifyError(error: unknown): ErrorType {
   }
 
   return "transient"; // Default to transient for safety
+}
+
+/**
+ * Classify an HTTP response status code for consistent error handling.
+ * Used across all HTTP-based consumers and services.
+ *
+ * @param status - HTTP status code
+ * @param body - Optional response body for additional context
+ * @returns Classified error with retry guidance
+ */
+export function classifyHttpError(status: number, body?: string): ClassifiedError {
+  // Success - not an error
+  if (status >= 200 && status < 300) {
+    return {
+      severity: "transient", // Should not happen, but safe default
+      shouldRetry: false,
+      message: "Success",
+    };
+  }
+
+  // 404 - Resource not found (expected for resolved markets)
+  if (status === 404) {
+    return {
+      severity: "permanent",
+      shouldRetry: false,
+      message: body || "Resource not found",
+    };
+  }
+
+  // 429 - Rate limited
+  if (status === 429) {
+    return {
+      severity: "rate_limit",
+      shouldRetry: true,
+      backoffMs: 60000, // 1 minute default
+      message: body || "Rate limited",
+    };
+  }
+
+  // 4xx Client errors (except 404, 429) - don't retry
+  if (status >= 400 && status < 500) {
+    return {
+      severity: "client_error",
+      shouldRetry: false,
+      message: body || `Client error: ${status}`,
+    };
+  }
+
+  // 5xx Server errors - retry with backoff
+  if (status >= 500) {
+    return {
+      severity: "transient",
+      shouldRetry: true,
+      backoffMs: status === 503 ? 30000 : 5000, // Longer backoff for 503
+      message: body || `Server error: ${status}`,
+    };
+  }
+
+  // Unknown status - treat as transient
+  return {
+    severity: "transient",
+    shouldRetry: true,
+    backoffMs: 5000,
+    message: body || `Unknown status: ${status}`,
+  };
+}
+
+/**
+ * Classify a ClickHouse-specific error for consistent handling.
+ * Wraps classifyError with ClassifiedError return type.
+ */
+export function classifyClickHouseError(error: unknown): ClassifiedError {
+  const severity = classifyError(error);
+  const msg = String(error);
+
+  const backoffMap: Record<ErrorType, number | undefined> = {
+    transient: 5000,
+    rate_limit: 30000,
+    client_error: undefined,
+    permanent: undefined,
+  };
+
+  return {
+    severity,
+    shouldRetry: severity !== "client_error" && severity !== "permanent",
+    backoffMs: backoffMap[severity],
+    message: msg,
+  };
 }
 
 // ============================================================

@@ -117,6 +117,15 @@ export class GenericTriggerEvaluator extends BaseTriggerEvaluator {
       "SIZE_SPIKE",
       "PRICE_MOVE",
       "CROSSED_BOOK",
+      "EMPTY_BOOK",
+      // HFT Triggers for Avellaneda-Stoikov market making
+      "VOLATILITY_SPIKE",
+      "MICROPRICE_DIVERGENCE",
+      "IMBALANCE_SHIFT",
+      "MID_PRICE_TREND",
+      "QUOTE_VELOCITY",
+      "STALE_QUOTE",
+      "LARGE_FILL",
     ];
   }
 
@@ -154,6 +163,9 @@ export class GenericTriggerEvaluator extends BaseTriggerEvaluator {
 
       case "CROSSED_BOOK":
         return this.evaluateCrossedBook(trigger, snapshot);
+
+      case "EMPTY_BOOK":
+        return this.evaluateEmptyBook(trigger, snapshot);
 
       default:
         return this.notFired();
@@ -271,12 +283,22 @@ export class GenericTriggerEvaluator extends BaseTriggerEvaluator {
       return this.notFired();
     }
 
-    const windowStart = snapshot.source_ts - window_ms;
-    const oldEntry = history.find((h) => h.ts >= windowStart);
+    // Convert window_ms to microseconds (source_ts is in microseconds)
+    const windowStartUs = snapshot.source_ts - (window_ms * 1000);
 
-    if (oldEntry && oldEntry.mid_price > 0) {
+    // Find oldest entry within the window using explicit loop
+    // History is sorted ascending by timestamp, so first match is oldest in window
+    let baselineEntry: PriceHistoryEntry | null = null;
+    for (let i = 0; i < history.length; i++) {
+      if (history[i].ts >= windowStartUs) {
+        baselineEntry = history[i];
+        break;
+      }
+    }
+
+    if (baselineEntry && baselineEntry.mid_price > 0) {
       const pctChange =
-        Math.abs((snapshot.mid_price - oldEntry.mid_price) / oldEntry.mid_price) * 100;
+        Math.abs((snapshot.mid_price - baselineEntry.mid_price) / baselineEntry.mid_price) * 100;
       if (pctChange >= threshold) {
         return this.fired(this.createTriggerEvent(trigger, snapshot, pctChange));
       }
@@ -300,11 +322,41 @@ export class GenericTriggerEvaluator extends BaseTriggerEvaluator {
     }
     return this.notFired();
   }
+
+  /**
+   * EMPTY_BOOK: Detect when both sides of the book are empty
+   *
+   * This is a critical market state indicating:
+   * - Market halt or suspension
+   * - Liquidity withdrawal (all LPs pulled quotes)
+   * - Data gap or connection issue
+   * - Pre-market or post-market state
+   *
+   * Fires when both bid_size and ask_size are null or zero.
+   * The threshold is ignored for this trigger type.
+   * actualValue is 0 when fired.
+   */
+  private evaluateEmptyBook(
+    trigger: Trigger,
+    snapshot: BBOSnapshot
+  ): TriggerEvaluationResult {
+    const bidEmpty = snapshot.bid_size === null || snapshot.bid_size === 0;
+    const askEmpty = snapshot.ask_size === null || snapshot.ask_size === 0;
+
+    if (bidEmpty && askEmpty) {
+      return this.fired(this.createTriggerEvent(trigger, snapshot, 0));
+    }
+    return this.notFired();
+  }
 }
 
 /**
  * Update price history for PRICE_MOVE triggers
  * Returns pruned history with old entries removed
+ *
+ * OPTIMIZATION: Uses binary search O(log n) instead of linear scan O(n)
+ * for finding the cutoff point, since history is sorted by timestamp.
+ * Also includes early return when no pruning is needed.
  */
 export function updatePriceHistory(
   history: PriceHistoryEntry[],
@@ -316,17 +368,41 @@ export function updatePriceHistory(
     return history;
   }
 
-  const newHistory = [...history, { ts: snapshot.source_ts, mid_price: snapshot.mid_price }];
+  // Add new entry (mutates in place for better performance)
+  history.push({ ts: snapshot.source_ts, mid_price: snapshot.mid_price });
 
-  // Prune old entries
-  const cutoff = snapshot.source_ts - maxAgeMs;
-  let firstValidIdx = 0;
-  while (firstValidIdx < newHistory.length && newHistory[firstValidIdx].ts < cutoff) {
-    firstValidIdx++;
+  // Early return if under limits - no pruning needed
+  if (history.length <= maxEntries) {
+    const cutoffUs = snapshot.source_ts - (maxAgeMs * 1000);
+    if (history[0].ts >= cutoffUs) {
+      return history; // No pruning needed
+    }
   }
 
-  // Enforce max entries limit
-  const startIdx = Math.max(firstValidIdx, newHistory.length - maxEntries);
+  // Binary search for first valid entry (since array is sorted by ts)
+  // This is O(log n) vs O(n) for linear scan
+  const cutoffUs = snapshot.source_ts - (maxAgeMs * 1000);
+  let left = 0;
+  let right = history.length - 1;
+  let firstValidIdx = history.length;
 
-  return startIdx > 0 ? newHistory.slice(startIdx) : newHistory;
+  while (left <= right) {
+    const mid = Math.floor((left + right) / 2);
+    if (history[mid].ts >= cutoffUs) {
+      firstValidIdx = mid;
+      right = mid - 1;
+    } else {
+      left = mid + 1;
+    }
+  }
+
+  // Determine final start index (consider both time-based and count-based limits)
+  const startIdx = Math.max(firstValidIdx, history.length - maxEntries);
+
+  // Only slice if necessary
+  if (startIdx > 0) {
+    return history.slice(startIdx);
+  }
+
+  return history;
 }

@@ -1,5 +1,6 @@
 import { Hono, Context, Next } from "hono";
-import { Env, GoldskyTradeEvent, DeadLetterMessage } from "./types";
+import { cors } from "hono/cors";
+import { Env, DeadLetterMessage } from "./types";
 import type {
   BBOSnapshot,
   GapBackfillJob,
@@ -8,6 +9,7 @@ import type {
   FullL2Snapshot,
 } from "./types/orderbook";
 import { OrderbookManager } from "./durable-objects/orderbook-manager";
+import { TriggerEventBuffer } from "./durable-objects/trigger-event-buffer";
 import { snapshotConsumer } from "./consumers/snapshot-consumer";
 import { gapBackfillConsumer } from "./consumers/gap-backfill-consumer";
 import { tradeTickConsumer } from "./consumers/trade-tick-consumer";
@@ -15,6 +17,8 @@ import { levelChangeConsumer } from "./consumers/level-change-consumer";
 import { fullL2SnapshotConsumer } from "./consumers/full-l2-snapshot-consumer";
 import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
 import { MarketLifecycleService, type MarketLifecycleWebhook } from "./services/market-lifecycle";
+import { MarketCacheService } from "./services/market-cache";
+import { MarketCleanupService } from "./services/market-cleanup";
 import { DB_CONFIG } from "./config/database";
 
 // ============================================================
@@ -66,117 +70,20 @@ async function loadLifecycleWebhooks(env: Env): Promise<MarketLifecycleWebhook[]
 }
 
 /**
- * Auth middleware for API endpoints
+ * Auth middleware for API endpoints (uses VITE_DASHBOARD_API_KEY)
  */
 const authMiddleware = async (
   c: Context<{ Bindings: Env }>,
   next: Next
 ): Promise<Response | void> => {
   const apiKey = c.req.header("X-API-Key");
-  if (!apiKey || apiKey !== c.env.WEBHOOK_API_KEY) {
+  if (!apiKey || apiKey !== c.env.VITE_DASHBOARD_API_KEY) {
     return c.json({ error: "Unauthorized" }, 401);
   }
   await next();
 };
 
 const app = new Hono<{ Bindings: Env }>();
-
-app.post("/webhook/goldsky", authMiddleware, async (c) => {
-  const body = await c.req.json();
-
-  // Handle both single event and array of events
-  const events: GoldskyTradeEvent[] = Array.isArray(body) ? body : [body];
-
-  console.log(`Received ${events.length} events from Goldsky`);
-
-  const subscribedAssets: string[] = [];
-  let cacheHits = 0;
-  let cacheMisses = 0;
-
-  for (const event of events) {
-    // Extract active asset ID (the one that's not "0")
-    const activeAssetId =
-      event.maker_asset_id !== "0"
-        ? event.maker_asset_id
-        : event.taker_asset_id;
-
-    // Check cache for market metadata using clob_token_id
-    const cacheKey = `market:${activeAssetId}`;
-    const cached = await c.env.MARKET_CACHE.get(cacheKey);
-
-    // RELIABILITY: Only subscribe if we have cached metadata with condition_id
-    // This ensures YES/NO pairs are ALWAYS routed to the same shard
-    // Cache miss = skip subscription, 5-minute cron will sync metadata
-    if (!cached) {
-      cacheMisses++;
-      console.warn(
-        `[Goldsky] Cache miss for asset ${activeAssetId.slice(0, 20)}... - skipping subscription (will retry after metadata sync)`
-      );
-      continue;
-    }
-
-    let conditionId: string;
-    let tickSize = 0.01;
-    let marketEnded = false;
-    let negRisk = false;
-    let orderMinSize = 0;
-
-    try {
-      const metadata = JSON.parse(cached);
-      conditionId = metadata.condition_id;
-
-      // CRITICAL: condition_id is required for market-based sharding
-      if (!conditionId) {
-        console.warn(
-          `[Goldsky] Missing condition_id in cache for asset ${activeAssetId.slice(0, 20)}... - skipping`
-        );
-        continue;
-      }
-
-      tickSize = metadata.order_price_min_tick_size || 0.01;
-      negRisk = metadata.neg_risk === 1 || metadata.neg_risk === true;
-      orderMinSize = metadata.order_min_size || 0;
-
-      // Check if market has ended
-      if (metadata.end_date) {
-        marketEnded = new Date(metadata.end_date) < new Date();
-      }
-      cacheHits++;
-    } catch {
-      console.error(`[Goldsky] Failed to parse cache for asset ${activeAssetId.slice(0, 20)}...`);
-      continue;
-    }
-
-    // Subscribe to orderbook WebSocket if market hasn't ended
-    // CRITICAL: Route by MARKET (condition_id) to ensure YES/NO pairs are on same shard
-    if (!marketEnded) {
-      const shardId = getShardForMarket(conditionId);
-      const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardId);
-      const stub = c.env.ORDERBOOK_MANAGER.get(doId);
-      c.executionCtx.waitUntil(
-        stub.fetch("http://do/subscribe", {
-          method: "POST",
-          body: JSON.stringify({
-            condition_id: conditionId,
-            token_ids: [activeAssetId],
-            tick_size: tickSize,
-            neg_risk: negRisk,
-            order_min_size: orderMinSize,
-          }),
-        })
-      );
-      subscribedAssets.push(activeAssetId);
-    }
-  }
-
-  return c.json({
-    status: "ok",
-    events_received: events.length,
-    subscriptions_triggered: subscribedAssets.length,
-    cache_hits: cacheHits,
-    cache_misses: cacheMisses,
-  });
-});
 
 app.get("/health", (c) => {
   return c.json({ status: "ok" });
@@ -222,18 +129,9 @@ app.post("/triggers", authMiddleware, async (c) => {
   let conditionId: string | null = body.condition_id || null;
 
   if (!conditionId) {
-    // Look up condition_id from cache
-    const cacheKey = `market:${body.asset_id}`;
-    const cached = await c.env.MARKET_CACHE.get(cacheKey);
-
-    if (cached) {
-      try {
-        const metadata = JSON.parse(cached);
-        conditionId = metadata.condition_id;
-      } catch {
-        // Parse failed, continue without condition_id
-      }
-    }
+    // Look up condition_id from cache using service
+    const marketCache = new MarketCacheService(c.env.MARKET_CACHE);
+    conditionId = await marketCache.getConditionId(body.asset_id);
   }
 
   // RELIABILITY: Require condition_id for proper shard routing
@@ -282,18 +180,9 @@ app.delete("/triggers", authMiddleware, async (c) => {
   let conditionId: string | null = body.condition_id || null;
 
   if (!conditionId && body.asset_id) {
-    // Look up condition_id from cache
-    const cacheKey = `market:${body.asset_id}`;
-    const cached = await c.env.MARKET_CACHE.get(cacheKey);
-
-    if (cached) {
-      try {
-        const metadata = JSON.parse(cached);
-        conditionId = metadata.condition_id;
-      } catch {
-        // Parse failed
-      }
-    }
+    // Look up condition_id from cache using service
+    const marketCache = new MarketCacheService(c.env.MARKET_CACHE);
+    conditionId = await marketCache.getConditionId(body.asset_id);
   }
 
   if (!conditionId) {
@@ -995,8 +884,275 @@ app.get("/test/all", async (c) => {
   });
 });
 
+// ============================================================
+// Dashboard API Endpoints (Public - CORS enabled)
+// ============================================================
+
+// CORS middleware for dashboard API
+const dashboardApi = new Hono<{ Bindings: Env }>();
+
+dashboardApi.use("*", cors({
+  origin: (origin) => origin || "*", // Allow the requesting origin for credentials
+  allowMethods: ["GET", "POST", "OPTIONS"],
+  allowHeaders: ["Content-Type", "X-API-Key"],
+  credentials: true,
+}));
+
+// Session cookie name
+const SESSION_COOKIE = "dashboard_session";
+
+/**
+ * Parse cookies from request header
+ */
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  if (!cookieHeader) return {};
+  return Object.fromEntries(
+    cookieHeader.split(";").map((c) => {
+      const [key, ...val] = c.trim().split("=");
+      return [key, val.join("=")];
+    })
+  );
+}
+
+/**
+ * Generate a secure session token
+ */
+function generateSessionToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// In-memory session store (in production, use KV or Durable Objects)
+const sessions = new Map<string, { createdAt: number }>();
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/**
+ * Auth endpoint - validates API key and sets session cookie
+ * POST /api/v1/auth with X-API-Key header or { "api_key": "..." } body
+ */
+dashboardApi.post("/auth", async (c) => {
+  const apiKey = c.req.header("X-API-Key") || (await c.req.json().catch(() => ({}))).api_key;
+
+  if (!apiKey || apiKey !== c.env.VITE_DASHBOARD_API_KEY) {
+    return c.json({ error: "Invalid API key" }, 401);
+  }
+
+  // Generate session token
+  const sessionToken = generateSessionToken();
+  sessions.set(sessionToken, { createdAt: Date.now() });
+
+  // Set httpOnly cookie
+  const isSecure = c.req.url.startsWith("https");
+  const cookie = `${SESSION_COOKIE}=${sessionToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400${isSecure ? "; Secure" : ""}`;
+
+  return c.json(
+    { success: true, message: "Authenticated" },
+    200,
+    { "Set-Cookie": cookie }
+  );
+});
+
+/**
+ * Validate session from cookie
+ */
+function validateSession(c: Context<{ Bindings: Env }>): boolean {
+  const cookies = parseCookies(c.req.header("Cookie"));
+  const sessionToken = cookies[SESSION_COOKIE];
+
+  if (!sessionToken) return false;
+
+  const session = sessions.get(sessionToken);
+  if (!session) return false;
+
+  // Check if session expired
+  if (Date.now() - session.createdAt > SESSION_TTL_MS) {
+    sessions.delete(sessionToken);
+    return false;
+  }
+
+  return true;
+}
+
+// Top Activity Endpoint - Most active market by tick count
+dashboardApi.get("/markets/top-activity", async (c) => {
+  if (!c.env.CLICKHOUSE_URL) {
+    return c.json({ error: "CLICKHOUSE_URL not configured" }, 503);
+  }
+
+  const headers = {
+    "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
+    "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
+  };
+
+  // Query top market with metadata using proper JSON extraction
+  // Filters for: active markets only (end_date > now) AND activity in last 10 minutes
+  const query = `
+    WITH tokens AS (
+      SELECT
+        question,
+        end_date,
+        arrayJoin(JSONExtractArrayRaw(clob_token_ids)) as token
+      FROM ${DB_CONFIG.DATABASE}.market_metadata
+      WHERE end_date > now()
+    )
+    SELECT
+      t.question,
+      replaceAll(t.token, '"', '') as asset_id,
+      b.condition_id,
+      countMerge(b.tick_count_state) as tick_count
+    FROM tokens t
+    INNER JOIN ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m b ON replaceAll(t.token, '"', '') = b.asset_id
+    WHERE b.minute >= now() - INTERVAL 10 MINUTE
+    GROUP BY t.question, asset_id, b.condition_id
+    ORDER BY tick_count DESC
+    LIMIT 1
+    FORMAT JSON
+  `;
+
+  try {
+    const response = await fetch(
+      `${c.env.CLICKHOUSE_URL}/?query=${encodeURIComponent(query)}`,
+      { headers }
+    );
+
+    if (!response.ok) {
+      const error = await response.text();
+      return c.json({ error: "ClickHouse query failed", details: error }, 500);
+    }
+
+    const result = await response.json() as { data: Array<{ question: string; asset_id: string; condition_id: string; tick_count: number }> };
+
+    if (result.data.length === 0) {
+      return c.json({ data: null, timestamp: new Date().toISOString() });
+    }
+
+    const topMarket = result.data[0];
+
+    return c.json({
+      data: {
+        asset_id: topMarket.asset_id,
+        condition_id: topMarket.condition_id,
+        tick_count: topMarket.tick_count,
+        question: topMarket.question,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    return c.json({ error: "Failed to query top activity", details: String(error) }, 500);
+  }
+});
+
+// OHLC Endpoint - Candlestick data for charting
+dashboardApi.get("/ohlc/:asset_id", async (c) => {
+  const assetId = c.req.param("asset_id");
+  const interval = c.req.query("interval") || "1m";
+  const hours = parseInt(c.req.query("hours") || "24");
+
+  if (!c.env.CLICKHOUSE_URL) {
+    return c.json({ error: "CLICKHOUSE_URL not configured" }, 503);
+  }
+
+  const headers = {
+    "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
+    "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
+  };
+
+  // For 1-minute intervals, use the 1m materialized view
+  // For larger intervals, we'd aggregate from 1m bars
+  // Filter by the hours parameter to only return recent data
+  const query = interval === "1m"
+    ? `
+      SELECT
+        toUnixTimestamp(minute) * 1000 as time,
+        toFloat64((argMinMerge(open_bid_state) + argMinMerge(open_ask_state)) / 2) as open,
+        toFloat64(greatest(maxMerge(high_bid_state), maxMerge(high_ask_state))) as high,
+        toFloat64(least(minMerge(low_bid_state), minMerge(low_ask_state))) as low,
+        toFloat64((argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2) as close,
+        toUInt64(countMerge(tick_count_state)) as volume
+      FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
+      WHERE asset_id = '${assetId}'
+        AND minute >= now() - INTERVAL ${hours} HOUR
+      GROUP BY minute
+      ORDER BY minute ASC
+      FORMAT JSON
+    `
+    : `
+      SELECT
+        toUnixTimestamp(toStartOfFiveMinutes(minute)) * 1000 as time,
+        toFloat64(argMin((argMinMerge(open_bid_state) + argMinMerge(open_ask_state)) / 2, minute)) as open,
+        toFloat64(max(greatest(maxMerge(high_bid_state), maxMerge(high_ask_state)))) as high,
+        toFloat64(min(least(minMerge(low_bid_state), minMerge(low_ask_state)))) as low,
+        toFloat64(argMax((argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2, minute)) as close,
+        toUInt64(sum(countMerge(tick_count_state))) as volume
+      FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
+      WHERE asset_id = '${assetId}'
+        AND minute >= now() - INTERVAL ${hours} HOUR
+      GROUP BY toStartOfFiveMinutes(minute)
+      ORDER BY time ASC
+      FORMAT JSON
+    `;
+
+  try {
+    const response = await fetch(
+      `${c.env.CLICKHOUSE_URL}/?query=${encodeURIComponent(query)}`,
+      { headers }
+    );
+
+    if (!response.ok) {
+      const error = await response.text();
+      return c.json({ error: "ClickHouse query failed", details: error }, 500);
+    }
+
+    const result = await response.json() as {
+      data: Array<{ time: number; open: number; high: number; low: number; close: number; volume: number }>
+    };
+
+    return c.json({
+      data: result.data,
+      asset_id: assetId,
+      interval,
+      hours,
+    });
+  } catch (error) {
+    return c.json({ error: "Failed to query OHLC", details: String(error) }, 500);
+  }
+});
+
+// SSE Endpoint - Stream trigger events
+// Uses cookie-based auth (call POST /auth first to get session cookie)
+dashboardApi.get("/triggers/events/sse", async (c) => {
+  if (!validateSession(c)) {
+    return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
+  }
+
+  // Route to the global TriggerEventBuffer DO
+  const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
+  const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
+
+  return stub.fetch(new Request("https://do/sse", {
+    headers: c.req.raw.headers,
+  }));
+});
+
+// Trigger event buffer status
+dashboardApi.get("/triggers/events/status", async (c) => {
+  if (!validateSession(c)) {
+    return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
+  }
+
+  const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
+  const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
+
+  const response = await stub.fetch(new Request("https://do/status"));
+  return response;
+});
+
+// Mount dashboard API under /api/v1
+app.route("/api/v1", dashboardApi);
+
 // Export Durable Objects
-export { OrderbookManager };
+export { OrderbookManager, TriggerEventBuffer };
 
 async function queueHandler(batch: MessageBatch, env: Env) {
   const queueName = batch.queue;
@@ -1047,32 +1203,17 @@ async function scheduledHandler(
           `[Scheduled] Lifecycle check complete: ${results.resolutions} resolutions, ${results.new_markets} new markets, ${results.metadata_synced} metadata synced`
         );
 
-        // CRITICAL: Unsubscribe resolved markets to prevent false gap events
-        // This fixes the root cause of 1.3M+ daily false gap events
-        for (const event of results.resolutionEvents) {
-          for (const tokenId of event.token_ids) {
-            const shardId = getShardForMarket(event.condition_id);
-            const doId = env.ORDERBOOK_MANAGER.idFromName(shardId);
-            const stub = env.ORDERBOOK_MANAGER.get(doId);
+        // CRITICAL: Clean up resolved markets using coordinated cleanup service
+        // This prevents race conditions with gap-backfill consumer and ensures
+        // proper ordering: unsubscribe FIRST, then delete hash chain
+        if (results.resolutionEvents.length > 0) {
+          const cleanupService = new MarketCleanupService(env, getShardForMarket);
 
+          for (const event of results.resolutionEvents) {
             try {
-              await stub.fetch(new Request("https://do/unsubscribe", {
-                method: "POST",
-                body: JSON.stringify({ token_ids: [tokenId] }),
-              }));
-              console.log(`[Scheduled] Unsubscribed ${tokenId.slice(0, 20)}... from ${shardId}`);
+              await cleanupService.cleanupMarket(event.condition_id, event.token_ids);
             } catch (err) {
-              console.error(`[Scheduled] Failed to unsubscribe ${tokenId}:`, err);
-            }
-          }
-
-          // Clean up hash chain cache for both YES and NO tokens
-          // This prevents stale hash chain state from triggering false gaps
-          for (const tokenId of event.token_ids) {
-            try {
-              await env.HASH_CHAIN_CACHE.delete(`chain:${tokenId}`);
-            } catch (err) {
-              console.error(`[Scheduled] Failed to clean hash chain for ${tokenId}:`, err);
+              console.error(`[Scheduled] Failed to cleanup market ${event.condition_id}:`, err);
             }
           }
         }
