@@ -9,8 +9,8 @@ function getConfig(): Config {
   const isDevelopment = import.meta.env.DEV;
   const isProduction = import.meta.env.PROD;
 
-  // Same origin in production, use proxy in development
-  const apiBase = "";
+  // Use API subdomain in production, same origin (proxy) in development
+  const apiBase = isProduction ? "https://api.indication.xyz" : "";
 
   const dashboardApiKey = import.meta.env.VITE_DASHBOARD_API_KEY;
 

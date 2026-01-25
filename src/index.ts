@@ -884,6 +884,508 @@ app.get("/test/all", async (c) => {
   });
 });
 
+/**
+ * Test endpoint to fire synthetic trigger events for all 17 trigger types.
+ * This allows live demonstration that triggers are flowing to the dashboard.
+ *
+ * Usage:
+ *   GET /test/triggers - Fire all 17 trigger types with synthetic data
+ *   GET /test/triggers?type=VOLATILITY_SPIKE - Fire specific trigger type
+ *   GET /test/triggers?delay=500 - Add 500ms delay between events
+ *
+ * The events will appear in the dashboard TriggerTable via SSE stream.
+ */
+app.get("/test/triggers", async (c) => {
+  const requestedType = c.req.query("type")?.toUpperCase();
+  const delayMs = parseInt(c.req.query("delay") || "100", 10);
+
+  // All 17 trigger types with synthetic data
+  const triggerTemplates = [
+    // Generic Triggers (10)
+    {
+      type: "PRICE_ABOVE",
+      threshold: 0.50,
+      actual_value: 0.55,
+      description: "Best bid crossed above $0.50",
+    },
+    {
+      type: "PRICE_BELOW",
+      threshold: 0.50,
+      actual_value: 0.45,
+      description: "Best bid dropped below $0.50",
+    },
+    {
+      type: "SPREAD_NARROW",
+      threshold: 100,
+      actual_value: 50,
+      description: "Spread narrowed to 50 bps (below 100 bps threshold)",
+    },
+    {
+      type: "SPREAD_WIDE",
+      threshold: 200,
+      actual_value: 350,
+      description: "Spread widened to 350 bps (above 200 bps threshold)",
+    },
+    {
+      type: "IMBALANCE_BID",
+      threshold: 0.4,
+      actual_value: 0.65,
+      description: "Book imbalance 65% bid-heavy",
+    },
+    {
+      type: "IMBALANCE_ASK",
+      threshold: 0.4,
+      actual_value: -0.58,
+      description: "Book imbalance 58% ask-heavy",
+    },
+    {
+      type: "SIZE_SPIKE",
+      threshold: 5000,
+      actual_value: 12000,
+      description: "Large size $12,000 appeared at top of book",
+    },
+    {
+      type: "PRICE_MOVE",
+      threshold: 5,
+      actual_value: 8.5,
+      description: "Price moved 8.5% in 60 seconds",
+    },
+    {
+      type: "CROSSED_BOOK",
+      threshold: 0,
+      actual_value: 0.02,
+      description: "Book crossed: bid $0.52 >= ask $0.50",
+      best_bid: 0.52,
+      best_ask: 0.50,
+    },
+    {
+      type: "EMPTY_BOOK",
+      threshold: 0,
+      actual_value: 0,
+      description: "Both sides of book empty - market halt",
+      bid_size: 0,
+      ask_size: 0,
+    },
+    // HFT Triggers (7)
+    {
+      type: "VOLATILITY_SPIKE",
+      threshold: 2,
+      actual_value: 5.2,
+      description: "Volatility spiked to 5.2% (threshold 2%)",
+      volatility: 5.2,
+    },
+    {
+      type: "MICROPRICE_DIVERGENCE",
+      threshold: 50,
+      actual_value: 120,
+      description: "Microprice diverged 120 bps from mid",
+      microprice: 0.512,
+      microprice_divergence_bps: 120,
+    },
+    {
+      type: "IMBALANCE_SHIFT",
+      threshold: 0.3,
+      actual_value: 0.55,
+      description: "Imbalance shifted 55% in 60 seconds",
+      imbalance_delta: 0.55,
+      previous_imbalance: 0.2,
+      current_imbalance: -0.35,
+    },
+    {
+      type: "MID_PRICE_TREND",
+      threshold: 3,
+      actual_value: 5,
+      description: "5 consecutive price moves UP",
+      consecutive_moves: 5,
+      trend_direction: "UP",
+    },
+    {
+      type: "QUOTE_VELOCITY",
+      threshold: 2,
+      actual_value: 8.5,
+      description: "BBO updating 8.5 times/second",
+      updates_per_second: 8.5,
+    },
+    {
+      type: "STALE_QUOTE",
+      threshold: 30000,
+      actual_value: 45000,
+      description: "No update for 45 seconds (threshold 30s)",
+      stale_ms: 45000,
+    },
+    {
+      type: "LARGE_FILL",
+      threshold: 1000,
+      actual_value: 5500,
+      description: "Whale activity: $5,500 removed from bid side",
+      fill_notional: 5500,
+      fill_side: "BID",
+      size_delta: -12000,
+    },
+    // Prediction Market Triggers (3)
+    {
+      type: "ARBITRAGE_BUY",
+      threshold: 0.99,
+      actual_value: 0.96,
+      description: "Arbitrage: YES ask $0.48 + NO ask $0.48 = $0.96 < $0.99",
+      counterpart_asset_id: "no_token_test",
+      counterpart_best_bid: 0.46,
+      counterpart_best_ask: 0.48,
+      sum_of_asks: 0.96,
+      potential_profit_bps: 400,
+    },
+    {
+      type: "ARBITRAGE_SELL",
+      threshold: 1.01,
+      actual_value: 1.04,
+      description: "Arbitrage: YES bid $0.52 + NO bid $0.52 = $1.04 > $1.01",
+      counterpart_asset_id: "no_token_test",
+      counterpart_best_bid: 0.52,
+      counterpart_best_ask: 0.54,
+      sum_of_bids: 1.04,
+      potential_profit_bps: 400,
+    },
+    {
+      type: "MULTI_OUTCOME_ARBITRAGE",
+      threshold: 0.99,
+      actual_value: 0.92,
+      description: "3-outcome arb: sum of asks $0.92 < $0.99",
+      outcome_ask_sum: 0.92,
+      outcome_count: 3,
+      potential_profit_bps: 800,
+    },
+  ];
+
+  // Filter to specific type if requested
+  const triggersToFire = requestedType
+    ? triggerTemplates.filter((t) => t.type === requestedType)
+    : triggerTemplates;
+
+  if (triggersToFire.length === 0) {
+    return c.json({
+      status: "error",
+      message: `Unknown trigger type: ${requestedType}`,
+      available_types: triggerTemplates.map((t) => t.type),
+    }, 400);
+  }
+
+  // Get TriggerEventBuffer DO
+  const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
+  const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
+
+  const firedEvents: Array<{ type: string; status: string; description: string }> = [];
+  const baseTs = Date.now() * 1000; // Microseconds
+
+  for (let i = 0; i < triggersToFire.length; i++) {
+    const template = triggersToFire[i];
+
+    // Create synthetic trigger event
+    const event = {
+      trigger_id: `test_${template.type.toLowerCase()}_${Date.now()}`,
+      trigger_type: template.type,
+      market_source: "polymarket",
+      asset_id: `test_asset_${template.type.toLowerCase()}`,
+      condition_id: "test_market_condition",
+      fired_at: baseTs + i * 1000,
+      latency_us: Math.floor(Math.random() * 5000) + 1000, // 1-6ms latency
+
+      // Market state
+      best_bid: template.best_bid ?? 0.48,
+      best_ask: template.best_ask ?? 0.52,
+      bid_size: template.bid_size ?? 5000,
+      ask_size: template.ask_size ?? 5000,
+      mid_price: 0.50,
+      spread_bps: 800,
+
+      // Trigger evaluation
+      threshold: template.threshold,
+      actual_value: template.actual_value,
+
+      // Context
+      book_hash: `test_hash_${crypto.randomUUID().slice(0, 8)}`,
+      sequence_number: i + 1,
+      metadata: {
+        test: "true",
+        description: template.description,
+      },
+
+      // Trigger-specific fields
+      ...(template.volatility !== undefined && { volatility: template.volatility }),
+      ...(template.microprice !== undefined && { microprice: template.microprice }),
+      ...(template.microprice_divergence_bps !== undefined && { microprice_divergence_bps: template.microprice_divergence_bps }),
+      ...(template.imbalance_delta !== undefined && { imbalance_delta: template.imbalance_delta }),
+      ...(template.previous_imbalance !== undefined && { previous_imbalance: template.previous_imbalance }),
+      ...(template.current_imbalance !== undefined && { current_imbalance: template.current_imbalance }),
+      ...(template.consecutive_moves !== undefined && { consecutive_moves: template.consecutive_moves }),
+      ...(template.trend_direction !== undefined && { trend_direction: template.trend_direction }),
+      ...(template.updates_per_second !== undefined && { updates_per_second: template.updates_per_second }),
+      ...(template.stale_ms !== undefined && { stale_ms: template.stale_ms }),
+      ...(template.fill_notional !== undefined && { fill_notional: template.fill_notional }),
+      ...(template.fill_side !== undefined && { fill_side: template.fill_side }),
+      ...(template.size_delta !== undefined && { size_delta: template.size_delta }),
+      ...(template.counterpart_asset_id !== undefined && { counterpart_asset_id: template.counterpart_asset_id }),
+      ...(template.counterpart_best_bid !== undefined && { counterpart_best_bid: template.counterpart_best_bid }),
+      ...(template.counterpart_best_ask !== undefined && { counterpart_best_ask: template.counterpart_best_ask }),
+      ...(template.sum_of_asks !== undefined && { sum_of_asks: template.sum_of_asks }),
+      ...(template.sum_of_bids !== undefined && { sum_of_bids: template.sum_of_bids }),
+      ...(template.potential_profit_bps !== undefined && { potential_profit_bps: template.potential_profit_bps }),
+      ...(template.outcome_ask_sum !== undefined && { outcome_ask_sum: template.outcome_ask_sum }),
+      ...(template.outcome_count !== undefined && { outcome_count: template.outcome_count }),
+    };
+
+    try {
+      // Publish to TriggerEventBuffer DO
+      const response = await stub.fetch(new Request("https://do/publish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(event),
+      }));
+
+      const result = await response.json() as { status: string };
+      firedEvents.push({
+        type: template.type,
+        status: result.status,
+        description: template.description,
+      });
+    } catch (error) {
+      firedEvents.push({
+        type: template.type,
+        status: "error",
+        description: String(error),
+      });
+    }
+
+    // Add delay between events if requested
+    if (delayMs > 0 && i < triggersToFire.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  return c.json({
+    status: "success",
+    message: `Fired ${firedEvents.length} test trigger events`,
+    events: firedEvents,
+    instructions: {
+      view_events: "Open the dashboard to see events in the TriggerTable",
+      sse_endpoint: "/api/v1/triggers/events/sse",
+      single_type: "Use ?type=VOLATILITY_SPIKE to fire a specific trigger",
+      with_delay: "Use ?delay=500 to add 500ms delay between events",
+    },
+  });
+});
+
+/**
+ * Register test triggers for all types that don't require specific asset IDs.
+ * Uses wildcard "*" to match all assets.
+ *
+ * This registers 7 trigger types:
+ * - PRICE_ABOVE, PRICE_BELOW, SIZE_SPIKE, PRICE_MOVE
+ * - IMBALANCE_SHIFT, QUOTE_VELOCITY, STALE_QUOTE
+ *
+ * NOT registered (require specific asset IDs):
+ * - ARBITRAGE_BUY, ARBITRAGE_SELL (need counterpart_asset_id)
+ * - MULTI_OUTCOME_ARBITRAGE (need outcome_asset_ids)
+ *
+ * Usage:
+ *   GET /test/triggers/register - Register all 7 test triggers
+ *   GET /test/triggers/register?delete=true - Delete all test triggers first
+ */
+app.get("/test/triggers/register", async (c) => {
+  const shouldDelete = c.req.query("delete") === "true";
+
+  // Test trigger definitions with sensible thresholds for Polymarket
+  // webhook_url is required by the DO but events also stream to SSE
+  const testWebhookUrl = "https://httpbin.org/post"; // Dummy webhook for testing
+
+  const testTriggers = [
+    {
+      id_suffix: "price_above",
+      asset_id: "*", // Wildcard for all assets
+      condition: {
+        type: "PRICE_ABOVE",
+        threshold: 0.90, // Fire when price > $0.90 (near resolution)
+        side: "BID",
+      },
+      webhook_url: testWebhookUrl,
+      cooldown_ms: 5000,
+      metadata: { test: "true", description: "Price above $0.90" },
+    },
+    {
+      id_suffix: "price_below",
+      asset_id: "*",
+      condition: {
+        type: "PRICE_BELOW",
+        threshold: 0.10, // Fire when price < $0.10 (near resolution)
+        side: "BID",
+      },
+      webhook_url: testWebhookUrl,
+      cooldown_ms: 5000,
+      metadata: { test: "true", description: "Price below $0.10" },
+    },
+    {
+      id_suffix: "size_spike_bid",
+      asset_id: "*",
+      condition: {
+        type: "SIZE_SPIKE",
+        threshold: 10000, // Fire when >$10k at top of book
+        side: "BID",
+      },
+      webhook_url: testWebhookUrl,
+      cooldown_ms: 10000,
+      metadata: { test: "true", description: "Large bid size >$10k" },
+    },
+    {
+      id_suffix: "size_spike_ask",
+      asset_id: "*",
+      condition: {
+        type: "SIZE_SPIKE",
+        threshold: 10000,
+        side: "ASK",
+      },
+      webhook_url: testWebhookUrl,
+      cooldown_ms: 10000,
+      metadata: { test: "true", description: "Large ask size >$10k" },
+    },
+    {
+      id_suffix: "price_move",
+      asset_id: "*",
+      condition: {
+        type: "PRICE_MOVE",
+        threshold: 3, // 3% move
+        window_ms: 60000, // Within 60 seconds
+      },
+      webhook_url: testWebhookUrl,
+      cooldown_ms: 30000,
+      metadata: { test: "true", description: "3% price move in 60s" },
+    },
+    {
+      id_suffix: "imbalance_shift",
+      asset_id: "*",
+      condition: {
+        type: "IMBALANCE_SHIFT",
+        threshold: 0.4, // 40% shift in imbalance
+        window_ms: 30000, // Within 30 seconds
+      },
+      webhook_url: testWebhookUrl,
+      cooldown_ms: 15000,
+      metadata: { test: "true", description: "40% imbalance shift in 30s" },
+    },
+    {
+      id_suffix: "quote_velocity",
+      asset_id: "*",
+      condition: {
+        type: "QUOTE_VELOCITY",
+        threshold: 3, // 3 updates per second
+        window_ms: 5000, // 5 second measurement window
+      },
+      webhook_url: testWebhookUrl,
+      cooldown_ms: 30000,
+      metadata: { test: "true", description: "High quote velocity >3/sec" },
+    },
+    {
+      id_suffix: "stale_quote",
+      asset_id: "*",
+      condition: {
+        type: "STALE_QUOTE",
+        threshold: 60000, // 60 seconds without update
+      },
+      webhook_url: testWebhookUrl,
+      cooldown_ms: 120000, // 2 minute cooldown
+      metadata: { test: "true", description: "No update for 60 seconds" },
+    },
+  ];
+
+  const results: Array<{ type: string; status: string; trigger_id?: string; error?: string }> = [];
+
+  // Route to shard-0 for wildcard triggers (they apply to all assets)
+  const doId = c.env.ORDERBOOK_MANAGER.idFromName("shard-0");
+  const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+
+  // If delete flag is set, delete existing test triggers first
+  if (shouldDelete) {
+    try {
+      const listResp = await stub.fetch("http://do/triggers");
+      const listData = await listResp.json() as { triggers: Array<{ id: string; metadata?: Record<string, string> }> };
+
+      for (const trigger of listData.triggers) {
+        if (trigger.metadata?.test === "true") {
+          await stub.fetch("http://do/triggers/delete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ trigger_id: trigger.id }),
+          });
+          results.push({ type: "DELETE", status: "deleted", trigger_id: trigger.id });
+        }
+      }
+    } catch (error) {
+      results.push({ type: "DELETE", status: "error", error: String(error) });
+    }
+  }
+
+  // Register each test trigger
+  for (const triggerDef of testTriggers) {
+    try {
+      const response = await stub.fetch("http://do/triggers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          asset_id: triggerDef.asset_id,
+          condition: triggerDef.condition,
+          webhook_url: triggerDef.webhook_url,
+          cooldown_ms: triggerDef.cooldown_ms,
+          enabled: true,
+          metadata: triggerDef.metadata,
+        }),
+      });
+
+      const data = await response.json() as { trigger_id?: string; status?: string; error?: string };
+
+      if (response.ok) {
+        results.push({
+          type: triggerDef.condition.type,
+          status: "registered",
+          trigger_id: data.trigger_id,
+        });
+      } else {
+        results.push({
+          type: triggerDef.condition.type,
+          status: "error",
+          error: data.error || "Unknown error",
+        });
+      }
+    } catch (error) {
+      results.push({
+        type: triggerDef.condition.type,
+        status: "error",
+        error: String(error),
+      });
+    }
+  }
+
+  const registered = results.filter(r => r.status === "registered").length;
+  const deleted = results.filter(r => r.status === "deleted").length;
+
+  return c.json({
+    status: "success",
+    summary: {
+      registered,
+      deleted,
+      errors: results.filter(r => r.status === "error").length,
+    },
+    results,
+    triggers_not_registered: [
+      "ARBITRAGE_BUY - requires counterpart_asset_id",
+      "ARBITRAGE_SELL - requires counterpart_asset_id",
+      "MULTI_OUTCOME_ARBITRAGE - requires outcome_asset_ids",
+    ],
+    next_steps: {
+      view_triggers: "GET /triggers to see all registered triggers",
+      fire_synthetic: "GET /test/triggers to fire synthetic events for all 20 types",
+      delete_test_triggers: "GET /test/triggers/register?delete=true to clean up",
+    },
+  });
+});
+
 // ============================================================
 // Dashboard API Endpoints (Public - CORS enabled)
 // ============================================================
