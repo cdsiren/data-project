@@ -146,7 +146,7 @@ export async function authenticate(): Promise<boolean> {
  * Get SSE endpoint URL for trigger events
  */
 export function getTriggerSSEUrl(): string {
-  return "/api/v1/triggers/events/sse";
+  return `${API_BASE}/api/v1/triggers/events/sse`;
 }
 
 /**

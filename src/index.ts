@@ -1496,9 +1496,8 @@ dashboardApi.post("/auth", async (c) => {
   // Generate signed session token (stateless - no storage needed)
   const sessionToken = await generateSessionToken(apiKey);
 
-  // Set httpOnly cookie
-  const isSecure = c.req.url.startsWith("https");
-  const cookie = `${SESSION_COOKIE}=${sessionToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400${isSecure ? "; Secure" : ""}`;
+  // Set httpOnly cookie with SameSite=None for cross-origin SSE
+  const cookie = `${SESSION_COOKIE}=${sessionToken}; HttpOnly; SameSite=None; Secure; Path=/; Max-Age=86400`;
 
   return c.json(
     { success: true, message: "Authenticated" },
