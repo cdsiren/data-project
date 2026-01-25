@@ -56,9 +56,9 @@ export function TriggerTable({
 
   // Memoize rows to prevent re-renders of unchanged events
   const eventRows = useMemo(() => {
-    return events.map((event) => {
-      // Use stable key from immutable event properties
-      const key = `${event.trigger_id}-${event.fired_at}-${event.sequence_number}`;
+    return events.map((event, index) => {
+      // Use index + event properties for unique key (index is stable since we prepend)
+      const key = `${index}-${event.trigger_id}-${event.asset_id}-${event.fired_at}`;
 
       return (
         <TableRow key={key}>
