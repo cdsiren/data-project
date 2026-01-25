@@ -48,6 +48,94 @@ function getShardForMarket(conditionId: string): string {
   return `shard-${Math.abs(hash) % SHARD_COUNT}`;
 }
 
+// ============================================================
+// Shard Utilities
+// ============================================================
+
+interface ShardResult<T> {
+  shard: string;
+  index: number;
+  result?: T;
+  error?: string;
+}
+
+/**
+ * Execute an operation across all shards in parallel.
+ * Provides consistent error handling and result aggregation.
+ */
+async function forEachShard<T>(
+  env: Env,
+  operation: (stub: DurableObjectStub, shardId: string, index: number) => Promise<T>,
+  options?: { continueOnError?: boolean }
+): Promise<ShardResult<T>[]> {
+  return Promise.all(
+    Array.from({ length: SHARD_COUNT }, async (_, i) => {
+      const shardId = `shard-${i}`;
+      const doId = env.ORDERBOOK_MANAGER.idFromName(shardId);
+      const stub = env.ORDERBOOK_MANAGER.get(doId);
+
+      try {
+        const result = await operation(stub, shardId, i);
+        return { shard: shardId, index: i, result };
+      } catch (error) {
+        if (!options?.continueOnError) throw error;
+        return { shard: shardId, index: i, error: String(error) };
+      }
+    })
+  );
+}
+
+// ============================================================
+// Market Subscription Utilities
+// ============================================================
+
+interface NewMarketEvent {
+  condition_id: string;
+  token_ids: string[];
+  tick_size?: number;
+  neg_risk: boolean;
+  min_size?: number;
+}
+
+/**
+ * Subscribe new markets to appropriate OrderbookManager shards.
+ * Used by both manual lifecycle checks and scheduled cron jobs.
+ */
+async function subscribeNewMarkets(
+  env: Env,
+  events: NewMarketEvent[]
+): Promise<{ subscribed: number; errors: string[] }> {
+  let subscribed = 0;
+  const errors: string[] = [];
+
+  for (const event of events) {
+    try {
+      const shardId = getShardForMarket(event.condition_id);
+      const doId = env.ORDERBOOK_MANAGER.idFromName(shardId);
+      const stub = env.ORDERBOOK_MANAGER.get(doId);
+
+      await stub.fetch("http://do/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          condition_id: event.condition_id,
+          token_ids: event.token_ids,
+          tick_size: event.tick_size,
+          neg_risk: event.neg_risk,
+          order_min_size: event.min_size,
+          market_source: "polymarket",
+        }),
+      });
+
+      subscribed++;
+    } catch (err) {
+      errors.push(`${event.condition_id}: ${String(err)}`);
+    }
+  }
+
+  return { subscribed, errors };
+}
+
 /**
  * Load lifecycle webhooks from KV storage (parallel)
  */
@@ -95,20 +183,16 @@ app.get("/health", (c) => {
 
 // List all triggers across all shards
 app.get("/triggers", authMiddleware, async (c) => {
-  const results = await Promise.all(
-    Array.from({ length: SHARD_COUNT }, async (_, i) => {
-      const doId = c.env.ORDERBOOK_MANAGER.idFromName(`shard-${i}`);
-      const stub = c.env.ORDERBOOK_MANAGER.get(doId);
-      try {
-        const resp = await stub.fetch("http://do/triggers");
-        return resp.json() as Promise<{ triggers: unknown[]; total: number }>;
-      } catch {
-        return { triggers: [], total: 0 };
-      }
-    })
+  const shardResults = await forEachShard(
+    c.env,
+    async (stub) => {
+      const resp = await stub.fetch("http://do/triggers");
+      return resp.json() as Promise<{ triggers: unknown[]; total: number }>;
+    },
+    { continueOnError: true }
   );
 
-  const allTriggers = results.flatMap((r) => r.triggers);
+  const allTriggers = shardResults.flatMap((r) => r.result?.triggers ?? []);
   return c.json({
     triggers: allTriggers,
     total: allTriggers.length,
@@ -217,38 +301,30 @@ app.delete("/triggers", authMiddleware, async (c) => {
 
 // Get status of all shards - health check and asset distribution
 app.get("/shards/status", authMiddleware, async (c) => {
-  const statuses = await Promise.all(
-    Array.from({ length: SHARD_COUNT }, async (_, i) => {
-      const shardName = `shard-${i}`;
-      const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardName);
-      const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+  interface ShardStatus {
+    total_assets: number;
+    connections: Array<{ connected: boolean; asset_count: number }>;
+  }
 
-      try {
-        const resp = await stub.fetch("http://do/status");
-        const data = (await resp.json()) as {
-          total_assets: number;
-          connections: Array<{ connected: boolean; asset_count: number }>;
-        };
-        return {
-          shard: i,
-          name: shardName,
-          ...data,
-          healthy: data.connections?.some((conn) => conn.connected) ?? false,
-        };
-      } catch (error) {
-        return {
-          shard: i,
-          name: shardName,
-          total_assets: 0,
-          connections: [],
-          healthy: false,
-          error: String(error),
-        };
-      }
-    })
+  const shardResults = await forEachShard<ShardStatus>(
+    c.env,
+    async (stub) => {
+      const resp = await stub.fetch("http://do/status");
+      return resp.json() as Promise<ShardStatus>;
+    },
+    { continueOnError: true }
   );
 
-  const totalAssets = statuses.reduce((sum, s) => sum + (s.total_assets || 0), 0);
+  const statuses = shardResults.map((r) => ({
+    shard: r.index,
+    name: r.shard,
+    total_assets: r.result?.total_assets ?? 0,
+    connections: r.result?.connections ?? [],
+    healthy: r.result?.connections?.some((conn) => conn.connected) ?? false,
+    ...(r.error && { error: r.error }),
+  }));
+
+  const totalAssets = statuses.reduce((sum, s) => sum + s.total_assets, 0);
   const healthyShards = statuses.filter((s) => s.healthy).length;
 
   return c.json({
@@ -301,7 +377,16 @@ app.post("/lifecycle/check", authMiddleware, async (c) => {
   }
 
   const results = await lifecycle.runCheck();
-  return c.json({ status: "ok", ...results });
+
+  // Subscribe new markets to OrderbookManager DOs
+  const subscription = await subscribeNewMarkets(c.env, results.newMarketEvents);
+
+  return c.json({
+    status: "ok",
+    ...results,
+    subscribed: subscription.subscribed,
+    subscription_errors: subscription.errors.length > 0 ? subscription.errors : undefined,
+  });
 });
 
 // ============================================================
@@ -857,6 +942,443 @@ app.post("/admin/migrate", authMiddleware, async (c) => {
   return c.json({ status: allOk ? "migrated" : "partial", results });
 });
 
+// ============================================================
+// Bootstrap & Health Check Endpoints
+// ============================================================
+
+/**
+ * One-time endpoint to backfill all active markets for orderbook monitoring.
+ * The cron job only catches NEW markets going forward; this endpoint bootstraps
+ * the system with all existing active markets.
+ *
+ * Usage:
+ *   POST /admin/bootstrap-markets - Subscribe all active markets to shards
+ *   POST /admin/bootstrap-markets?limit=100 - Limit number of markets to bootstrap
+ */
+app.post("/admin/bootstrap-markets", authMiddleware, async (c) => {
+  const limit = parseInt(c.req.query("limit") || "1000", 10);
+
+  try {
+    // Fetch all active markets from Gamma API
+    const response = await fetch(
+      `${c.env.GAMMA_API_URL}/markets?active=true&closed=false&enableOrderBook=true&limit=${limit}`,
+      { headers: { Accept: "application/json" } }
+    );
+
+    if (!response.ok) {
+      return c.json({ error: "Gamma API error", status: response.status }, 500);
+    }
+
+    interface GammaMarketBootstrap {
+      conditionId: string;
+      clobTokenIds: string;
+      orderPriceMinTickSize: number;
+      negRisk: boolean;
+      orderMinSize: number;
+      question: string;
+    }
+
+    const markets = (await response.json()) as GammaMarketBootstrap[];
+
+    const results: Array<{
+      condition_id: string;
+      shard: string;
+      tokens: number;
+      status: string;
+      error?: string;
+    }> = [];
+
+    let subscribed = 0;
+    let failed = 0;
+
+    // Subscribe each market to its appropriate shard
+    for (const market of markets) {
+      let tokenIds: string[] = [];
+      try {
+        tokenIds = JSON.parse(market.clobTokenIds);
+      } catch {
+        tokenIds = [market.clobTokenIds];
+      }
+
+      const shardId = getShardForMarket(market.conditionId);
+      const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardId);
+      const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+
+      try {
+        await stub.fetch("http://do/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            condition_id: market.conditionId,
+            token_ids: tokenIds,
+            tick_size: market.orderPriceMinTickSize,
+            neg_risk: market.negRisk,
+            order_min_size: market.orderMinSize,
+            market_source: "polymarket",
+          }),
+        });
+
+        results.push({
+          condition_id: market.conditionId,
+          shard: shardId,
+          tokens: tokenIds.length,
+          status: "subscribed",
+        });
+        subscribed++;
+      } catch (err) {
+        results.push({
+          condition_id: market.conditionId,
+          shard: shardId,
+          tokens: tokenIds.length,
+          status: "failed",
+          error: String(err),
+        });
+        failed++;
+      }
+    }
+
+    return c.json({
+      status: "complete",
+      summary: {
+        total_markets: markets.length,
+        subscribed,
+        failed,
+        shards_used: new Set(results.map((r) => r.shard)).size,
+      },
+      results,
+    });
+  } catch (error) {
+    return c.json({ error: "Bootstrap failed", details: String(error) }, 500);
+  }
+});
+
+/**
+ * Health check endpoint to verify markets are being monitored.
+ * Queries all 25 shards for their subscription counts.
+ *
+ * Usage:
+ *   GET /health/subscriptions - Get subscription status across all shards
+ */
+app.get("/health/subscriptions", authMiddleware, async (c) => {
+  interface ShardStatus {
+    total_assets: number;
+    connections: Array<{ connected: boolean; asset_count: number }>;
+  }
+
+  const shardResults = await forEachShard<ShardStatus>(
+    c.env,
+    async (stub) => {
+      const resp = await stub.fetch("http://do/status");
+      return resp.json() as Promise<ShardStatus>;
+    },
+    { continueOnError: true }
+  );
+
+  const shardStatuses = shardResults.map((r) => {
+    const activeConns = r.result?.connections?.filter((c) => c.connected).length ?? 0;
+    const totalAssets = r.result?.total_assets ?? 0;
+    return {
+      shard: r.shard,
+      total_assets: totalAssets,
+      active_connections: activeConns,
+      healthy: activeConns > 0 || totalAssets === 0,
+      ...(r.error && { error: r.error }),
+    };
+  });
+
+  const totalSubscriptions = shardStatuses.reduce((sum, s) => sum + s.total_assets, 0);
+  const healthyShards = shardStatuses.filter((s) => s.healthy).length;
+  const activeConnections = shardStatuses.reduce((sum, s) => sum + s.active_connections, 0);
+
+  // Determine overall health status
+  let status: "healthy" | "degraded" | "unhealthy";
+  if (totalSubscriptions === 0) {
+    status = "unhealthy";
+  } else if (healthyShards < SHARD_COUNT) {
+    status = "degraded";
+  } else {
+    status = "healthy";
+  }
+
+  return c.json({
+    status,
+    timestamp: new Date().toISOString(),
+    summary: {
+      total_subscriptions: totalSubscriptions,
+      total_shards: SHARD_COUNT,
+      healthy_shards: healthyShards,
+      active_connections: activeConnections,
+    },
+    shards: shardStatuses,
+    recommendations:
+      totalSubscriptions === 0
+        ? ["No markets subscribed. Run POST /admin/bootstrap-markets to subscribe existing markets."]
+        : [],
+  });
+});
+
+/**
+ * Admin endpoint to delete all test triggers and clear event buffer.
+ * Use this to clean up after testing and prepare for production.
+ */
+app.post("/admin/cleanup-test-data", authMiddleware, async (c) => {
+  const results: Array<{ action: string; status: string; details?: string }> = [];
+
+  // Delete all test triggers from all shards
+  interface TriggerList {
+    triggers: Array<{ id: string; metadata?: Record<string, string> }>;
+  }
+
+  const shardResults = await forEachShard<number>(
+    c.env,
+    async (stub) => {
+      const listResp = await stub.fetch("http://do/triggers");
+      const listData = await listResp.json() as TriggerList;
+      let deleted = 0;
+
+      for (const trigger of listData.triggers) {
+        if (trigger.metadata?.test === "true") {
+          await stub.fetch("http://do/triggers/delete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ trigger_id: trigger.id }),
+          });
+          deleted++;
+        }
+      }
+      return deleted;
+    },
+    { continueOnError: true }
+  );
+
+  const deletedTriggers = shardResults.reduce((sum, r) => sum + (r.result ?? 0), 0);
+  const shardErrors = shardResults.filter((r) => r.error);
+
+  for (const err of shardErrors) {
+    results.push({ action: `delete_triggers_${err.shard}`, status: "error", details: err.error });
+  }
+
+  results.push({ action: "delete_test_triggers", status: "success", details: `${deletedTriggers} triggers deleted` });
+
+  // Clear event buffer by requesting it to clear
+  try {
+    const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
+    const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
+    await stub.fetch("http://do/clear", { method: "POST" });
+    results.push({ action: "clear_event_buffer", status: "success" });
+  } catch (error) {
+    results.push({ action: "clear_event_buffer", status: "error", details: String(error) });
+  }
+
+  return c.json({
+    status: "complete",
+    results,
+  });
+});
+
+/**
+ * Production trigger definitions - wildcard triggers that fire on all markets.
+ * These don't require specific asset IDs and will generate real-time events.
+ */
+const PRODUCTION_TRIGGERS = [
+  // Price threshold triggers - fire when markets approach resolution
+  {
+    id_prefix: "prod_price_above",
+    asset_id: "*",
+    condition: { type: "PRICE_ABOVE", threshold: 0.90, side: "BID" },
+    cooldown_ms: 10000,
+    description: "Price above $0.90",
+  },
+  {
+    id_prefix: "prod_price_below",
+    asset_id: "*",
+    condition: { type: "PRICE_BELOW", threshold: 0.10, side: "BID" },
+    cooldown_ms: 10000,
+    description: "Price below $0.10",
+  },
+  // Spread triggers - common in prediction markets
+  {
+    id_prefix: "prod_spread_wide",
+    asset_id: "*",
+    condition: { type: "SPREAD_WIDE", threshold: 300 },
+    cooldown_ms: 30000,
+    description: "Spread wider than 300 bps",
+  },
+  {
+    id_prefix: "prod_spread_narrow",
+    asset_id: "*",
+    condition: { type: "SPREAD_NARROW", threshold: 50 },
+    cooldown_ms: 15000,
+    description: "Spread narrower than 50 bps",
+  },
+  // Imbalance triggers - detect order flow
+  {
+    id_prefix: "prod_imbalance_bid",
+    asset_id: "*",
+    condition: { type: "IMBALANCE_BID", threshold: 0.6 },
+    cooldown_ms: 15000,
+    description: "Book imbalance >60% bid-heavy",
+  },
+  {
+    id_prefix: "prod_imbalance_ask",
+    asset_id: "*",
+    condition: { type: "IMBALANCE_ASK", threshold: 0.6 },
+    cooldown_ms: 15000,
+    description: "Book imbalance >60% ask-heavy",
+  },
+  {
+    id_prefix: "prod_imbalance_shift",
+    asset_id: "*",
+    condition: { type: "IMBALANCE_SHIFT", threshold: 0.4, window_ms: 30000 },
+    cooldown_ms: 20000,
+    description: "Imbalance shifted >40% in 30s",
+  },
+  // Size triggers - whale detection
+  {
+    id_prefix: "prod_size_spike_bid",
+    asset_id: "*",
+    condition: { type: "SIZE_SPIKE", threshold: 10000, side: "BID" },
+    cooldown_ms: 20000,
+    description: "Large bid size >$10k",
+  },
+  {
+    id_prefix: "prod_size_spike_ask",
+    asset_id: "*",
+    condition: { type: "SIZE_SPIKE", threshold: 10000, side: "ASK" },
+    cooldown_ms: 20000,
+    description: "Large ask size >$10k",
+  },
+  {
+    id_prefix: "prod_large_fill",
+    asset_id: "*",
+    condition: { type: "LARGE_FILL", threshold: 1000 },
+    cooldown_ms: 15000,
+    description: "Large fill >$1k detected",
+  },
+  // Price movement triggers
+  {
+    id_prefix: "prod_price_move",
+    asset_id: "*",
+    condition: { type: "PRICE_MOVE", threshold: 3, window_ms: 60000 },
+    cooldown_ms: 30000,
+    description: "Price moved >3% in 60s",
+  },
+  {
+    id_prefix: "prod_mid_price_trend",
+    asset_id: "*",
+    condition: { type: "MID_PRICE_TREND", threshold: 3 },
+    cooldown_ms: 30000,
+    description: "3+ consecutive price moves",
+  },
+  // HFT/Market quality triggers
+  {
+    id_prefix: "prod_microprice_divergence",
+    asset_id: "*",
+    condition: { type: "MICROPRICE_DIVERGENCE", threshold: 50 },
+    cooldown_ms: 20000,
+    description: "Microprice diverged >50 bps from mid",
+  },
+  {
+    id_prefix: "prod_quote_velocity",
+    asset_id: "*",
+    condition: { type: "QUOTE_VELOCITY", threshold: 3, window_ms: 5000 },
+    cooldown_ms: 30000,
+    description: "Quote velocity >3 updates/sec",
+  },
+  {
+    id_prefix: "prod_stale_quote",
+    asset_id: "*",
+    condition: { type: "STALE_QUOTE", threshold: 60000 },
+    cooldown_ms: 120000,
+    description: "No update for 1 minute",
+  },
+];
+
+/**
+ * Delete all triggers from all shards. Use before re-initializing.
+ */
+app.post("/admin/delete-all-triggers", authMiddleware, async (c) => {
+  const shardResults = await forEachShard<number>(
+    c.env,
+    async (stub) => {
+      const listResp = await stub.fetch("http://do/triggers");
+      const listData = (await listResp.json()) as { triggers: Array<{ id: string }> };
+      let deleted = 0;
+
+      for (const trigger of listData.triggers) {
+        await stub.fetch("http://do/triggers/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ trigger_id: trigger.id }),
+        });
+        deleted++;
+      }
+      return deleted;
+    },
+    { continueOnError: true }
+  );
+
+  const deletedCount = shardResults.reduce((sum, r) => sum + (r.result ?? 0), 0);
+  const errors = shardResults.filter((r) => r.error).length;
+
+  return c.json({ status: "complete", deleted: deletedCount, shard_errors: errors });
+});
+
+/**
+ * Initialize production triggers on all shards.
+ * Call this after deployment to set up real-time trigger events.
+ * Idempotent - won't create duplicates if triggers already exist.
+ */
+app.post("/admin/init-triggers", authMiddleware, async (c) => {
+  const results: Array<{ trigger: string; status: string; shards?: number; error?: string }> = [];
+
+  for (const triggerDef of PRODUCTION_TRIGGERS) {
+    // Register on all shards in parallel (wildcard triggers need to be everywhere)
+    const shardResults = await Promise.all(
+      Array.from({ length: SHARD_COUNT }, async (_, i) => {
+        const doId = c.env.ORDERBOOK_MANAGER.idFromName(`shard-${i}`);
+        const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+        try {
+          const response = await stub.fetch("http://do/triggers", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              asset_id: triggerDef.asset_id,
+              condition: triggerDef.condition,
+              webhook_url: "https://noop.webhook", // Required field, but events stream via SSE
+              cooldown_ms: triggerDef.cooldown_ms,
+              enabled: true,
+              metadata: { production: "true", description: triggerDef.description },
+            }),
+          });
+          return { ok: response.ok };
+        } catch {
+          return { ok: false };
+        }
+      })
+    );
+
+    const successCount = shardResults.filter((r) => r.ok).length;
+    results.push({
+      trigger: triggerDef.id_prefix,
+      status: successCount > 0 ? "registered" : "failed",
+      shards: successCount,
+    });
+  }
+
+  const totalRegistered = results.filter((r) => r.status === "registered").length;
+
+  return c.json({
+    status: "complete",
+    summary: {
+      triggers_registered: totalRegistered,
+      total_triggers: PRODUCTION_TRIGGERS.length,
+      shards: SHARD_COUNT,
+    },
+    results,
+  });
+});
+
 app.get("/test/all", async (c) => {
   const results = {
     timestamp: new Date().toISOString(),
@@ -881,508 +1403,6 @@ app.get("/test/all", async (c) => {
   return c.json({
     status: allPassed ? "all_pass" : "some_failed",
     ...results,
-  });
-});
-
-/**
- * Test endpoint to fire synthetic trigger events for all 17 trigger types.
- * This allows live demonstration that triggers are flowing to the dashboard.
- *
- * Usage:
- *   GET /test/triggers - Fire all 17 trigger types with synthetic data
- *   GET /test/triggers?type=VOLATILITY_SPIKE - Fire specific trigger type
- *   GET /test/triggers?delay=500 - Add 500ms delay between events
- *
- * The events will appear in the dashboard TriggerTable via SSE stream.
- */
-app.get("/test/triggers", async (c) => {
-  const requestedType = c.req.query("type")?.toUpperCase();
-  const delayMs = parseInt(c.req.query("delay") || "100", 10);
-
-  // All 17 trigger types with synthetic data
-  const triggerTemplates = [
-    // Generic Triggers (10)
-    {
-      type: "PRICE_ABOVE",
-      threshold: 0.50,
-      actual_value: 0.55,
-      description: "Best bid crossed above $0.50",
-    },
-    {
-      type: "PRICE_BELOW",
-      threshold: 0.50,
-      actual_value: 0.45,
-      description: "Best bid dropped below $0.50",
-    },
-    {
-      type: "SPREAD_NARROW",
-      threshold: 100,
-      actual_value: 50,
-      description: "Spread narrowed to 50 bps (below 100 bps threshold)",
-    },
-    {
-      type: "SPREAD_WIDE",
-      threshold: 200,
-      actual_value: 350,
-      description: "Spread widened to 350 bps (above 200 bps threshold)",
-    },
-    {
-      type: "IMBALANCE_BID",
-      threshold: 0.4,
-      actual_value: 0.65,
-      description: "Book imbalance 65% bid-heavy",
-    },
-    {
-      type: "IMBALANCE_ASK",
-      threshold: 0.4,
-      actual_value: -0.58,
-      description: "Book imbalance 58% ask-heavy",
-    },
-    {
-      type: "SIZE_SPIKE",
-      threshold: 5000,
-      actual_value: 12000,
-      description: "Large size $12,000 appeared at top of book",
-    },
-    {
-      type: "PRICE_MOVE",
-      threshold: 5,
-      actual_value: 8.5,
-      description: "Price moved 8.5% in 60 seconds",
-    },
-    {
-      type: "CROSSED_BOOK",
-      threshold: 0,
-      actual_value: 0.02,
-      description: "Book crossed: bid $0.52 >= ask $0.50",
-      best_bid: 0.52,
-      best_ask: 0.50,
-    },
-    {
-      type: "EMPTY_BOOK",
-      threshold: 0,
-      actual_value: 0,
-      description: "Both sides of book empty - market halt",
-      bid_size: 0,
-      ask_size: 0,
-    },
-    // HFT Triggers (7)
-    {
-      type: "VOLATILITY_SPIKE",
-      threshold: 2,
-      actual_value: 5.2,
-      description: "Volatility spiked to 5.2% (threshold 2%)",
-      volatility: 5.2,
-    },
-    {
-      type: "MICROPRICE_DIVERGENCE",
-      threshold: 50,
-      actual_value: 120,
-      description: "Microprice diverged 120 bps from mid",
-      microprice: 0.512,
-      microprice_divergence_bps: 120,
-    },
-    {
-      type: "IMBALANCE_SHIFT",
-      threshold: 0.3,
-      actual_value: 0.55,
-      description: "Imbalance shifted 55% in 60 seconds",
-      imbalance_delta: 0.55,
-      previous_imbalance: 0.2,
-      current_imbalance: -0.35,
-    },
-    {
-      type: "MID_PRICE_TREND",
-      threshold: 3,
-      actual_value: 5,
-      description: "5 consecutive price moves UP",
-      consecutive_moves: 5,
-      trend_direction: "UP",
-    },
-    {
-      type: "QUOTE_VELOCITY",
-      threshold: 2,
-      actual_value: 8.5,
-      description: "BBO updating 8.5 times/second",
-      updates_per_second: 8.5,
-    },
-    {
-      type: "STALE_QUOTE",
-      threshold: 30000,
-      actual_value: 45000,
-      description: "No update for 45 seconds (threshold 30s)",
-      stale_ms: 45000,
-    },
-    {
-      type: "LARGE_FILL",
-      threshold: 1000,
-      actual_value: 5500,
-      description: "Whale activity: $5,500 removed from bid side",
-      fill_notional: 5500,
-      fill_side: "BID",
-      size_delta: -12000,
-    },
-    // Prediction Market Triggers (3)
-    {
-      type: "ARBITRAGE_BUY",
-      threshold: 0.99,
-      actual_value: 0.96,
-      description: "Arbitrage: YES ask $0.48 + NO ask $0.48 = $0.96 < $0.99",
-      counterpart_asset_id: "no_token_test",
-      counterpart_best_bid: 0.46,
-      counterpart_best_ask: 0.48,
-      sum_of_asks: 0.96,
-      potential_profit_bps: 400,
-    },
-    {
-      type: "ARBITRAGE_SELL",
-      threshold: 1.01,
-      actual_value: 1.04,
-      description: "Arbitrage: YES bid $0.52 + NO bid $0.52 = $1.04 > $1.01",
-      counterpart_asset_id: "no_token_test",
-      counterpart_best_bid: 0.52,
-      counterpart_best_ask: 0.54,
-      sum_of_bids: 1.04,
-      potential_profit_bps: 400,
-    },
-    {
-      type: "MULTI_OUTCOME_ARBITRAGE",
-      threshold: 0.99,
-      actual_value: 0.92,
-      description: "3-outcome arb: sum of asks $0.92 < $0.99",
-      outcome_ask_sum: 0.92,
-      outcome_count: 3,
-      potential_profit_bps: 800,
-    },
-  ];
-
-  // Filter to specific type if requested
-  const triggersToFire = requestedType
-    ? triggerTemplates.filter((t) => t.type === requestedType)
-    : triggerTemplates;
-
-  if (triggersToFire.length === 0) {
-    return c.json({
-      status: "error",
-      message: `Unknown trigger type: ${requestedType}`,
-      available_types: triggerTemplates.map((t) => t.type),
-    }, 400);
-  }
-
-  // Get TriggerEventBuffer DO
-  const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
-  const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
-
-  const firedEvents: Array<{ type: string; status: string; description: string }> = [];
-  const baseTs = Date.now() * 1000; // Microseconds
-
-  for (let i = 0; i < triggersToFire.length; i++) {
-    const template = triggersToFire[i];
-
-    // Create synthetic trigger event
-    const event = {
-      trigger_id: `test_${template.type.toLowerCase()}_${Date.now()}`,
-      trigger_type: template.type,
-      market_source: "polymarket",
-      asset_id: `test_asset_${template.type.toLowerCase()}`,
-      condition_id: "test_market_condition",
-      fired_at: baseTs + i * 1000,
-      latency_us: Math.floor(Math.random() * 5000) + 1000, // 1-6ms latency
-
-      // Market state
-      best_bid: template.best_bid ?? 0.48,
-      best_ask: template.best_ask ?? 0.52,
-      bid_size: template.bid_size ?? 5000,
-      ask_size: template.ask_size ?? 5000,
-      mid_price: 0.50,
-      spread_bps: 800,
-
-      // Trigger evaluation
-      threshold: template.threshold,
-      actual_value: template.actual_value,
-
-      // Context
-      book_hash: `test_hash_${crypto.randomUUID().slice(0, 8)}`,
-      sequence_number: i + 1,
-      metadata: {
-        test: "true",
-        description: template.description,
-      },
-
-      // Trigger-specific fields
-      ...(template.volatility !== undefined && { volatility: template.volatility }),
-      ...(template.microprice !== undefined && { microprice: template.microprice }),
-      ...(template.microprice_divergence_bps !== undefined && { microprice_divergence_bps: template.microprice_divergence_bps }),
-      ...(template.imbalance_delta !== undefined && { imbalance_delta: template.imbalance_delta }),
-      ...(template.previous_imbalance !== undefined && { previous_imbalance: template.previous_imbalance }),
-      ...(template.current_imbalance !== undefined && { current_imbalance: template.current_imbalance }),
-      ...(template.consecutive_moves !== undefined && { consecutive_moves: template.consecutive_moves }),
-      ...(template.trend_direction !== undefined && { trend_direction: template.trend_direction }),
-      ...(template.updates_per_second !== undefined && { updates_per_second: template.updates_per_second }),
-      ...(template.stale_ms !== undefined && { stale_ms: template.stale_ms }),
-      ...(template.fill_notional !== undefined && { fill_notional: template.fill_notional }),
-      ...(template.fill_side !== undefined && { fill_side: template.fill_side }),
-      ...(template.size_delta !== undefined && { size_delta: template.size_delta }),
-      ...(template.counterpart_asset_id !== undefined && { counterpart_asset_id: template.counterpart_asset_id }),
-      ...(template.counterpart_best_bid !== undefined && { counterpart_best_bid: template.counterpart_best_bid }),
-      ...(template.counterpart_best_ask !== undefined && { counterpart_best_ask: template.counterpart_best_ask }),
-      ...(template.sum_of_asks !== undefined && { sum_of_asks: template.sum_of_asks }),
-      ...(template.sum_of_bids !== undefined && { sum_of_bids: template.sum_of_bids }),
-      ...(template.potential_profit_bps !== undefined && { potential_profit_bps: template.potential_profit_bps }),
-      ...(template.outcome_ask_sum !== undefined && { outcome_ask_sum: template.outcome_ask_sum }),
-      ...(template.outcome_count !== undefined && { outcome_count: template.outcome_count }),
-    };
-
-    try {
-      // Publish to TriggerEventBuffer DO
-      const response = await stub.fetch(new Request("https://do/publish", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(event),
-      }));
-
-      const result = await response.json() as { status: string };
-      firedEvents.push({
-        type: template.type,
-        status: result.status,
-        description: template.description,
-      });
-    } catch (error) {
-      firedEvents.push({
-        type: template.type,
-        status: "error",
-        description: String(error),
-      });
-    }
-
-    // Add delay between events if requested
-    if (delayMs > 0 && i < triggersToFire.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-
-  return c.json({
-    status: "success",
-    message: `Fired ${firedEvents.length} test trigger events`,
-    events: firedEvents,
-    instructions: {
-      view_events: "Open the dashboard to see events in the TriggerTable",
-      sse_endpoint: "/api/v1/triggers/events/sse",
-      single_type: "Use ?type=VOLATILITY_SPIKE to fire a specific trigger",
-      with_delay: "Use ?delay=500 to add 500ms delay between events",
-    },
-  });
-});
-
-/**
- * Register test triggers for all types that don't require specific asset IDs.
- * Uses wildcard "*" to match all assets.
- *
- * This registers 7 trigger types:
- * - PRICE_ABOVE, PRICE_BELOW, SIZE_SPIKE, PRICE_MOVE
- * - IMBALANCE_SHIFT, QUOTE_VELOCITY, STALE_QUOTE
- *
- * NOT registered (require specific asset IDs):
- * - ARBITRAGE_BUY, ARBITRAGE_SELL (need counterpart_asset_id)
- * - MULTI_OUTCOME_ARBITRAGE (need outcome_asset_ids)
- *
- * Usage:
- *   GET /test/triggers/register - Register all 7 test triggers
- *   GET /test/triggers/register?delete=true - Delete all test triggers first
- */
-app.get("/test/triggers/register", async (c) => {
-  const shouldDelete = c.req.query("delete") === "true";
-
-  // Test trigger definitions with sensible thresholds for Polymarket
-  // webhook_url is required by the DO but events also stream to SSE
-  const testWebhookUrl = "https://httpbin.org/post"; // Dummy webhook for testing
-
-  const testTriggers = [
-    {
-      id_suffix: "price_above",
-      asset_id: "*", // Wildcard for all assets
-      condition: {
-        type: "PRICE_ABOVE",
-        threshold: 0.90, // Fire when price > $0.90 (near resolution)
-        side: "BID",
-      },
-      webhook_url: testWebhookUrl,
-      cooldown_ms: 5000,
-      metadata: { test: "true", description: "Price above $0.90" },
-    },
-    {
-      id_suffix: "price_below",
-      asset_id: "*",
-      condition: {
-        type: "PRICE_BELOW",
-        threshold: 0.10, // Fire when price < $0.10 (near resolution)
-        side: "BID",
-      },
-      webhook_url: testWebhookUrl,
-      cooldown_ms: 5000,
-      metadata: { test: "true", description: "Price below $0.10" },
-    },
-    {
-      id_suffix: "size_spike_bid",
-      asset_id: "*",
-      condition: {
-        type: "SIZE_SPIKE",
-        threshold: 10000, // Fire when >$10k at top of book
-        side: "BID",
-      },
-      webhook_url: testWebhookUrl,
-      cooldown_ms: 10000,
-      metadata: { test: "true", description: "Large bid size >$10k" },
-    },
-    {
-      id_suffix: "size_spike_ask",
-      asset_id: "*",
-      condition: {
-        type: "SIZE_SPIKE",
-        threshold: 10000,
-        side: "ASK",
-      },
-      webhook_url: testWebhookUrl,
-      cooldown_ms: 10000,
-      metadata: { test: "true", description: "Large ask size >$10k" },
-    },
-    {
-      id_suffix: "price_move",
-      asset_id: "*",
-      condition: {
-        type: "PRICE_MOVE",
-        threshold: 3, // 3% move
-        window_ms: 60000, // Within 60 seconds
-      },
-      webhook_url: testWebhookUrl,
-      cooldown_ms: 30000,
-      metadata: { test: "true", description: "3% price move in 60s" },
-    },
-    {
-      id_suffix: "imbalance_shift",
-      asset_id: "*",
-      condition: {
-        type: "IMBALANCE_SHIFT",
-        threshold: 0.4, // 40% shift in imbalance
-        window_ms: 30000, // Within 30 seconds
-      },
-      webhook_url: testWebhookUrl,
-      cooldown_ms: 15000,
-      metadata: { test: "true", description: "40% imbalance shift in 30s" },
-    },
-    {
-      id_suffix: "quote_velocity",
-      asset_id: "*",
-      condition: {
-        type: "QUOTE_VELOCITY",
-        threshold: 3, // 3 updates per second
-        window_ms: 5000, // 5 second measurement window
-      },
-      webhook_url: testWebhookUrl,
-      cooldown_ms: 30000,
-      metadata: { test: "true", description: "High quote velocity >3/sec" },
-    },
-    {
-      id_suffix: "stale_quote",
-      asset_id: "*",
-      condition: {
-        type: "STALE_QUOTE",
-        threshold: 60000, // 60 seconds without update
-      },
-      webhook_url: testWebhookUrl,
-      cooldown_ms: 120000, // 2 minute cooldown
-      metadata: { test: "true", description: "No update for 60 seconds" },
-    },
-  ];
-
-  const results: Array<{ type: string; status: string; trigger_id?: string; error?: string }> = [];
-
-  // Route to shard-0 for wildcard triggers (they apply to all assets)
-  const doId = c.env.ORDERBOOK_MANAGER.idFromName("shard-0");
-  const stub = c.env.ORDERBOOK_MANAGER.get(doId);
-
-  // If delete flag is set, delete existing test triggers first
-  if (shouldDelete) {
-    try {
-      const listResp = await stub.fetch("http://do/triggers");
-      const listData = await listResp.json() as { triggers: Array<{ id: string; metadata?: Record<string, string> }> };
-
-      for (const trigger of listData.triggers) {
-        if (trigger.metadata?.test === "true") {
-          await stub.fetch("http://do/triggers/delete", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ trigger_id: trigger.id }),
-          });
-          results.push({ type: "DELETE", status: "deleted", trigger_id: trigger.id });
-        }
-      }
-    } catch (error) {
-      results.push({ type: "DELETE", status: "error", error: String(error) });
-    }
-  }
-
-  // Register each test trigger
-  for (const triggerDef of testTriggers) {
-    try {
-      const response = await stub.fetch("http://do/triggers", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          asset_id: triggerDef.asset_id,
-          condition: triggerDef.condition,
-          webhook_url: triggerDef.webhook_url,
-          cooldown_ms: triggerDef.cooldown_ms,
-          enabled: true,
-          metadata: triggerDef.metadata,
-        }),
-      });
-
-      const data = await response.json() as { trigger_id?: string; status?: string; error?: string };
-
-      if (response.ok) {
-        results.push({
-          type: triggerDef.condition.type,
-          status: "registered",
-          trigger_id: data.trigger_id,
-        });
-      } else {
-        results.push({
-          type: triggerDef.condition.type,
-          status: "error",
-          error: data.error || "Unknown error",
-        });
-      }
-    } catch (error) {
-      results.push({
-        type: triggerDef.condition.type,
-        status: "error",
-        error: String(error),
-      });
-    }
-  }
-
-  const registered = results.filter(r => r.status === "registered").length;
-  const deleted = results.filter(r => r.status === "deleted").length;
-
-  return c.json({
-    status: "success",
-    summary: {
-      registered,
-      deleted,
-      errors: results.filter(r => r.status === "error").length,
-    },
-    results,
-    triggers_not_registered: [
-      "ARBITRAGE_BUY - requires counterpart_asset_id",
-      "ARBITRAGE_SELL - requires counterpart_asset_id",
-      "MULTI_OUTCOME_ARBITRAGE - requires outcome_asset_ids",
-    ],
-    next_steps: {
-      view_triggers: "GET /triggers to see all registered triggers",
-      fire_synthetic: "GET /test/triggers to fire synthetic events for all 20 types",
-      delete_test_triggers: "GET /test/triggers/register?delete=true to clean up",
-    },
   });
 });
 
@@ -1417,17 +1437,50 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
 }
 
 /**
- * Generate a secure session token
+ * Generate a signed session token using HMAC
+ * Token format: timestamp.signature
  */
-function generateSessionToken(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+async function generateSessionToken(apiKey: string): Promise<string> {
+  const timestamp = Date.now().toString();
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(apiKey),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(timestamp));
+  const signatureHex = Array.from(new Uint8Array(signature), (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${timestamp}.${signatureHex}`;
 }
 
-// In-memory session store (in production, use KV or Durable Objects)
-const sessions = new Map<string, { createdAt: number }>();
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+/**
+ * Validate a session token
+ */
+async function verifySessionToken(token: string, apiKey: string): Promise<boolean> {
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+
+  const [timestamp, signature] = parts;
+  const tokenAge = Date.now() - parseInt(timestamp, 10);
+
+  // Token expires after 24 hours
+  if (tokenAge > 24 * 60 * 60 * 1000) return false;
+
+  // Verify signature
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(apiKey),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  const signatureBytes = new Uint8Array(signature.match(/.{2}/g)!.map((b) => parseInt(b, 16)));
+  return crypto.subtle.verify("HMAC", key, signatureBytes, encoder.encode(timestamp));
+}
 
 /**
  * Auth endpoint - validates API key and sets session cookie
@@ -1440,9 +1493,8 @@ dashboardApi.post("/auth", async (c) => {
     return c.json({ error: "Invalid API key" }, 401);
   }
 
-  // Generate session token
-  const sessionToken = generateSessionToken();
-  sessions.set(sessionToken, { createdAt: Date.now() });
+  // Generate signed session token (stateless - no storage needed)
+  const sessionToken = await generateSessionToken(apiKey);
 
   // Set httpOnly cookie
   const isSecure = c.req.url.startsWith("https");
@@ -1456,24 +1508,15 @@ dashboardApi.post("/auth", async (c) => {
 });
 
 /**
- * Validate session from cookie
+ * Validate session from cookie (stateless verification)
  */
-function validateSession(c: Context<{ Bindings: Env }>): boolean {
+async function validateSession(c: Context<{ Bindings: Env }>): Promise<boolean> {
   const cookies = parseCookies(c.req.header("Cookie"));
   const sessionToken = cookies[SESSION_COOKIE];
 
   if (!sessionToken) return false;
 
-  const session = sessions.get(sessionToken);
-  if (!session) return false;
-
-  // Check if session expired
-  if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-    sessions.delete(sessionToken);
-    return false;
-  }
-
-  return true;
+  return verifySessionToken(sessionToken, c.env.VITE_DASHBOARD_API_KEY);
 }
 
 // Top Activity Endpoint - Most active market by tick count
@@ -1624,7 +1667,7 @@ dashboardApi.get("/ohlc/:asset_id", async (c) => {
 // SSE Endpoint - Stream trigger events
 // Uses cookie-based auth (call POST /auth first to get session cookie)
 dashboardApi.get("/triggers/events/sse", async (c) => {
-  if (!validateSession(c)) {
+  if (!(await validateSession(c))) {
     return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
   }
 
@@ -1639,7 +1682,7 @@ dashboardApi.get("/triggers/events/sse", async (c) => {
 
 // Trigger event buffer status
 dashboardApi.get("/triggers/events/status", async (c) => {
-  if (!validateSession(c)) {
+  if (!(await validateSession(c))) {
     return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
   }
 
@@ -1647,6 +1690,23 @@ dashboardApi.get("/triggers/events/status", async (c) => {
   const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
 
   const response = await stub.fetch(new Request("https://do/status"));
+  return response;
+});
+
+// Get buffered trigger events for validation/debugging
+dashboardApi.get("/triggers/events", async (c) => {
+  if (!(await validateSession(c))) {
+    return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
+  }
+
+  const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
+  const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
+
+  const limit = c.req.query("limit") || "20";
+  const type = c.req.query("type") || "";
+  const url = `https://do/events?limit=${limit}${type ? `&type=${type}` : ""}`;
+
+  const response = await stub.fetch(new Request(url));
   return response;
 });
 
@@ -1681,6 +1741,86 @@ async function queueHandler(batch: MessageBatch, env: Env) {
   }
 }
 
+/**
+ * Check if any markets are subscribed across all shards
+ */
+async function getTotalSubscriptions(env: Env): Promise<number> {
+  const shardResults = await forEachShard<number>(
+    env,
+    async (stub) => {
+      const resp = await stub.fetch("http://do/status");
+      const data = (await resp.json()) as { total_assets?: number };
+      return data.total_assets ?? 0;
+    },
+    { continueOnError: true }
+  );
+  return shardResults.reduce((sum, r) => sum + (r.result ?? 0), 0);
+}
+
+/**
+ * Bootstrap all active markets from Gamma API
+ */
+async function bootstrapActiveMarkets(env: Env): Promise<{ subscribed: number; errors: number }> {
+  console.log("[Bootstrap] Fetching all active markets from Gamma API");
+
+  const response = await fetch(
+    `${env.GAMMA_API_URL}/markets?active=true&closed=false&enableOrderBook=true&limit=1000`,
+    { headers: { Accept: "application/json" } }
+  );
+
+  if (!response.ok) {
+    console.error("[Bootstrap] Gamma API error:", response.status);
+    return { subscribed: 0, errors: 1 };
+  }
+
+  interface GammaMarket {
+    conditionId: string;
+    clobTokenIds: string;
+    orderPriceMinTickSize: number;
+    negRisk: boolean;
+    orderMinSize: number;
+  }
+
+  const markets = (await response.json()) as GammaMarket[];
+  console.log(`[Bootstrap] Found ${markets.length} active markets`);
+
+  let subscribed = 0;
+  let errors = 0;
+
+  for (const market of markets) {
+    let tokenIds: string[] = [];
+    try {
+      tokenIds = JSON.parse(market.clobTokenIds);
+    } catch {
+      tokenIds = [market.clobTokenIds];
+    }
+
+    const shardId = getShardForMarket(market.conditionId);
+    const doId = env.ORDERBOOK_MANAGER.idFromName(shardId);
+    const stub = env.ORDERBOOK_MANAGER.get(doId);
+
+    try {
+      await stub.fetch("http://do/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          condition_id: market.conditionId,
+          token_ids: tokenIds,
+          tick_size: market.orderPriceMinTickSize,
+          neg_risk: market.negRisk,
+          order_min_size: market.orderMinSize,
+          market_source: "polymarket",
+        }),
+      });
+      subscribed++;
+    } catch {
+      errors++;
+    }
+  }
+
+  return { subscribed, errors };
+}
+
 async function scheduledHandler(
   event: ScheduledEvent,
   env: Env,
@@ -1691,6 +1831,20 @@ async function scheduledHandler(
   // Market lifecycle check every 5 minutes (cron: "*/5 * * * *")
   if (event.cron === "*/5 * * * *") {
     console.log("[Scheduled] Running market lifecycle check at", now);
+
+    // AUTOMATIC BOOTSTRAP: Check if we have any subscriptions
+    // On fresh deployment, no markets are subscribed - this fixes the gap
+    const totalSubscriptions = await getTotalSubscriptions(env);
+    if (totalSubscriptions === 0) {
+      console.log("[Scheduled] No markets subscribed - running automatic bootstrap");
+      ctx.waitUntil(
+        bootstrapActiveMarkets(env).then((result) => {
+          console.log(`[Scheduled] Bootstrap complete: ${result.subscribed} subscribed, ${result.errors} errors`);
+        })
+      );
+      return; // Skip lifecycle check on bootstrap run
+    }
+
     const lifecycle = new MarketLifecycleService(env);
 
     // Load webhooks from KV
@@ -1705,9 +1859,15 @@ async function scheduledHandler(
           `[Scheduled] Lifecycle check complete: ${results.resolutions} resolutions, ${results.new_markets} new markets, ${results.metadata_synced} metadata synced`
         );
 
-        // CRITICAL: Clean up resolved markets using coordinated cleanup service
-        // This prevents race conditions with gap-backfill consumer and ensures
-        // proper ordering: unsubscribe FIRST, then delete hash chain
+        // Subscribe new markets to OrderbookManager DOs for real-time monitoring
+        if (results.newMarketEvents.length > 0) {
+          console.log(`[Scheduled] Subscribing ${results.newMarketEvents.length} new markets`);
+          const subscription = await subscribeNewMarkets(env, results.newMarketEvents);
+          console.log(`[Scheduled] Subscribed ${subscription.subscribed} markets, ${subscription.errors.length} errors`);
+          subscription.errors.forEach((err) => console.error(`[Scheduled] ${err}`));
+        }
+
+        // Clean up resolved markets using coordinated cleanup service
         if (results.resolutionEvents.length > 0) {
           const cleanupService = new MarketCleanupService(env, getShardForMarket);
 

@@ -109,6 +109,14 @@ deleted_classes = ["SnapshotAggregator"]
 tag = "v4"
 new_classes = ["TriggerEventBuffer"]
 
+[[migrations]]
+tag = "v5"
+new_classes = ["SessionManager"]
+
+[[migrations]]
+tag = "v6"
+deleted_classes = ["SessionManager"]
+
 # ============================================================
 # KV NAMESPACES
 # ============================================================

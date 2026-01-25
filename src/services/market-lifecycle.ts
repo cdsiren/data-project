@@ -252,12 +252,14 @@ export class MarketLifecycleService {
   /**
    * Run a full lifecycle check (called from scheduled handler)
    * Returns resolutionEvents to allow caller to unsubscribe resolved markets
+   * Returns newMarketEvents to allow caller to subscribe new markets to orderbook monitoring
    */
   async runCheck(): Promise<{
     resolutions: number;
     new_markets: number;
     metadata_synced: number;
     resolutionEvents: MarketLifecycleEvent[];
+    newMarketEvents: MarketLifecycleEvent[];
   }> {
     const [resolutionEvents, newMarketEvents] = await Promise.all([
       this.checkMarketResolutions(),
@@ -293,6 +295,7 @@ export class MarketLifecycleService {
       new_markets: newMarketEvents.length,
       metadata_synced: metadataSynced,
       resolutionEvents, // Return for unsubscribe processing
+      newMarketEvents, // Return for subscribe processing
     };
   }
 }
