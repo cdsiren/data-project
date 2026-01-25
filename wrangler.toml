@@ -98,16 +98,16 @@ tag = "v1"
 new_classes = ["OrderbookManager"]
 
 [[migrations]]
-tag = "v4"
-new_classes = ["TriggerEventBuffer"]
-
-[[migrations]]
 tag = "v2"
 new_classes = ["SnapshotAggregator"]
 
 [[migrations]]
 tag = "v3"
 deleted_classes = ["SnapshotAggregator"]
+
+[[migrations]]
+tag = "v4"
+new_classes = ["TriggerEventBuffer"]
 
 # ============================================================
 # KV NAMESPACES
