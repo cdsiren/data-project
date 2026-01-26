@@ -49,6 +49,43 @@ function getShardForMarket(conditionId: string): string {
 }
 
 // ============================================================
+// Durable Object Location Hints
+// ============================================================
+
+/**
+ * Location hint for Durable Objects - co-locate with Polymarket servers
+ * Polymarket's primary servers are in eu-west-2 (London)
+ * "weur" = Western Europe (closest Cloudflare region)
+ */
+const DO_LOCATION_HINT: DurableObjectLocationHint = "weur";
+
+/**
+ * Extended idFromName with location hint support
+ * Note: locationHint is a newer Cloudflare feature, types may not include it yet
+ */
+interface DurableObjectNamespaceExt {
+  idFromName(name: string, options?: { locationHint?: DurableObjectLocationHint }): DurableObjectId;
+}
+
+/**
+ * Get OrderbookManager DO stub with location hint for low-latency Polymarket connection
+ */
+function getOrderbookManagerStub(env: Env, shardId: string): DurableObjectStub {
+  const ns = env.ORDERBOOK_MANAGER as unknown as DurableObjectNamespaceExt;
+  const doId = ns.idFromName(shardId, { locationHint: DO_LOCATION_HINT });
+  return env.ORDERBOOK_MANAGER.get(doId);
+}
+
+/**
+ * Get TriggerEventBuffer DO stub with location hint
+ */
+function getTriggerEventBufferStub(env: Env): DurableObjectStub {
+  const ns = env.TRIGGER_EVENT_BUFFER as unknown as DurableObjectNamespaceExt;
+  const doId = ns.idFromName("global", { locationHint: DO_LOCATION_HINT });
+  return env.TRIGGER_EVENT_BUFFER.get(doId);
+}
+
+// ============================================================
 // Shard Utilities
 // ============================================================
 
@@ -71,8 +108,7 @@ async function forEachShard<T>(
   return Promise.all(
     Array.from({ length: SHARD_COUNT }, async (_, i) => {
       const shardId = `shard-${i}`;
-      const doId = env.ORDERBOOK_MANAGER.idFromName(shardId);
-      const stub = env.ORDERBOOK_MANAGER.get(doId);
+      const stub = getOrderbookManagerStub(env, shardId);
 
       try {
         const result = await operation(stub, shardId, i);
@@ -111,8 +147,7 @@ async function subscribeNewMarkets(
   for (const event of events) {
     try {
       const shardId = getShardForMarket(event.condition_id);
-      const doId = env.ORDERBOOK_MANAGER.idFromName(shardId);
-      const stub = env.ORDERBOOK_MANAGER.get(doId);
+      const stub = getOrderbookManagerStub(env, shardId);
 
       await stub.fetch("http://do/subscribe", {
         method: "POST",
@@ -232,8 +267,7 @@ app.post("/triggers", authMiddleware, async (c) => {
 
   // Route by MARKET to ensure trigger is on same shard as both YES/NO tokens
   const shardId = getShardForMarket(conditionId);
-  const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardId);
-  const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+  const stub = getOrderbookManagerStub(c.env, shardId);
 
   const response = await stub.fetch("http://do/triggers", {
     method: "POST",
@@ -280,8 +314,7 @@ app.delete("/triggers", authMiddleware, async (c) => {
   }
 
   const shardId = getShardForMarket(conditionId);
-  const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardId);
-  const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+  const stub = getOrderbookManagerStub(c.env, shardId);
 
   const response = await stub.fetch("http://do/triggers/delete", {
     method: "POST",
@@ -1001,8 +1034,7 @@ app.post("/admin/bootstrap-markets", authMiddleware, async (c) => {
       }
 
       const shardId = getShardForMarket(market.conditionId);
-      const doId = c.env.ORDERBOOK_MANAGER.idFromName(shardId);
-      const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+      const stub = getOrderbookManagerStub(c.env, shardId);
 
       try {
         await stub.fetch("http://do/subscribe", {
@@ -1162,8 +1194,7 @@ app.post("/admin/cleanup-test-data", authMiddleware, async (c) => {
 
   // Clear event buffer by requesting it to clear
   try {
-    const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
-    const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
+    const stub = getTriggerEventBufferStub(c.env);
     await stub.fetch("http://do/clear", { method: "POST" });
     results.push({ action: "clear_event_buffer", status: "success" });
   } catch (error) {
@@ -1336,8 +1367,7 @@ app.post("/admin/init-triggers", authMiddleware, async (c) => {
     // Register on all shards in parallel (wildcard triggers need to be everywhere)
     const shardResults = await Promise.all(
       Array.from({ length: SHARD_COUNT }, async (_, i) => {
-        const doId = c.env.ORDERBOOK_MANAGER.idFromName(`shard-${i}`);
-        const stub = c.env.ORDERBOOK_MANAGER.get(doId);
+        const stub = getOrderbookManagerStub(c.env, `shard-${i}`);
         try {
           const response = await stub.fetch("http://do/triggers", {
             method: "POST",
@@ -1670,9 +1700,8 @@ dashboardApi.get("/triggers/events/sse", async (c) => {
     return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
   }
 
-  // Route to the global TriggerEventBuffer DO
-  const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
-  const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
+  // Route to the global TriggerEventBuffer DO (with location hint for low latency)
+  const stub = getTriggerEventBufferStub(c.env);
 
   return stub.fetch(new Request("https://do/sse", {
     headers: c.req.raw.headers,
@@ -1685,9 +1714,7 @@ dashboardApi.get("/triggers/events/status", async (c) => {
     return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
   }
 
-  const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
-  const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
-
+  const stub = getTriggerEventBufferStub(c.env);
   const response = await stub.fetch(new Request("https://do/status"));
   return response;
 });
@@ -1698,9 +1725,7 @@ dashboardApi.get("/triggers/events", async (c) => {
     return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
   }
 
-  const doId = c.env.TRIGGER_EVENT_BUFFER.idFromName("global");
-  const stub = c.env.TRIGGER_EVENT_BUFFER.get(doId);
-
+  const stub = getTriggerEventBufferStub(c.env);
   const limit = c.req.query("limit") || "20";
   const type = c.req.query("type") || "";
   const url = `https://do/events?limit=${limit}${type ? `&type=${type}` : ""}`;
@@ -1795,8 +1820,7 @@ async function bootstrapActiveMarkets(env: Env): Promise<{ subscribed: number; e
     }
 
     const shardId = getShardForMarket(market.conditionId);
-    const doId = env.ORDERBOOK_MANAGER.idFromName(shardId);
-    const stub = env.ORDERBOOK_MANAGER.get(doId);
+    const stub = getOrderbookManagerStub(env, shardId);
 
     try {
       await stub.fetch("http://do/subscribe", {

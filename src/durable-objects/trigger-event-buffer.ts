@@ -33,6 +33,7 @@ export class TriggerEventBuffer extends DurableObject<Env> {
   private encoder = new TextEncoder();
   private nextAlarmTime: number | null = null;
   private initialized = false;
+  private initializationPromise: Promise<void> | null = null; // Guard against race conditions
   private bufferDirty = false; // Track if buffer needs flushing
   private flushScheduled = false; // Prevent multiple flush schedules
 
@@ -42,16 +43,22 @@ export class TriggerEventBuffer extends DurableObject<Env> {
 
   /**
    * Load event buffer from storage on first access
+   * Uses promise caching to prevent double-init race condition
    */
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) return;
+    if (!this.initializationPromise) {
+      this.initializationPromise = this.doInitialize();
+    }
+    await this.initializationPromise;
+  }
 
+  private async doInitialize(): Promise<void> {
     const stored = await this.ctx.storage.get<BufferedEvent[]>("eventBuffer");
     if (stored) {
       this.eventBuffer = stored;
       console.log(`[SSE] Restored ${this.eventBuffer.length} buffered events from storage`);
     }
-
     this.initialized = true;
   }
 
@@ -72,6 +79,8 @@ export class TriggerEventBuffer extends DurableObject<Env> {
         return this.handleSSE();
       case "/publish":
         return this.handlePublish(request);
+      case "/publish-batch":
+        return this.handlePublishBatch(request);
       case "/status":
         return this.handleStatus();
       case "/events":
@@ -162,22 +171,69 @@ export class TriggerEventBuffer extends DurableObject<Env> {
         timestamp: Date.now(),
       });
 
-      // Trim buffer to max size
-      while (this.eventBuffer.length > this.MAX_BUFFER_SIZE) {
-        this.eventBuffer.shift();
+      // Trim buffer to max size - single splice is O(1) vs O(n) for shift loop
+      if (this.eventBuffer.length > this.MAX_BUFFER_SIZE) {
+        this.eventBuffer.splice(0, this.eventBuffer.length - this.MAX_BUFFER_SIZE);
       }
 
       // Mark buffer as dirty (needs persistence)
       this.bufferDirty = true;
 
-      // Schedule debounced flush (don't await - non-blocking)
+      // Schedule debounced flush (non-blocking)
       this.scheduleDebouncedFlush();
 
-      // Broadcast to all connected clients immediately
-      await this.broadcast(event);
+      // Broadcast to all connected clients (fire-and-forget)
+      this.broadcast(event);
 
       return Response.json({
         status: "published",
+        connections: this.connections.size,
+        buffer_size: this.eventBuffer.length,
+      });
+    } catch (error) {
+      return Response.json(
+        { status: "error", message: String(error) },
+        { status: 500 }
+      );
+    }
+  }
+
+  /**
+   * Handle batch event publish from OrderbookManager
+   * Reduces DO hop overhead when multiple triggers fire in one evaluation
+   */
+  private async handlePublishBatch(request: Request): Promise<Response> {
+    try {
+      const events = await request.json() as TriggerEvent[];
+
+      if (!Array.isArray(events) || events.length === 0) {
+        return Response.json({ status: "ok", count: 0, connections: this.connections.size });
+      }
+
+      const now = Date.now();
+
+      // Add all events to ring buffer
+      for (const event of events) {
+        this.eventBuffer.push({ event, timestamp: now });
+      }
+
+      // Trim buffer to max size - single splice
+      if (this.eventBuffer.length > this.MAX_BUFFER_SIZE) {
+        this.eventBuffer.splice(0, this.eventBuffer.length - this.MAX_BUFFER_SIZE);
+      }
+
+      // Mark buffer as dirty (needs persistence)
+      this.bufferDirty = true;
+
+      // Schedule debounced flush (non-blocking)
+      this.scheduleDebouncedFlush();
+
+      // Broadcast all events in a single write per connection
+      this.broadcastBatch(events);
+
+      return Response.json({
+        status: "published",
+        count: events.length,
         connections: this.connections.size,
         buffer_size: this.eventBuffer.length,
       });
@@ -210,39 +266,46 @@ export class TriggerEventBuffer extends DurableObject<Env> {
   }
 
   /**
-   * Broadcast event to all connected clients
+   * Broadcast event to all connected clients (fire-and-forget, non-blocking)
+   * Serializes once and reuses bytes for all connections
    */
-  private async broadcast(event: TriggerEvent): Promise<void> {
-    const message = `data: ${JSON.stringify(event)}\n\n`;
-    const deadConnections: string[] = [];
+  private broadcast(event: TriggerEvent): void {
+    if (this.connections.size === 0) return;
 
-    const sendPromises = Array.from(this.connections.entries()).map(
-      async ([id, conn]) => {
-        try {
-          await this.sendToWriter(conn.writer, message);
-        } catch {
-          deadConnections.push(id);
-        }
-      }
-    );
+    // Serialize once, reuse for all connections
+    const messageBytes = this.encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
 
-    await Promise.all(sendPromises);
-
-    // Clean up dead connections
-    for (const id of deadConnections) {
-      this.connections.delete(id);
-    }
-
-    if (deadConnections.length > 0) {
-      console.log(
-        `[SSE] Cleaned up ${deadConnections.length} dead connections, ` +
-        `${this.connections.size} remaining`
-      );
+    // Fire-and-forget to each connection
+    for (const [id, conn] of this.connections) {
+      conn.writer.write(messageBytes).catch((error) => {
+        console.error(`[SSE] Connection ${id.slice(0, 8)} write failed:`, error);
+        this.connections.delete(id);
+      });
     }
   }
 
   /**
-   * Send data to a writer
+   * Broadcast multiple events to all connected clients (batched)
+   * Reduces write overhead when multiple triggers fire in one evaluation
+   */
+  private broadcastBatch(events: TriggerEvent[]): void {
+    if (this.connections.size === 0 || events.length === 0) return;
+
+    // Serialize all events once, concatenate into single message
+    const message = events.map(e => `data: ${JSON.stringify(e)}\n\n`).join("");
+    const messageBytes = this.encoder.encode(message);
+
+    // Fire-and-forget to each connection
+    for (const [id, conn] of this.connections) {
+      conn.writer.write(messageBytes).catch((error) => {
+        console.error(`[SSE] Connection ${id.slice(0, 8)} batch write failed:`, error);
+        this.connections.delete(id);
+      });
+    }
+  }
+
+  /**
+   * Send data to a writer (for initialization and heartbeat)
    */
   private async sendToWriter(
     writer: WritableStreamDefaultWriter<Uint8Array>,

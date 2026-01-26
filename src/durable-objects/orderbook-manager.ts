@@ -108,6 +108,8 @@ export class OrderbookManager extends DurableObject<Env> {
   private lastUpdateTs: Map<string, number> = new Map();
   // LARGE_FILL: Track previous BBO for size delta calculation
   private previousBBO: Map<string, { bid_size: number | null; ask_size: number | null }> = new Map();
+  // Cached DO stub for SSE publishing (avoids stub lookup on every event)
+  private eventBufferStub: DurableObjectStub | null = null;
 
   // Polymarket allows max 500 instruments per connection
   // We use 450 to leave headroom for pending subscriptions during updates
@@ -1515,18 +1517,19 @@ export class OrderbookManager extends DurableObject<Env> {
       }
     }
 
-    // Fire webhooks asynchronously
+    // Dispatch events asynchronously (batched SSE + individual webhooks)
     if (firedEvents.length > 0) {
       console.log(`[Alarm] Detected ${firedEvents.length} stale quote(s)`);
-      this.ctx.waitUntil(
-        Promise.all(
-          firedEvents.map(({ trigger, event }) =>
-            this.dispatchTriggerWebhook(trigger, event).catch((err) =>
-              console.error(`[Trigger] Stale quote webhook failed for ${trigger.id}:`, err)
-            )
-          )
-        )
-      );
+
+      // Batched SSE publish
+      this.ctx.waitUntil(this.publishEventsToBuffer(firedEvents.map(f => f.event)));
+
+      // Individual webhook dispatch
+      for (const { trigger, event } of firedEvents) {
+        if (trigger.webhook_url) {
+          this.ctx.waitUntil(this.dispatchWebhook(trigger, event));
+        }
+      }
     }
   }
 
@@ -2094,19 +2097,9 @@ export class OrderbookManager extends DurableObject<Env> {
       history.push({ ts: snapshot.source_ts, mid_price: snapshot.mid_price });
 
       // CRITICAL: Prune on EVERY update to prevent unbounded growth
-      // Uses splice() for in-place modification (no new array allocation)
-      // Convert PRICE_HISTORY_MAX_AGE_MS to microseconds (source_ts is in microseconds)
+      // Time-based (60s) + count-based (1000 entries) limits
       const cutoffUs = snapshot.source_ts - (this.PRICE_HISTORY_MAX_AGE_MS * 1000);
-      let firstValidIdx = 0;
-      while (firstValidIdx < history.length && history[firstValidIdx].ts < cutoffUs) {
-        firstValidIdx++;
-      }
-      // Enforce both time-based and count-based limits
-      const startIdx = Math.max(firstValidIdx, history.length - this.MAX_PRICE_HISTORY_ENTRIES);
-      if (startIdx > 0) {
-        // In-place pruning - no new array allocation, guaranteed memory safety
-        history.splice(0, startIdx);
-      }
+      this.pruneHistory(history, this.MAX_PRICE_HISTORY_ENTRIES, cutoffUs);
     }
 
     // ============================================================
@@ -2176,10 +2169,8 @@ export class OrderbookManager extends DurableObject<Env> {
           this.imbalanceHistory.set(snapshot.asset_id, imbHistory);
         }
         imbHistory.push({ imbalance, ts: snapshot.source_ts });
-        // Prune to max entries
-        if (imbHistory.length > this.MAX_IMBALANCE_HISTORY_ENTRIES) {
-          imbHistory.splice(0, imbHistory.length - this.MAX_IMBALANCE_HISTORY_ENTRIES);
-        }
+        // Prune to max entries (count-based only)
+        this.pruneHistory(imbHistory, this.MAX_IMBALANCE_HISTORY_ENTRIES);
       }
     }
 
@@ -2233,41 +2224,55 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // ============================================================
     // GLOBAL TRIGGERS - Always-on triggers for dashboard streaming
-    // These fire without registration and publish directly to SSE
+    // These fire without registration and publish directly to SSE (no webhook)
     // ============================================================
     const globalEvents = this.evaluateGlobalTriggers(snapshot, now);
-    for (const event of globalEvents) {
-      // Create a synthetic trigger for dispatch
-      const syntheticTrigger: Trigger = {
-        id: event.trigger_id,
-        asset_id: snapshot.asset_id,
-        condition: { type: event.trigger_type, threshold: event.threshold },
-        enabled: true,
-        cooldown_ms: 500, // Fast cooldown for global triggers
-        created_at: 0,
-      };
-      firedEvents.push({ trigger: syntheticTrigger, event });
+
+    // LARGE_FILL: Update previousBBO BEFORE dispatch to ensure state consistency
+    // (if dispatch throws, we still have correct state for next evaluation)
+    this.previousBBO.set(snapshot.asset_id, {
+      bid_size: snapshot.bid_size,
+      ask_size: snapshot.ask_size,
+    });
+
+    // Collect all events for batched SSE publish (reduces DO hops)
+    const allEvents = [
+      ...firedEvents.map(f => f.event),
+      ...globalEvents,
+    ];
+
+    // Single batched SSE publish for all events (fire-and-forget)
+    if (allEvents.length > 0) {
+      this.ctx.waitUntil(this.publishEventsToBuffer(allEvents));
     }
 
-    // Fire webhooks asynchronously using waitUntil (non-blocking)
-    // This ensures DO doesn't shutdown before webhooks complete while not blocking the hot path
-    if (firedEvents.length > 0) {
+    // Dispatch webhooks individually for registered triggers with webhook_url
+    for (const { trigger, event } of firedEvents) {
+      if (trigger.webhook_url) {
+        this.ctx.waitUntil(this.dispatchWebhook(trigger, event));
+      }
+      // Log trigger fires (backgrounded)
       this.ctx.waitUntil(
-        Promise.all(
-          firedEvents.map(({ trigger, event }) =>
-            this.dispatchTriggerWebhook(trigger, event).catch((err) =>
-              console.error(`[Trigger] Webhook dispatch failed for ${trigger.id}:`, err)
-            )
+        Promise.resolve().then(() =>
+          console.log(
+            `[Trigger] Fired ${trigger.id} (${trigger.condition.type}) for ${event.asset_id} ` +
+              `@ ${event.actual_value.toFixed(4)}, latency=${Math.round(event.latency_us / 1000)}ms`
           )
         )
       );
     }
 
-    // LARGE_FILL: Update previousBBO for next comparison (after trigger evaluation)
-    this.previousBBO.set(snapshot.asset_id, {
-      bid_size: snapshot.bid_size,
-      ask_size: snapshot.ask_size,
-    });
+    // Log global trigger fires (backgrounded)
+    for (const event of globalEvents) {
+      this.ctx.waitUntil(
+        Promise.resolve().then(() =>
+          console.log(
+            `[Trigger] Global ${event.trigger_type} for ${event.asset_id?.slice(0, 12)}... ` +
+              `@ ${event.actual_value.toFixed(4)}`
+          )
+        )
+      );
+    }
   }
 
   private checkTriggerCondition(
@@ -2916,6 +2921,36 @@ export class OrderbookManager extends DurableObject<Env> {
   }
 
   /**
+   * Prune timestamped history array in-place (DRY helper for memory management)
+   * Supports both time-based and count-based pruning.
+   * @param history Array with `ts` field (in microseconds)
+   * @param maxEntries Maximum entries to keep
+   * @param cutoffUs Optional time cutoff in microseconds (entries older than this are removed)
+   */
+  private pruneHistory<T extends { ts: number }>(
+    history: T[],
+    maxEntries: number,
+    cutoffUs?: number
+  ): void {
+    let firstValidIdx = 0;
+
+    // Time-based pruning (if cutoff provided)
+    if (cutoffUs !== undefined) {
+      while (firstValidIdx < history.length && history[firstValidIdx].ts < cutoffUs) {
+        firstValidIdx++;
+      }
+    }
+
+    // Enforce count-based limit
+    const startIdx = Math.max(firstValidIdx, history.length - maxEntries);
+
+    // In-place pruning (no new array allocation)
+    if (startIdx > 0) {
+      history.splice(0, startIdx);
+    }
+  }
+
+  /**
    * CRITICAL PATH OPTIMIZATION: Get or create cached HMAC key for webhook signing
    * Avoids expensive crypto.subtle.importKey on every webhook dispatch (100-500μs savings)
    */
@@ -2946,65 +2981,61 @@ export class OrderbookManager extends DurableObject<Env> {
     this.hmacKeyCache.delete(triggerId);
   }
 
-  private async dispatchTriggerWebhook(trigger: Trigger, event: TriggerEvent): Promise<void> {
-    // Always publish to SSE buffer for dashboard subscribers
-    const bufferPromise = this.publishToEventBuffer(event);
+  /**
+   * Dispatch webhook with HMAC signature (background task)
+   */
+  private async dispatchWebhook(trigger: Trigger, event: TriggerEvent): Promise<void> {
+    const body = JSON.stringify(event);
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "X-Trigger-ID": trigger.id,
+      "X-Trigger-Type": trigger.condition.type,
+    };
 
-    // Only dispatch webhook if URL is configured
-    let webhookPromise: Promise<Response | null> = Promise.resolve(null);
-    if (trigger.webhook_url) {
-      const body = JSON.stringify(event);
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        "X-Trigger-ID": trigger.id,
-        "X-Trigger-Type": trigger.condition.type,
-      };
-
-      // Add HMAC signature if secret is configured (using cached key for performance)
-      if (trigger.webhook_secret) {
-        const key = await this.getOrCreateHmacKey(trigger.id, trigger.webhook_secret);
-        const encoder = new TextEncoder();
-        const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
-        headers["X-Trigger-Signature"] = btoa(String.fromCharCode(...new Uint8Array(signature)));
-      }
-
-      webhookPromise = fetch(trigger.webhook_url, {
-        method: "POST",
-        headers,
-        body,
-      });
+    if (trigger.webhook_secret) {
+      const key = await this.getOrCreateHmacKey(trigger.id, trigger.webhook_secret);
+      const encoder = new TextEncoder();
+      const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
+      headers["X-Trigger-Signature"] = btoa(String.fromCharCode(...new Uint8Array(signature)));
     }
 
-    const [response] = await Promise.all([webhookPromise, bufferPromise]);
-
-    if (response && !response.ok) {
-      console.error(
-        `[Trigger] Webhook failed for ${trigger.id}: ${response.status} ${await response.text()}`
-      );
-    } else {
-      console.log(
-        `[Trigger] Fired ${trigger.id} (${trigger.condition.type}) for ${event.asset_id} ` +
-          `@ ${event.actual_value.toFixed(4)}, latency=${Math.round(event.latency_us / 1000)}ms`
-      );
+    try {
+      const response = await fetch(trigger.webhook_url!, { method: "POST", headers, body });
+      if (!response.ok) {
+        console.error(`[Trigger] Webhook failed for ${trigger.id}: ${response.status}`);
+      }
+    } catch (error) {
+      console.error(`[Trigger] Webhook error for ${trigger.id}:`, error);
     }
   }
 
   /**
-   * Publish trigger event to TriggerEventBuffer for SSE broadcasting
+   * Get cached DO stub for event buffer (avoids stub lookup on every event)
    */
-  private async publishToEventBuffer(event: TriggerEvent): Promise<void> {
-    try {
-      const doId = this.env.TRIGGER_EVENT_BUFFER.idFromName("global");
-      const stub = this.env.TRIGGER_EVENT_BUFFER.get(doId);
+  private getEventBufferStub(): DurableObjectStub {
+    if (!this.eventBufferStub) {
+      this.eventBufferStub = this.env.TRIGGER_EVENT_BUFFER.get(
+        this.env.TRIGGER_EVENT_BUFFER.idFromName("global")
+      );
+    }
+    return this.eventBufferStub;
+  }
 
-      await stub.fetch(new Request("https://do/publish", {
+  /**
+   * Batch publish trigger events to TriggerEventBuffer for SSE broadcasting
+   * Reduces DO hop overhead when multiple triggers fire in one evaluation
+   */
+  private async publishEventsToBuffer(events: TriggerEvent[]): Promise<void> {
+    if (events.length === 0) return;
+
+    try {
+      await this.getEventBufferStub().fetch("https://do/publish-batch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(event),
-      }));
+        body: JSON.stringify(events),
+      });
     } catch (error) {
-      // Don't fail the trigger if buffer publish fails
-      console.error("[Trigger] Failed to publish to event buffer:", error);
+      console.error("[Trigger] SSE batch publish failed:", error);
     }
   }
 }
