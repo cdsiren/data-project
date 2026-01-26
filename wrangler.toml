@@ -117,10 +117,6 @@ new_classes = ["SessionManager"]
 tag = "v6"
 deleted_classes = ["SessionManager"]
 
-[[migrations]]
-tag = "v7"
-new_classes = ["OrderbookManager", "TriggerEventBuffer"]
-
 # ============================================================
 # KV NAMESPACES
 # ============================================================
