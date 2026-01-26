@@ -93,29 +93,8 @@ bindings = [
   { name = "TRIGGER_EVENT_BUFFER", class_name = "TriggerEventBuffer" }
 ]
 
-[[migrations]]
-tag = "v1"
-new_classes = ["OrderbookManager"]
-
-[[migrations]]
-tag = "v2"
-new_classes = ["SnapshotAggregator"]
-
-[[migrations]]
-tag = "v3"
-deleted_classes = ["SnapshotAggregator"]
-
-[[migrations]]
-tag = "v4"
-new_classes = ["TriggerEventBuffer"]
-
-[[migrations]]
-tag = "v5"
-new_classes = ["SessionManager"]
-
-[[migrations]]
-tag = "v6"
-deleted_classes = ["SessionManager"]
+# Migrations removed - OrderbookManager and TriggerEventBuffer already exist in production
+# Add new migrations here only for future schema changes (e.g., renamed_classes, deleted_classes)
 
 # ============================================================
 # KV NAMESPACES
