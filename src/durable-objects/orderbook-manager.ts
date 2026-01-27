@@ -33,6 +33,8 @@ interface ConnectionState {
   lastPing: number;
   subscriptionSent: boolean; // Track if we've sent subscription for current connection
   abortController: AbortController | null; // For cleanup of event listeners
+  marketSource: string; // Market source for this connection (e.g., "polymarket", "kalshi")
+  connector: MarketConnector | null; // Adapter for market-specific normalization
 }
 
 /**
@@ -301,7 +303,12 @@ export class OrderbookManager extends DurableObject<Env> {
             continue;
           }
 
+          // Get market source for this asset (for multi-market support)
+          const marketSource = this.assetToMarketSource.get(assetId) ?? getDefaultMarketSource();
+
           if (!this.connections.has(connId)) {
+            // Get connector for this market source
+            const connector = this.getMarketConnector(marketSource);
             this.connections.set(connId, {
               ws: null,
               assets: new Set(),
@@ -309,6 +316,8 @@ export class OrderbookManager extends DurableObject<Env> {
               lastPing: 0,
               subscriptionSent: false,
               abortController: null,
+              marketSource,
+              connector,
             });
           }
           this.connections.get(connId)!.assets.add(assetId);
@@ -520,10 +529,10 @@ export class OrderbookManager extends DurableObject<Env> {
       if (neg_risk !== undefined) this.negRisk.set(tokenId, neg_risk);
       if (order_min_size !== undefined) this.orderMinSizes.set(tokenId, order_min_size);
 
-      // Find or create connection with capacity
-      let connId = this.findConnectionWithCapacity();
+      // Find or create connection with capacity for this market source
+      let connId = this.findConnectionWithCapacity(effectiveMarketSource);
       if (!connId) {
-        connId = await this.createConnection();
+        connId = await this.createConnection(effectiveMarketSource);
       }
 
       const conn = this.connections.get(connId)!;
@@ -632,9 +641,21 @@ export class OrderbookManager extends DurableObject<Env> {
     });
   }
 
-  private findConnectionWithCapacity(): string | null {
+  /**
+   * Find an existing connection with capacity for the given market source.
+   * Connections are market-specific since different markets have different WebSocket endpoints.
+   *
+   * @param marketSource - The market source to find a connection for
+   * @returns The connection ID if found, null otherwise
+   */
+  private findConnectionWithCapacity(marketSource: string = getDefaultMarketSource()): string | null {
     for (const [connId, state] of this.connections) {
-      if (state.assets.size < this.MAX_ASSETS_PER_CONNECTION) {
+      // Only use connections for the same market source
+      if (state.marketSource !== marketSource) continue;
+
+      // Check capacity using connector's limit (or default)
+      const maxAssets = state.connector?.getMaxAssetsPerConnection() ?? this.MAX_ASSETS_PER_CONNECTION;
+      if (state.assets.size < maxAssets) {
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
           return connId;
         }
@@ -643,8 +664,18 @@ export class OrderbookManager extends DurableObject<Env> {
     return null;
   }
 
-  private async createConnection(): Promise<string> {
-    const connId = `conn_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+  /**
+   * Create a new WebSocket connection for a specific market source.
+   * Uses the market's adapter to get the WebSocket URL and subscription format.
+   *
+   * @param marketSource - The market source (e.g., "polymarket", "kalshi")
+   * @returns The connection ID
+   */
+  private async createConnection(marketSource: string = getDefaultMarketSource()): Promise<string> {
+    const connId = `conn_${marketSource}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+
+    // Get the connector for this market source
+    const connector = this.getMarketConnector(marketSource);
 
     this.connections.set(connId, {
       ws: null,
@@ -653,6 +684,8 @@ export class OrderbookManager extends DurableObject<Env> {
       lastPing: 0,
       subscriptionSent: false,
       abortController: null,
+      marketSource,
+      connector,
     });
 
     await this.reconnect(connId, 0);
@@ -748,8 +781,10 @@ export class OrderbookManager extends DurableObject<Env> {
     }
 
     try {
-      console.log(`[WS ${connId}] Attempting connection to ${this.env.CLOB_WSS_URL}`);
-      const ws = new WebSocket(this.env.CLOB_WSS_URL);
+      // ADAPTER-DRIVEN: Use connector's WebSocket URL for market-specific endpoint
+      const wsUrl = state.connector?.getWebSocketUrl() ?? this.env.CLOB_WSS_URL;
+      console.log(`[WS ${connId}] Attempting connection to ${wsUrl} (market: ${state.marketSource})`);
+      const ws = new WebSocket(wsUrl);
       state.ws = ws;
 
       // Create AbortController for this connection's event listeners
@@ -797,16 +832,14 @@ export class OrderbookManager extends DurableObject<Env> {
         console.log(`[WS ${connId}] Connected, subscribing to ${state.assets.size} assets`);
         state.lastPing = Date.now();
 
-        // Subscribe to assets (no action field per Polymarket spec)
+        // ADAPTER-DRIVEN: Use connector's subscription message format
         if (state.assets.size > 0 && !state.subscriptionSent) {
-          ws.send(
-            JSON.stringify({
-              assets_ids: Array.from(state.assets),
-              type: "market",
-            })
-          );
+          const assetList = Array.from(state.assets);
+          const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
+            ?? JSON.stringify({ assets_ids: assetList, type: "market" });
+          ws.send(subscriptionMsg);
           state.subscriptionSent = true;
-          console.log(`[WS ${connId}] Subscription sent for ${state.assets.size} assets`);
+          console.log(`[WS ${connId}] Subscription sent for ${state.assets.size} assets (market: ${state.marketSource})`);
         }
 
         // Schedule alarm for PING heartbeat
@@ -894,6 +927,13 @@ export class OrderbookManager extends DurableObject<Env> {
     }
   }
 
+  /**
+   * ADAPTER-DRIVEN MESSAGE HANDLING
+   *
+   * Uses the connector's parseMessage method to determine event type,
+   * enabling market-agnostic event routing. New markets only need to
+   * implement the MarketConnector interface.
+   */
   private handleMessage(data: string, connId: string): void {
     const state = this.connections.get(connId);
 
@@ -903,89 +943,344 @@ export class OrderbookManager extends DurableObject<Env> {
       return;
     }
 
+    const ingestionTs = Date.now() * 1000; // Microseconds
+    const ingestionTsFloor = Math.floor(ingestionTs);
+
+    // ADAPTER-DRIVEN: Use connector to parse message if available
+    if (state.connector) {
+      const parsed = state.connector.parseMessage(data);
+
+      // Protocol messages (PONG, etc.) return null
+      if (parsed === null) {
+        return;
+      }
+
+      // Handle INVALID OPERATION (returned as unknown type with raw string)
+      if (parsed.type === "unknown" && parsed.raw === "INVALID OPERATION") {
+        this.handleInvalidOperation(connId, state);
+        return;
+      }
+
+      // Mark asset as confirmed on any valid event
+      if (parsed.assetId && state.pendingAssets.has(parsed.assetId)) {
+        state.pendingAssets.delete(parsed.assetId);
+        this.subscriptionFailures.delete(parsed.assetId);
+      }
+
+      // ADAPTER-DRIVEN DISPATCH: Route to appropriate handler based on canonical event type
+      switch (parsed.type) {
+        case "book":
+          // For Polymarket, we have optimized handlers that work directly with raw events
+          // For other markets, the connector would normalize to canonical types
+          if (state.marketSource === "polymarket") {
+            this.handleBookEvent(parsed.raw as PolymarketBookEvent, ingestionTsFloor);
+          } else {
+            // Generic path for other markets - use connector normalization
+            this.handleCanonicalBookEvent(state.connector, parsed.raw, ingestionTsFloor);
+          }
+          break;
+
+        case "price_change":
+          if (state.marketSource === "polymarket") {
+            this.handlePriceChangeEvent(parsed.raw as PolymarketPriceChangeEvent, ingestionTsFloor);
+          } else {
+            this.handleCanonicalPriceChange(state.connector, parsed.raw, ingestionTsFloor);
+          }
+          break;
+
+        case "trade":
+          if (state.marketSource === "polymarket") {
+            this.handleTradeEvent(parsed.raw as PolymarketLastTradePriceEvent, ingestionTsFloor);
+          } else {
+            this.handleCanonicalTrade(state.connector, parsed.raw, ingestionTsFloor);
+          }
+          break;
+
+        case "tick_size":
+          if (state.marketSource === "polymarket") {
+            this.handleTickSizeChange(parsed.raw as PolymarketTickSizeChangeEvent);
+          }
+          // Other markets can implement tick_size handling as needed
+          break;
+
+        default:
+          console.warn(`[WS ${connId}] Unknown event type: ${parsed.type}`);
+      }
+    } else {
+      // FALLBACK: Legacy handling without connector (should not happen with new code)
+      this.handleMessageLegacy(data, connId, state, ingestionTsFloor);
+    }
+  }
+
+  /**
+   * Handle INVALID OPERATION response from market.
+   * Track failures and schedule retry with backoff.
+   */
+  private handleInvalidOperation(connId: string, state: ConnectionState): void {
+    console.error(
+      `[WS ${connId}] INVALID OPERATION received (market: ${state.marketSource}). ` +
+      `This may indicate invalid asset IDs or rate limiting.`
+    );
+
+    const pendingList = Array.from(state.pendingAssets);
+    console.error(`[WS ${connId}] Pending assets that may be invalid: ${pendingList.slice(0, 5).join(", ")}`);
+
+    // Increment failure count for all pending assets
+    for (const assetId of state.pendingAssets) {
+      const failures = (this.subscriptionFailures.get(assetId) || 0) + 1;
+      this.subscriptionFailures.set(assetId, failures);
+
+      if (failures >= this.MAX_SUBSCRIPTION_RETRIES) {
+        console.error(`[WS] Asset ${assetId} exceeded max retries, removing from subscriptions`);
+        this.removeAsset(assetId);
+      }
+    }
+
+    // Reset subscription state to allow retry
+    state.subscriptionSent = false;
+
+    // Schedule a retry with backoff
+    this.ctx.storage.setAlarm(Date.now() + this.RECONNECT_BASE_DELAY_MS * 2);
+  }
+
+  /**
+   * Legacy message handling for connections without connectors.
+   * Kept for backward compatibility but should not be reached with new code.
+   */
+  private handleMessageLegacy(
+    data: string,
+    connId: string,
+    state: ConnectionState,
+    ingestionTsFloor: number
+  ): void {
     // Handle non-JSON protocol messages first
     if (data === "PONG") {
-      // Expected heartbeat response - silently ignore
       return;
     }
 
     if (data === "INVALID OPERATION") {
-      // Polymarket rejected the subscription - this is critical!
-      console.error(
-        `[WS ${connId}] INVALID OPERATION received. ` +
-        `This may indicate invalid asset IDs or rate limiting.`
-      );
-
-      // Track failures for pending assets and retry with backoff
-      if (state) {
-        const pendingList = Array.from(state.pendingAssets);
-        console.error(`[WS ${connId}] Pending assets that may be invalid: ${pendingList.slice(0, 5).join(", ")}`);
-
-        // Increment failure count for all pending assets
-        for (const assetId of state.pendingAssets) {
-          const failures = (this.subscriptionFailures.get(assetId) || 0) + 1;
-          this.subscriptionFailures.set(assetId, failures);
-
-          if (failures >= this.MAX_SUBSCRIPTION_RETRIES) {
-            console.error(`[WS] Asset ${assetId} exceeded max retries, removing from subscriptions`);
-            this.removeAsset(assetId);
-          }
-        }
-
-        // Reset subscription state to allow retry
-        state.subscriptionSent = false;
-
-        // Schedule a retry with backoff
-        this.ctx.storage.setAlarm(Date.now() + this.RECONNECT_BASE_DELAY_MS * 2);
-      }
+      this.handleInvalidOperation(connId, state);
       return;
     }
 
-    // Skip non-JSON messages
     if (!data.startsWith("{") && !data.startsWith("[")) {
       console.warn(`[WS ${connId}] Unexpected non-JSON message: "${data.length > 100 ? data.slice(0, 100) + "..." : data}"`);
       return;
     }
 
-    const ingestionTs = Date.now() * 1000; // Microseconds
-
     try {
       const event = JSON.parse(data) as PolymarketWSEvent;
-      const ingestionTsFloor = Math.floor(ingestionTs);
 
       // Mark asset as confirmed on any valid event
-      if (state && "asset_id" in event && state.pendingAssets.has(event.asset_id)) {
+      if ("asset_id" in event && state.pendingAssets.has(event.asset_id)) {
         state.pendingAssets.delete(event.asset_id);
         this.subscriptionFailures.delete(event.asset_id);
       }
 
       switch (event.event_type) {
         case "book":
-          // Full orderbook snapshot - initialize/reset local book
           this.handleBookEvent(event, ingestionTsFloor);
           break;
-
         case "price_change":
-          // Incremental update - apply deltas to local book
           this.handlePriceChangeEvent(event, ingestionTsFloor);
           break;
-
         case "last_trade_price":
-          // Trade execution - capture for backtesting
           this.handleTradeEvent(event, ingestionTsFloor);
           break;
-
         case "tick_size_change":
-          // Tick size update - rebuild book with new precision
           this.handleTickSizeChange(event);
           break;
-
         default:
           console.warn(`[WS ${connId}] Unknown event type: ${(event as { event_type: string }).event_type}`);
       }
     } catch (error) {
       console.error(`[WS ${connId}] JSON parse error for message: "${data.length > 200 ? data.slice(0, 200) + "..." : data}"`, error);
     }
+  }
+
+  /**
+   * CANONICAL BOOK EVENT HANDLER
+   * Handles book events from any market using connector normalization.
+   * This is the generic path for non-Polymarket markets.
+   */
+  private handleCanonicalBookEvent(
+    connector: MarketConnector,
+    raw: unknown,
+    ingestionTs: number
+  ): void {
+    // Use connector to normalize to canonical BBO snapshot
+    const snapshot = connector.normalizeBookEvent(raw);
+    if (!snapshot) return;
+
+    // Get condition ID and tick size from local state
+    const conditionId = this.assetToMarket.get(snapshot.asset_id) || snapshot.condition_id;
+    const tickSize = this.tickSizes.get(snapshot.asset_id) || snapshot.tick_size;
+
+    // Clear missing book tracking
+    this.missingBookFirstSeen.delete(snapshot.asset_id);
+
+    // Get full L2 snapshot using connector
+    const fullL2 = connector.normalizeFullL2(
+      raw,
+      conditionId,
+      tickSize,
+      this.negRisk.get(snapshot.asset_id),
+      this.orderMinSizes.get(snapshot.asset_id)
+    );
+
+    if (fullL2) {
+      // Initialize local book from full L2
+      const localBook: LocalOrderbook = {
+        market_source: connector.marketSource as MarketSource,
+        asset_id: snapshot.asset_id,
+        condition_id: conditionId,
+        bids: new Map(fullL2.bids.map((b) => [b.price, b.size])),
+        asks: new Map(fullL2.asks.map((a) => [a.price, a.size])),
+        tick_size: tickSize,
+        last_hash: snapshot.book_hash,
+        last_update_ts: snapshot.source_ts,
+        sequence: 1,
+      };
+      this.localBooks.set(snapshot.asset_id, localBook);
+
+      // Emit full L2 snapshot
+      this.ctx.waitUntil(
+        this.sendToQueue("FULL_L2_QUEUE", this.env.FULL_L2_QUEUE, fullL2)
+      );
+      this.lastFullL2SnapshotTs.set(snapshot.asset_id, snapshot.source_ts);
+    }
+
+    // Update snapshot with correct values from local state
+    const finalSnapshot: BBOSnapshot = {
+      ...snapshot,
+      condition_id: conditionId,
+      tick_size: tickSize,
+      ingestion_ts: ingestionTs,
+    };
+
+    // Check for duplicates before buffering
+    const cached = this.lastQuotes.get(snapshot.asset_id);
+    if (
+      cached &&
+      cached.bestBid === finalSnapshot.best_bid &&
+      cached.bestAsk === finalSnapshot.best_ask
+    ) {
+      return; // Duplicate
+    }
+
+    // Update quote cache
+    this.lastQuotes.set(snapshot.asset_id, {
+      bestBid: finalSnapshot.best_bid,
+      bestAsk: finalSnapshot.best_ask,
+    });
+
+    // Buffer for direct ClickHouse write
+    this.bufferSnapshot(finalSnapshot);
+
+    // Evaluate triggers
+    this.evaluateTriggersSync(finalSnapshot);
+  }
+
+  /**
+   * CANONICAL PRICE CHANGE HANDLER
+   * Handles level changes from any market using connector normalization.
+   */
+  private handleCanonicalPriceChange(
+    connector: MarketConnector,
+    raw: unknown,
+    ingestionTs: number
+  ): void {
+    const levelChanges = connector.normalizeLevelChange(raw);
+    if (!levelChanges || levelChanges.length === 0) return;
+
+    // Group by asset
+    const byAsset = new Map<string, typeof levelChanges>();
+    for (const change of levelChanges) {
+      if (!byAsset.has(change.asset_id)) {
+        byAsset.set(change.asset_id, []);
+      }
+      byAsset.get(change.asset_id)!.push(change);
+    }
+
+    // Process each asset's changes
+    for (const [assetId, changes] of byAsset) {
+      const localBook = this.localBooks.get(assetId);
+      if (!localBook) {
+        this.trackMissingBook(assetId);
+        continue;
+      }
+
+      // Apply changes to local book
+      for (const change of changes) {
+        const book = change.side === "BUY" ? localBook.bids : localBook.asks;
+        if (change.new_size === 0) {
+          book.delete(change.price);
+        } else {
+          book.set(change.price, change.new_size);
+        }
+        if (change.book_hash) {
+          localBook.last_hash = change.book_hash;
+        }
+      }
+
+      localBook.sequence++;
+      localBook.last_update_ts = changes[0]?.source_ts || ingestionTs;
+
+      // Buffer level changes (sampled)
+      if (Math.random() < 0.1) {
+        this.bufferLevelChange(changes);
+      }
+
+      // Extract and emit BBO
+      const bestBid = this.findBestBid(localBook.bids);
+      const bestAsk = this.findBestAsk(localBook.asks);
+      const bidSize = bestBid !== null ? localBook.bids.get(bestBid) ?? null : null;
+      const askSize = bestAsk !== null ? localBook.asks.get(bestAsk) ?? null : null;
+
+      const conditionId = this.assetToMarket.get(assetId) || localBook.condition_id;
+      const snapshot = this.extractBBOSnapshot(
+        assetId,
+        conditionId,
+        localBook.last_update_ts,
+        ingestionTs,
+        bestBid,
+        bestAsk,
+        bidSize,
+        askSize,
+        localBook.last_hash,
+        localBook.tick_size,
+        localBook.sequence
+      );
+
+      if (snapshot) {
+        this.bufferSnapshot(snapshot);
+        this.evaluateTriggersSync(snapshot);
+      }
+    }
+  }
+
+  /**
+   * CANONICAL TRADE HANDLER
+   * Handles trade events from any market using connector normalization.
+   */
+  private handleCanonicalTrade(
+    connector: MarketConnector,
+    raw: unknown,
+    ingestionTs: number
+  ): void {
+    const trade = connector.normalizeTrade(raw);
+    if (!trade) return;
+
+    // Update with correct condition ID from local state
+    const conditionId = this.assetToMarket.get(trade.asset_id) || trade.condition_id;
+    const finalTrade: TradeTick = {
+      ...trade,
+      condition_id: conditionId,
+      ingestion_ts: ingestionTs,
+    };
+
+    // Buffer for direct ClickHouse write
+    this.bufferTrade(finalTrade);
   }
 
   private removeAsset(assetId: string): void {
@@ -1393,14 +1688,13 @@ export class OrderbookManager extends DurableObject<Env> {
         !state.subscriptionSent
       ) {
         try {
-          state.ws.send(
-            JSON.stringify({
-              assets_ids: Array.from(state.assets),
-              type: "market",
-            })
-          );
+          // ADAPTER-DRIVEN: Use connector's subscription message format
+          const assetList = Array.from(state.assets);
+          const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
+            ?? JSON.stringify({ assets_ids: assetList, type: "market" });
+          state.ws.send(subscriptionMsg);
           state.subscriptionSent = true;
-          console.log(`[WS ${connId}] Subscription synced for ${state.assets.size} assets`);
+          console.log(`[WS ${connId}] Subscription synced for ${state.assets.size} assets (market: ${state.marketSource})`);
         } catch (error) {
           console.error(`[WS ${connId}] Failed to send subscription:`, error);
           state.subscriptionSent = false;
@@ -1453,13 +1747,12 @@ export class OrderbookManager extends DurableObject<Env> {
 
           // If subscription wasn't sent yet (e.g., after INVALID OPERATION), try again
           if (!state.subscriptionSent && state.assets.size > 0) {
-            console.log(`[WS ${connId}] Retrying subscription for ${state.assets.size} assets`);
-            state.ws.send(
-              JSON.stringify({
-                assets_ids: Array.from(state.assets),
-                type: "market",
-              })
-            );
+            console.log(`[WS ${connId}] Retrying subscription for ${state.assets.size} assets (market: ${state.marketSource})`);
+            // ADAPTER-DRIVEN: Use connector's subscription message format
+            const assetList = Array.from(state.assets);
+            const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
+              ?? JSON.stringify({ assets_ids: assetList, type: "market" });
+            state.ws.send(subscriptionMsg);
             state.subscriptionSent = true;
           }
         } catch (error) {

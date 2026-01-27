@@ -1,12 +1,13 @@
 // src/adapters/polymarket/connector.ts
 // Polymarket adapter implementing MarketConnector interface (~150 lines)
 
-import type { MarketConnector, LocationHint } from "../base-connector";
-import type { BBOSnapshot, TradeTick, OrderbookLevelChange } from "../../types/orderbook";
+import type { MarketConnector, LocationHint, ParsedMarketEvent, MarketEventType } from "../base-connector";
+import type { BBOSnapshot, TradeTick, OrderbookLevelChange, FullL2Snapshot } from "../../types/orderbook";
 import type {
   PolymarketBookEvent,
   PolymarketPriceChangeEvent,
   PolymarketLastTradePriceEvent,
+  PolymarketWSEvent,
 } from "./types";
 
 /**
@@ -31,6 +32,38 @@ export class PolymarketConnector implements MarketConnector {
   disconnect(ws: WebSocket): void {
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
       ws.close(1000, "Client disconnect");
+    }
+  }
+
+  parseMessage(data: string): ParsedMarketEvent | null {
+    // Handle Polymarket protocol messages
+    if (data === "PONG") {
+      return null; // Heartbeat response, ignore
+    }
+    if (data === "INVALID OPERATION") {
+      return { type: "unknown", raw: data }; // Will be handled specially by DO
+    }
+    if (!data.startsWith("{") && !data.startsWith("[")) {
+      return null; // Non-JSON, ignore
+    }
+
+    try {
+      const event = JSON.parse(data) as PolymarketWSEvent;
+
+      // Map Polymarket event types to canonical types
+      const typeMap: Record<string, MarketEventType> = {
+        book: "book",
+        price_change: "price_change",
+        last_trade_price: "trade",
+        tick_size_change: "tick_size",
+      };
+
+      const type = typeMap[event.event_type] || "unknown";
+      const assetId = "asset_id" in event ? event.asset_id : undefined;
+
+      return { type, raw: event, assetId };
+    } catch {
+      return null; // Parse error
     }
   }
 
@@ -87,6 +120,46 @@ export class PolymarketConnector implements MarketConnector {
       mid_price: midPrice,
       spread_bps: spreadBps,
       tick_size: 0.01, // Default, should be overridden from market config
+    };
+  }
+
+  normalizeFullL2(
+    raw: unknown,
+    conditionId: string,
+    tickSize: number,
+    negRisk?: boolean,
+    orderMinSize?: number
+  ): FullL2Snapshot | null {
+    const event = raw as PolymarketBookEvent;
+    if (!event || event.event_type !== "book") return null;
+
+    const sourceTs = parseInt(event.timestamp);
+    const ingestionTs = Date.now() * 1000;
+
+    // Parse all levels
+    const bids = event.bids.map((b) => ({
+      price: parseFloat(b.price),
+      size: parseFloat(b.size),
+    }));
+    const asks = event.asks.map((a) => ({
+      price: parseFloat(a.price),
+      size: parseFloat(a.size),
+    }));
+
+    return {
+      market_source: this.marketSource as "polymarket",
+      asset_id: event.asset_id,
+      token_id: event.asset_id,
+      condition_id: conditionId || event.market,
+      source_ts: sourceTs,
+      ingestion_ts: ingestionTs,
+      book_hash: event.hash,
+      bids,
+      asks,
+      tick_size: tickSize,
+      sequence_number: 1,
+      neg_risk: negRisk,
+      order_min_size: orderMinSize,
     };
   }
 

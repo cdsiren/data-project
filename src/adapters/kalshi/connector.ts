@@ -2,8 +2,8 @@
 // Kalshi adapter stub implementing MarketConnector interface (~100 lines)
 // TODO: Implement full Kalshi WebSocket integration
 
-import type { MarketConnector, LocationHint } from "../base-connector";
-import type { BBOSnapshot, TradeTick, OrderbookLevelChange } from "../../types/orderbook";
+import type { MarketConnector, LocationHint, ParsedMarketEvent, MarketEventType } from "../base-connector";
+import type { BBOSnapshot, TradeTick, OrderbookLevelChange, FullL2Snapshot } from "../../types/orderbook";
 
 /**
  * Kalshi WebSocket connector (stub implementation).
@@ -42,6 +42,35 @@ export class KalshiConnector implements MarketConnector {
     }
   }
 
+  parseMessage(data: string): ParsedMarketEvent | null {
+    // TODO: Implement Kalshi message parsing
+    // Kalshi message types:
+    // - orderbook_snapshot: Full book
+    // - orderbook_delta: Level changes
+    // - trade: Trade execution
+    // - subscribed: Subscription confirmation
+    if (!data.startsWith("{") && !data.startsWith("[")) {
+      return null; // Non-JSON, ignore
+    }
+
+    try {
+      const event = JSON.parse(data) as { type: string; msg?: { market_ticker?: string } };
+
+      const typeMap: Record<string, MarketEventType> = {
+        orderbook_snapshot: "book",
+        orderbook_delta: "price_change",
+        trade: "trade",
+      };
+
+      const type = typeMap[event.type] || "unknown";
+      const assetId = event.msg?.market_ticker;
+
+      return { type, raw: event, assetId };
+    } catch {
+      return null; // Parse error
+    }
+  }
+
   normalizeBookEvent(raw: unknown): BBOSnapshot | null {
     // TODO: Implement Kalshi book event normalization
     // Kalshi sends orderbook updates in a different format:
@@ -56,6 +85,18 @@ export class KalshiConnector implements MarketConnector {
     //   }
     // }
     console.warn("[KalshiConnector] normalizeBookEvent not implemented");
+    return null;
+  }
+
+  normalizeFullL2(
+    raw: unknown,
+    conditionId: string,
+    tickSize: number,
+    negRisk?: boolean,
+    orderMinSize?: number
+  ): FullL2Snapshot | null {
+    // TODO: Implement Kalshi full L2 normalization
+    console.warn("[KalshiConnector] normalizeFullL2 not implemented");
     return null;
   }
 
