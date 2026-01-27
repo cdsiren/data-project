@@ -250,3 +250,45 @@ SETTINGS index_granularity = 8192;
 
 -- Index for debugging by error message
 ALTER TABLE trading_data.dead_letter_messages ADD INDEX IF NOT EXISTS idx_error error TYPE tokenbf_v1(10240, 3, 0) GRANULARITY 4;
+
+
+-- ============================================================
+-- MARKET METADATA - Market info from Gamma API
+-- Used for joining with orderbook data to get market context
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS trading_data.market_metadata (
+    id String,
+    question String,
+    condition_id String,
+    slug String,
+    resolution_source String,
+    end_date DateTime64(3, 'UTC'),
+    start_date DateTime64(3, 'UTC'),
+    created_at DateTime64(3, 'UTC'),
+    submitted_by String,
+    resolved_by String,
+    restricted UInt8,
+    enable_order_book UInt8,
+    order_price_min_tick_size Float64,
+    order_min_size Float64,
+    clob_token_ids String,              -- JSON array of token IDs
+    neg_risk UInt8,
+    neg_risk_market_id String,
+    neg_risk_request_id String
+)
+ENGINE = ReplacingMergeTree()
+ORDER BY (condition_id, id);
+
+
+-- ============================================================
+-- MARKET EVENTS - Event metadata linked to markets
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS trading_data.market_events (
+    event_id String,
+    market_id String,
+    title String
+)
+ENGINE = ReplacingMergeTree()
+ORDER BY (event_id, market_id);

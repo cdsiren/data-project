@@ -1,6 +1,6 @@
 import { Hono, Context, Next } from "hono";
 import { cors } from "hono/cors";
-import { Env, DeadLetterMessage } from "./types";
+import { Env, DeadLetterMessage, PolymarketMarket } from "./types";
 import type {
   BBOSnapshot,
   GapBackfillJob,
@@ -16,10 +16,19 @@ import { tradeTickConsumer } from "./consumers/trade-tick-consumer";
 import { levelChangeConsumer } from "./consumers/level-change-consumer";
 import { fullL2SnapshotConsumer } from "./consumers/full-l2-snapshot-consumer";
 import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
-import { MarketLifecycleService, type MarketLifecycleWebhook } from "./services/market-lifecycle";
+import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { MarketCacheService } from "./services/market-cache";
 import { MarketCleanupService } from "./services/market-cleanup";
 import { DB_CONFIG } from "./config/database";
+
+// Helper to parse token IDs from JSON string
+function parseTokenIds(clobTokenIds: string): string[] {
+  try {
+    return JSON.parse(clobTokenIds);
+  } catch {
+    return [clobTokenIds];
+  }
+}
 
 // ============================================================
 // SHARD CONFIGURATION
@@ -756,6 +765,35 @@ app.post("/admin/migrate", authMiddleware, async (c) => {
       sequence_number UInt64,
       latency_ms Float64 MATERIALIZED dateDiff('millisecond', source_ts, ingestion_ts)
     ) ENGINE = MergeTree() PARTITION BY toYYYYMM(source_ts) ORDER BY (asset_id, source_ts, sequence_number) TTL source_ts + INTERVAL 30 DAY SETTINGS index_granularity = 8192`,
+
+    // market_metadata table - stores market info from Gamma API for joining with orderbook data
+    `CREATE TABLE IF NOT EXISTS ${DB_CONFIG.DATABASE}.market_metadata (
+      id String,
+      question String,
+      condition_id String,
+      slug String,
+      resolution_source String,
+      end_date DateTime64(3, 'UTC'),
+      start_date DateTime64(3, 'UTC'),
+      created_at DateTime64(3, 'UTC'),
+      submitted_by String,
+      resolved_by String,
+      restricted UInt8,
+      enable_order_book UInt8,
+      order_price_min_tick_size Float64,
+      order_min_size Float64,
+      clob_token_ids String,
+      neg_risk UInt8,
+      neg_risk_market_id String,
+      neg_risk_request_id String
+    ) ENGINE = ReplacingMergeTree() ORDER BY (condition_id, id)`,
+
+    // market_events table - stores event metadata linked to markets
+    `CREATE TABLE IF NOT EXISTS ${DB_CONFIG.DATABASE}.market_events (
+      event_id String,
+      market_id String,
+      title String
+    ) ENGINE = ReplacingMergeTree() ORDER BY (event_id, market_id)`,
   ];
 
   // Materialized views for OHLC aggregation (run after base tables)
@@ -1002,16 +1040,8 @@ app.post("/admin/bootstrap-markets", authMiddleware, async (c) => {
       return c.json({ error: "Gamma API error", status: response.status }, 500);
     }
 
-    interface GammaMarketBootstrap {
-      conditionId: string;
-      clobTokenIds: string;
-      orderPriceMinTickSize: number;
-      negRisk: boolean;
-      orderMinSize: number;
-      question: string;
-    }
-
-    const markets = (await response.json()) as GammaMarketBootstrap[];
+    // Use full PolymarketMarket type to get all fields needed for metadata sync
+    const markets = (await response.json()) as PolymarketMarket[];
 
     const results: Array<{
       condition_id: string;
@@ -1026,13 +1056,7 @@ app.post("/admin/bootstrap-markets", authMiddleware, async (c) => {
 
     // Subscribe each market to its appropriate shard
     for (const market of markets) {
-      let tokenIds: string[] = [];
-      try {
-        tokenIds = JSON.parse(market.clobTokenIds);
-      } catch {
-        tokenIds = [market.clobTokenIds];
-      }
-
+      const tokenIds = parseTokenIds(market.clobTokenIds);
       const shardId = getShardForMarket(market.conditionId);
       const stub = getOrderbookManagerStub(c.env, shardId);
 
@@ -1049,24 +1073,28 @@ app.post("/admin/bootstrap-markets", authMiddleware, async (c) => {
             market_source: "polymarket",
           }),
         });
-
-        results.push({
-          condition_id: market.conditionId,
-          shard: shardId,
-          tokens: tokenIds.length,
-          status: "subscribed",
-        });
+        results.push({ condition_id: market.conditionId, shard: shardId, tokens: tokenIds.length, status: "subscribed" });
         subscribed++;
       } catch (err) {
-        results.push({
-          condition_id: market.conditionId,
-          shard: shardId,
-          tokens: tokenIds.length,
-          status: "failed",
-          error: String(err),
-        });
+        results.push({ condition_id: market.conditionId, shard: shardId, tokens: tokenIds.length, status: "failed", error: String(err) });
         failed++;
       }
+    }
+
+    // Sync metadata to ClickHouse and cache separately
+    let clickhouseSynced = 0;
+    let cacheSynced = 0;
+    try {
+      await insertMarketsIntoClickHouse(markets, c.env);
+      clickhouseSynced = markets.length;
+    } catch (err) {
+      console.error("[Bootstrap] ClickHouse sync failed:", err);
+    }
+    try {
+      await updateMarketCache(markets, c.env);
+      cacheSynced = markets.length;
+    } catch (err) {
+      console.error("[Bootstrap] Cache sync failed:", err);
     }
 
     return c.json({
@@ -1075,6 +1103,8 @@ app.post("/admin/bootstrap-markets", authMiddleware, async (c) => {
         total_markets: markets.length,
         subscribed,
         failed,
+        metadata_synced: clickhouseSynced,
+        cache_synced: cacheSynced,
         shards_used: new Set(results.map((r) => r.shard)).size,
       },
       results,
@@ -1784,7 +1814,7 @@ async function getTotalSubscriptions(env: Env): Promise<number> {
 /**
  * Bootstrap all active markets from Gamma API
  */
-async function bootstrapActiveMarkets(env: Env): Promise<{ subscribed: number; errors: number }> {
+async function bootstrapActiveMarkets(env: Env): Promise<{ subscribed: number; errors: number; metadataSynced: number }> {
   console.log("[Bootstrap] Fetching all active markets from Gamma API");
 
   const response = await fetch(
@@ -1794,31 +1824,18 @@ async function bootstrapActiveMarkets(env: Env): Promise<{ subscribed: number; e
 
   if (!response.ok) {
     console.error("[Bootstrap] Gamma API error:", response.status);
-    return { subscribed: 0, errors: 1 };
+    return { subscribed: 0, errors: 1, metadataSynced: 0, cacheSynced: 0 };
   }
 
-  interface GammaMarket {
-    conditionId: string;
-    clobTokenIds: string;
-    orderPriceMinTickSize: number;
-    negRisk: boolean;
-    orderMinSize: number;
-  }
-
-  const markets = (await response.json()) as GammaMarket[];
+  // Use full PolymarketMarket type to get all fields needed for metadata sync
+  const markets = (await response.json()) as PolymarketMarket[];
   console.log(`[Bootstrap] Found ${markets.length} active markets`);
 
   let subscribed = 0;
   let errors = 0;
 
   for (const market of markets) {
-    let tokenIds: string[] = [];
-    try {
-      tokenIds = JSON.parse(market.clobTokenIds);
-    } catch {
-      tokenIds = [market.clobTokenIds];
-    }
-
+    const tokenIds = parseTokenIds(market.clobTokenIds);
     const shardId = getShardForMarket(market.conditionId);
     const stub = getOrderbookManagerStub(env, shardId);
 
@@ -1836,12 +1853,29 @@ async function bootstrapActiveMarkets(env: Env): Promise<{ subscribed: number; e
         }),
       });
       subscribed++;
-    } catch {
+    } catch (err) {
+      console.error(`[Bootstrap] Failed to subscribe ${market.conditionId}:`, err);
       errors++;
     }
   }
 
-  return { subscribed, errors };
+  // Sync market metadata to ClickHouse and cache separately
+  let clickhouseSynced = 0;
+  let cacheSynced = 0;
+  try {
+    await insertMarketsIntoClickHouse(markets, env);
+    clickhouseSynced = markets.length;
+  } catch (err) {
+    console.error("[Bootstrap] ClickHouse sync failed:", err);
+  }
+  try {
+    await updateMarketCache(markets, env);
+    cacheSynced = markets.length;
+  } catch (err) {
+    console.error("[Bootstrap] Cache sync failed:", err);
+  }
+
+  return { subscribed, errors, metadataSynced: clickhouseSynced, cacheSynced };
 }
 
 async function scheduledHandler(
@@ -1862,7 +1896,7 @@ async function scheduledHandler(
       console.log("[Scheduled] No markets subscribed - running automatic bootstrap");
       ctx.waitUntil(
         bootstrapActiveMarkets(env).then((result) => {
-          console.log(`[Scheduled] Bootstrap complete: ${result.subscribed} subscribed, ${result.errors} errors`);
+          console.log(`[Scheduled] Bootstrap complete: ${result.subscribed} subscribed, ${result.errors} errors, ${result.metadataSynced} metadata, ${result.cacheSynced} cached`);
         })
       );
       return; // Skip lifecycle check on bootstrap run

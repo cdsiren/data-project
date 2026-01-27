@@ -496,4 +496,5 @@ async function updateMarketCache(
   }
 }
 
+export { insertMarketsIntoClickHouse, updateMarketCache };
 export type { MarketLifecycleEvent, MarketLifecycleWebhook };
