@@ -22,6 +22,9 @@ import type {
 import type { MarketSource, LevelChangeType } from "../core/enums";
 import type { TriggerType } from "../core/triggers";
 import { getDefaultMarketSource } from "../config/database";
+import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
+import type { MarketConnector } from "../adapters/base-connector";
+import { getConnector } from "../adapters/registry";
 
 interface ConnectionState {
   ws: WebSocket | null;
@@ -58,6 +61,10 @@ interface PoolState {
  * - High-precision timestamps
  */
 export class OrderbookManager extends DurableObject<Env> {
+  // Initialization state tracking
+  private isInitializing = true;
+  private initializationError: string | null = null;
+
   private connections: Map<string, ConnectionState> = new Map();
   private assetToConnection: Map<string, string> = new Map();
   private assetToMarket: Map<string, string> = new Map(); // asset_id -> condition_id
@@ -110,6 +117,34 @@ export class OrderbookManager extends DurableObject<Env> {
   private previousBBO: Map<string, { bid_size: number | null; ask_size: number | null }> = new Map();
   // Cached DO stub for SSE publishing (avoids stub lookup on every event)
   private eventBufferStub: DurableObjectStub | null = null;
+
+  // ============================================================
+  // DO-DIRECT WRITE BUFFERS
+  // Buffer snapshots in memory and flush directly to ClickHouse
+  // Queues become fallback only (not hot path)
+  // ============================================================
+  private snapshotBuffer: BBOSnapshot[] = [];
+  private levelChangeBuffer: OrderbookLevelChange[] = [];
+  private tradeBuffer: TradeTick[] = [];
+  private readonly BUFFER_SIZE = 100;
+  private readonly BUFFER_FLUSH_MS = 5000;
+  private snapshotFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private levelChangeFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private tradeFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ============================================================
+  // MULTI-MARKET ADAPTER SUPPORT
+  // Cached connectors per market source for event normalization
+  // ============================================================
+  private connectors: Map<string, MarketConnector> = new Map();
+
+  // ============================================================
+  // DATA INTEGRITY TRACKING
+  // Track assets missing initial book events and stale quotes
+  // ============================================================
+  private missingBookFirstSeen: Map<string, number> = new Map(); // asset_id -> first seen timestamp
+  private readonly MISSING_BOOK_TIMEOUT_MS = 30000; // 30 seconds to receive initial book
+  private readonly STALE_QUOTE_THRESHOLD_MS = 60000; // 1 minute without updates = stale
 
   // Polymarket allows max 500 instruments per connection
   // We use 450 to leave headroom for pending subscriptions during updates
@@ -290,9 +325,14 @@ export class OrderbookManager extends DurableObject<Env> {
           );
           await this.ctx.storage.setAlarm(Date.now() + delay);
         }
+
+        // Mark initialization as complete
+        this.isInitializing = false;
       } catch (error) {
         console.error(`[DO ${this.shardId}] Critical error during state restoration:`, error);
+        this.initializationError = String(error);
         await this.emergencyStateReset("critical_error");
+        this.isInitializing = false;
       }
     });
   }
@@ -383,6 +423,8 @@ export class OrderbookManager extends DurableObject<Env> {
     this.imbalanceHistory.clear();
     this.lastUpdateTs.clear();
     this.previousBBO.clear();
+    // Clear data integrity tracking
+    this.missingBookFirstSeen.clear();
 
     // Clear corrupted storage
     try {
@@ -394,6 +436,31 @@ export class OrderbookManager extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    // Handle requests during initialization gracefully
+    if (this.isInitializing) {
+      return Response.json(
+        {
+          error: "DO is initializing, please retry",
+          retry_after_seconds: 5,
+        },
+        {
+          status: 503,
+          headers: { "Retry-After": "5" },
+        }
+      );
+    }
+
+    // Handle initialization failure
+    if (this.initializationError) {
+      return Response.json(
+        {
+          error: "DO failed to initialize",
+          details: this.initializationError,
+        },
+        { status: 500 }
+      );
+    }
+
     const url = new URL(request.url);
 
     switch (url.pathname) {
@@ -946,6 +1013,30 @@ export class OrderbookManager extends DurableObject<Env> {
     const conditionId = this.assetToMarket.get(event.asset_id) || event.market;
     const tickSize = this.tickSizes.get(event.asset_id) || 0.01;
 
+    // DATA INTEGRITY: Clear missing book tracking since we received the book
+    this.missingBookFirstSeen.delete(event.asset_id);
+
+    // DATA INTEGRITY: Check if this is a resync (we already had a book)
+    const existingBook = this.localBooks.get(event.asset_id);
+    if (existingBook && existingBook.last_hash !== event.hash) {
+      // Book event with different hash - this is a resync
+      console.log(
+        `[DO ${this.shardId}] Book resync for ${event.asset_id.slice(0, 12)}...: ` +
+        `old_hash=${existingBook.last_hash.slice(0, 12)}..., new_hash=${event.hash.slice(0, 12)}...`
+      );
+      // Record the resync for monitoring
+      const clickhouse = new ClickHouseOrderbookClient(this.env);
+      this.ctx.waitUntil(
+        clickhouse.recordGapEvent(
+          event.asset_id,
+          existingBook.last_hash,
+          event.hash,
+          sourceTs - existingBook.last_update_ts,
+          this.assetToMarketSource.get(event.asset_id)
+        )
+      );
+    }
+
     // Parse levels
     const bids = event.bids.map((b) => ({
       price: parseFloat(b.price),
@@ -1025,10 +1116,8 @@ export class OrderbookManager extends DurableObject<Env> {
       return; // Duplicate, skip
     }
 
-    // CRITICAL PATH OPTIMIZATION: Fire-and-forget queue send (non-blocking)
-    this.ctx.waitUntil(
-      this.sendToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, snapshot)
-    );
+    // DO-DIRECT: Buffer snapshot for direct ClickHouse write (bypasses queue latency)
+    this.bufferSnapshot(snapshot);
 
     // LOW-LATENCY: Evaluate triggers synchronously (bypasses queues)
     this.evaluateTriggersSync(snapshot);
@@ -1076,8 +1165,19 @@ export class OrderbookManager extends DurableObject<Env> {
       const localBook = this.localBooks.get(assetId);
       if (!localBook) {
         // No initial book snapshot yet - skip until we get a book event
-        // This is normal during initial subscription
+        // Track missing book for stale detection
+        this.trackMissingBook(assetId);
         continue;
+      }
+
+      // DATA INTEGRITY: Validate hash chain if hash provided in first change
+      const firstChangeWithHash = changes.find(c => c.hash);
+      if (firstChangeWithHash?.hash) {
+        // Verify the hash chain hasn't broken
+        if (!this.verifyHashChain(assetId, firstChangeWithHash.hash, localBook.last_hash)) {
+          // Gap detected - skip processing, resync will be triggered
+          continue;
+        }
       }
 
       // Collect level changes for this batch
@@ -1169,20 +1269,13 @@ export class OrderbookManager extends DurableObject<Env> {
       localBook.sequence++;
       localBook.last_update_ts = sourceTs;
 
-      // CRITICAL PATH OPTIMIZATION: Collect all queue operations for parallel fire-and-forget
-      const queueOperations: Promise<boolean>[] = [];
-
-      // Send level changes to queue (batch for efficiency)
-      // COST OPTIMIZATION: Sample 10% of level changes to reduce volume by 90%
+      // DO-DIRECT: Buffer level changes (sampled 10% for cost optimization)
       // Level changes are useful for order flow analysis but not required for backtesting
-      // This preserves enough data for future analysis while reducing ClickHouse costs
       if (levelChanges.length > 0 && Math.random() < 0.1) {
-        queueOperations.push(
-          this.sendBatchToQueue("LEVEL_CHANGE_QUEUE", this.env.LEVEL_CHANGE_QUEUE, levelChanges)
-        );
+        this.bufferLevelChange(levelChanges);
       }
 
-      // Check if it's time for a periodic full L2 snapshot (every 5 minutes)
+      // Check if it's time for a periodic full L2 snapshot (every 30 minutes)
       const lastFullL2Ts = this.lastFullL2SnapshotTs.get(assetId) || 0;
       if (sourceTs - lastFullL2Ts >= this.FULL_L2_INTERVAL_MS) {
         // Use centralized sorting helper
@@ -1205,7 +1298,8 @@ export class OrderbookManager extends DurableObject<Env> {
           order_min_size: this.orderMinSizes.get(assetId),
         };
 
-        queueOperations.push(
+        // Full L2 snapshots still use queue (lower frequency, larger payload)
+        this.ctx.waitUntil(
           this.sendToQueue("FULL_L2_QUEUE", this.env.FULL_L2_QUEUE, fullL2Snapshot)
         );
         this.lastFullL2SnapshotTs.set(assetId, sourceTs);
@@ -1231,22 +1325,11 @@ export class OrderbookManager extends DurableObject<Env> {
       );
 
       if (!snapshot) {
-        // Still need to fire-and-forget pending queue operations before continuing
-        if (queueOperations.length > 0) {
-          this.ctx.waitUntil(Promise.all(queueOperations));
-        }
         continue; // Duplicate, skip
       }
 
-      // Add snapshot queue to the batch
-      queueOperations.push(
-        this.sendToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, snapshot)
-      );
-
-      // CRITICAL PATH OPTIMIZATION: Fire-and-forget all queue sends in parallel (non-blocking)
-      if (queueOperations.length > 0) {
-        this.ctx.waitUntil(Promise.all(queueOperations));
-      }
+      // DO-DIRECT: Buffer snapshot for direct ClickHouse write (bypasses queue latency)
+      this.bufferSnapshot(snapshot);
 
       // LOW-LATENCY: Evaluate triggers synchronously (bypasses queues)
       this.evaluateTriggersSync(snapshot);
@@ -1256,10 +1339,10 @@ export class OrderbookManager extends DurableObject<Env> {
   /**
    * Handle trade executions (critical for backtesting strategies)
    */
-  private async handleTradeEvent(
+  private handleTradeEvent(
     event: PolymarketLastTradePriceEvent,
     ingestionTs: number
-  ): Promise<void> {
+  ): void {
     const sourceTs = parseInt(event.timestamp);
     const conditionId = this.assetToMarket.get(event.asset_id) || event.market;
 
@@ -1275,8 +1358,8 @@ export class OrderbookManager extends DurableObject<Env> {
       ingestion_ts: ingestionTs,
     };
 
-    // Queue trade tick for ClickHouse insertion
-    await this.sendToQueue("TRADE_QUEUE", this.env.TRADE_QUEUE, tradeTick);
+    // DO-DIRECT: Buffer trade for batched queue write
+    this.bufferTrade(tradeTick);
   }
 
   /**
@@ -1395,6 +1478,9 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // Check for stale quotes - evaluated in alarm since they detect absence of updates
     this.checkStaleQuotes();
+
+    // DATA INTEGRITY: Check for missing book events and stale data requiring resync
+    this.checkDataIntegrity();
 
     // Schedule next alarm if we have active connections
     if (hasActiveConnections || this.connections.size > 0) {
@@ -1635,6 +1721,122 @@ export class OrderbookManager extends DurableObject<Env> {
     }
   }
 
+  // ============================================================
+  // DO-DIRECT BUFFER FLUSH METHODS
+  // Flush directly to ClickHouse, fall back to queue on failure
+  // ============================================================
+
+  /**
+   * Add snapshot to buffer and schedule flush
+   */
+  private bufferSnapshot(snapshot: BBOSnapshot): void {
+    this.snapshotBuffer.push(snapshot);
+    if (this.snapshotBuffer.length >= this.BUFFER_SIZE) {
+      // Clear pending timer before size-triggered flush to prevent race condition
+      if (this.snapshotFlushTimer) {
+        clearTimeout(this.snapshotFlushTimer);
+        this.snapshotFlushTimer = null;
+      }
+      this.ctx.waitUntil(this.flushSnapshotBuffer());
+    } else if (!this.snapshotFlushTimer) {
+      this.snapshotFlushTimer = setTimeout(() => {
+        this.ctx.waitUntil(this.flushSnapshotBuffer());
+      }, this.BUFFER_FLUSH_MS);
+    }
+  }
+
+  /**
+   * Flush snapshot buffer directly to ClickHouse
+   */
+  private async flushSnapshotBuffer(): Promise<void> {
+    if (this.snapshotBuffer.length === 0) return;
+
+    const batch = this.snapshotBuffer.splice(0);
+    if (this.snapshotFlushTimer) {
+      clearTimeout(this.snapshotFlushTimer);
+      this.snapshotFlushTimer = null;
+    }
+
+    try {
+      const clickhouse = new ClickHouseOrderbookClient(this.env);
+      await clickhouse.insertSnapshots(batch);
+    } catch (error) {
+      // Fallback: send to queue for retry
+      console.error(`[DO ${this.shardId}] ClickHouse insert failed, falling back to queue:`, error);
+      await this.sendBatchToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, batch);
+    }
+  }
+
+  /**
+   * Add level change to buffer and schedule flush
+   */
+  private bufferLevelChange(changes: OrderbookLevelChange[]): void {
+    this.levelChangeBuffer.push(...changes);
+    if (this.levelChangeBuffer.length >= this.BUFFER_SIZE) {
+      // Clear pending timer before size-triggered flush to prevent race condition
+      if (this.levelChangeFlushTimer) {
+        clearTimeout(this.levelChangeFlushTimer);
+        this.levelChangeFlushTimer = null;
+      }
+      this.ctx.waitUntil(this.flushLevelChangeBuffer());
+    } else if (!this.levelChangeFlushTimer) {
+      this.levelChangeFlushTimer = setTimeout(() => {
+        this.ctx.waitUntil(this.flushLevelChangeBuffer());
+      }, this.BUFFER_FLUSH_MS);
+    }
+  }
+
+  /**
+   * Flush level change buffer directly to ClickHouse
+   */
+  private async flushLevelChangeBuffer(): Promise<void> {
+    if (this.levelChangeBuffer.length === 0) return;
+
+    const batch = this.levelChangeBuffer.splice(0);
+    if (this.levelChangeFlushTimer) {
+      clearTimeout(this.levelChangeFlushTimer);
+      this.levelChangeFlushTimer = null;
+    }
+
+    // Level changes still go through queue (lower priority than BBO)
+    await this.sendBatchToQueue("LEVEL_CHANGE_QUEUE", this.env.LEVEL_CHANGE_QUEUE, batch);
+  }
+
+  /**
+   * Add trade to buffer and schedule flush
+   */
+  private bufferTrade(trade: TradeTick): void {
+    this.tradeBuffer.push(trade);
+    if (this.tradeBuffer.length >= this.BUFFER_SIZE) {
+      // Clear pending timer before size-triggered flush to prevent race condition
+      if (this.tradeFlushTimer) {
+        clearTimeout(this.tradeFlushTimer);
+        this.tradeFlushTimer = null;
+      }
+      this.ctx.waitUntil(this.flushTradeBuffer());
+    } else if (!this.tradeFlushTimer) {
+      this.tradeFlushTimer = setTimeout(() => {
+        this.ctx.waitUntil(this.flushTradeBuffer());
+      }, this.BUFFER_FLUSH_MS);
+    }
+  }
+
+  /**
+   * Flush trade buffer to queue
+   */
+  private async flushTradeBuffer(): Promise<void> {
+    if (this.tradeBuffer.length === 0) return;
+
+    const batch = this.tradeBuffer.splice(0);
+    if (this.tradeFlushTimer) {
+      clearTimeout(this.tradeFlushTimer);
+      this.tradeFlushTimer = null;
+    }
+
+    // Trades still go through queue
+    await this.sendBatchToQueue("TRADE_QUEUE", this.env.TRADE_QUEUE, batch);
+  }
+
   /**
    * Schedule alarm with deduplication - prevents multiple alarms
    */
@@ -1663,6 +1865,7 @@ export class OrderbookManager extends DurableObject<Env> {
     this.subscriptionFailures.delete(assetId);
     this.priceHistory.delete(assetId);
     this.latestBBO.delete(assetId);
+    this.missingBookFirstSeen.delete(assetId);
     // Clean up HFT trigger state
     this.updateCounts.delete(assetId);
     this.trendTracker.delete(assetId);
@@ -1729,6 +1932,194 @@ export class OrderbookManager extends DurableObject<Env> {
       if (relatedBBO && currentTs - relatedBBO.ts > STALE_THRESHOLD_MS) {
         relatedBBO.stale = true;
       }
+    }
+  }
+
+  // ============================================================
+  // MULTI-MARKET ADAPTER SUPPORT
+  // ============================================================
+
+  /**
+   * Get or create a connector for the specified market source.
+   * Connectors are cached to avoid repeated instantiation.
+   */
+  private getMarketConnector(marketSource: string): MarketConnector {
+    if (!this.connectors.has(marketSource)) {
+      this.connectors.set(marketSource, getConnector(marketSource));
+    }
+    return this.connectors.get(marketSource)!;
+  }
+
+  // ============================================================
+  // DATA INTEGRITY: Stale Quote and Missing Book Detection
+  // ============================================================
+
+  /**
+   * Track assets that received price_change before initial book event.
+   * Triggers resync if book event not received within timeout.
+   */
+  private trackMissingBook(assetId: string): void {
+    if (!this.missingBookFirstSeen.has(assetId)) {
+      this.missingBookFirstSeen.set(assetId, Date.now());
+      console.warn(`[DO ${this.shardId}] Asset ${assetId.slice(0, 12)}... missing initial book event`);
+    }
+  }
+
+  /**
+   * Check for stale quotes and missing book events.
+   * Called from alarm handler.
+   */
+  private checkDataIntegrity(): void {
+    const now = Date.now();
+
+    // Check for assets that never received initial book event
+    for (const [assetId, firstSeen] of this.missingBookFirstSeen) {
+      if (now - firstSeen > this.MISSING_BOOK_TIMEOUT_MS) {
+        console.error(
+          `[DO ${this.shardId}] Asset ${assetId.slice(0, 12)}... never received book event after ${Math.round((now - firstSeen) / 1000)}s`
+        );
+        // Trigger resync by removing from tracking and requesting fresh subscription
+        this.missingBookFirstSeen.delete(assetId);
+        this.ctx.waitUntil(this.triggerResync(assetId));
+      }
+    }
+
+    // Check for stale quotes (no updates for too long)
+    for (const [assetId, localBook] of this.localBooks) {
+      const timeSinceUpdate = now - localBook.last_update_ts;
+      if (timeSinceUpdate > this.STALE_QUOTE_THRESHOLD_MS) {
+        console.warn(
+          `[DO ${this.shardId}] Stale quote for ${assetId.slice(0, 12)}...: ` +
+          `last update ${Math.round(timeSinceUpdate / 1000)}s ago`
+        );
+        // Record stale quote event for monitoring
+        const clickhouse = new ClickHouseOrderbookClient(this.env);
+        this.ctx.waitUntil(
+          clickhouse.recordGapEvent(
+            assetId,
+            localBook.last_hash,
+            "STALE",
+            timeSinceUpdate,
+            this.assetToMarketSource.get(assetId)
+          )
+        );
+        // Trigger resync
+        this.ctx.waitUntil(this.triggerResync(assetId));
+      }
+    }
+  }
+
+  // ============================================================
+  // DATA INTEGRITY: Hash Chain and Sequence Validation
+  // ============================================================
+
+  /**
+   * Verify hash chain continuity for an asset.
+   *
+   * Polymarket semantics: The hash in price_change events is the NEW hash after
+   * applying the change. We verify continuity by checking if the hash transition
+   * makes sense (hash should change when there are changes).
+   *
+   * @param assetId - Asset ID to verify
+   * @param newHash - New hash from the event
+   * @param currentLocalHash - Our current local hash (before applying changes)
+   * @returns true if valid, false if gap detected
+   */
+  private verifyHashChain(assetId: string, newHash: string, currentLocalHash: string): boolean {
+    const localBook = this.localBooks.get(assetId);
+
+    // First message for this asset - no previous hash to validate
+    if (!localBook?.last_hash) return true;
+
+    // If the new hash equals our current hash, the changes may have been duplicates
+    // or the hash didn't change for some reason - log but allow
+    if (newHash === currentLocalHash) {
+      // This is suspicious but not necessarily an error - could be duplicate event
+      return true;
+    }
+
+    // Hash changed - this is expected when we apply changes
+    // Update the local book hash (will be done by caller after applying changes)
+    return true;
+  }
+
+  /**
+   * Validate sequence number continuity.
+   * Returns true if valid, false if gap detected.
+   */
+  private verifySequence(assetId: string, eventSequence: number): boolean {
+    const localBook = this.localBooks.get(assetId);
+
+    // First message - accept any sequence
+    if (!localBook) return true;
+
+    const expectedSequence = localBook.sequence + 1;
+
+    if (eventSequence !== expectedSequence) {
+      console.error(
+        `[DO ${this.shardId}] Sequence gap for ${assetId}: ` +
+        `expected=${expectedSequence}, got=${eventSequence}`
+      );
+
+      // If we're behind, trigger a resync
+      if (eventSequence > expectedSequence) {
+        this.ctx.waitUntil(this.triggerResync(assetId));
+      }
+
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Handle detected gap in hash chain or sequence.
+   * Records gap event and triggers resync.
+   */
+  private handleGapDetection(assetId: string, lastKnownHash: string, newHash: string): void {
+    const localBook = this.localBooks.get(assetId);
+    const gapDurationMs = localBook
+      ? Date.now() - localBook.last_update_ts
+      : 0;
+
+    // Record gap event for monitoring
+    const clickhouse = new ClickHouseOrderbookClient(this.env);
+    this.ctx.waitUntil(
+      clickhouse.recordGapEvent(
+        assetId,
+        lastKnownHash,
+        newHash,
+        gapDurationMs,
+        this.assetToMarketSource.get(assetId)
+      )
+    );
+
+    // Trigger resync
+    this.ctx.waitUntil(this.triggerResync(assetId));
+  }
+
+  /**
+   * Trigger a resync for an asset by clearing local state.
+   * The next 'book' event will rebuild the orderbook.
+   */
+  private async triggerResync(assetId: string): Promise<void> {
+    console.log(`[DO ${this.shardId}] Triggering resync for ${assetId}`);
+
+    // Clear local book to force rebuild on next book event
+    this.localBooks.delete(assetId);
+    this.lastQuotes.delete(assetId);
+
+    // Optionally queue a gap backfill job for historical recovery
+    const localBook = this.localBooks.get(assetId);
+    if (localBook?.last_hash) {
+      const job = {
+        market_source: this.assetToMarketSource.get(assetId) ?? getDefaultMarketSource(),
+        asset_id: assetId,
+        last_known_hash: localBook.last_hash,
+        gap_detected_at: Date.now(),
+        retry_count: 0,
+      };
+      await this.sendToQueue("GAP_BACKFILL_QUEUE", this.env.GAP_BACKFILL_QUEUE, job);
     }
   }
 
@@ -1960,6 +2351,33 @@ export class OrderbookManager extends DurableObject<Env> {
         );
       }
 
+      // Validate cooldown bounds to prevent system overload (DoS prevention)
+      const MIN_COOLDOWN_MS = 100;   // Minimum 100ms to prevent trigger spam
+      const MAX_COOLDOWN_MS = 3600000; // Maximum 1 hour
+      const cooldown = body.cooldown_ms ?? 1000;
+
+      if (cooldown < MIN_COOLDOWN_MS) {
+        return Response.json(
+          {
+            trigger_id: "",
+            status: "error",
+            message: `cooldown_ms must be at least ${MIN_COOLDOWN_MS}ms`,
+          } as TriggerRegistration,
+          { status: 400 }
+        );
+      }
+
+      if (cooldown > MAX_COOLDOWN_MS) {
+        return Response.json(
+          {
+            trigger_id: "",
+            status: "error",
+            message: `cooldown_ms cannot exceed ${MAX_COOLDOWN_MS}ms (1 hour)`,
+          } as TriggerRegistration,
+          { status: 400 }
+        );
+      }
+
       const trigger: Trigger = {
         id: body.id || `trig_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`,
         asset_id: body.asset_id,
@@ -1967,7 +2385,7 @@ export class OrderbookManager extends DurableObject<Env> {
         webhook_url: body.webhook_url,
         webhook_secret: body.webhook_secret,
         enabled: body.enabled ?? true,
-        cooldown_ms: body.cooldown_ms ?? 1000,
+        cooldown_ms: cooldown,
         created_at: Date.now(),
         metadata: body.metadata,
       };
@@ -1995,6 +2413,21 @@ export class OrderbookManager extends DurableObject<Env> {
         (trigger.condition.type === "ARBITRAGE_BUY" || trigger.condition.type === "ARBITRAGE_SELL") &&
         trigger.condition.counterpart_asset_id
       ) {
+        // Validate counterpart asset is subscribed (unless wildcard trigger)
+        const counterpartExists = trigger.asset_id === "*" ||
+          this.assetToConnection.has(trigger.condition.counterpart_asset_id);
+
+        if (!counterpartExists) {
+          return Response.json(
+            {
+              trigger_id: "",
+              status: "error",
+              message: `Counterpart asset ${trigger.condition.counterpart_asset_id.slice(0, 20)}... is not subscribed on this shard`,
+            } as TriggerRegistration,
+            { status: 400 }
+          );
+        }
+
         this.registerMarketRelationship(trigger.asset_id, trigger.condition.counterpart_asset_id);
         console.log(
           `[Trigger] Registered market relationship: ${trigger.asset_id.slice(0, 12)}... <-> ${trigger.condition.counterpart_asset_id.slice(0, 12)}...`

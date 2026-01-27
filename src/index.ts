@@ -20,6 +20,7 @@ import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache,
 import { MarketCacheService } from "./services/market-cache";
 import { MarketCleanupService } from "./services/market-cleanup";
 import { DB_CONFIG } from "./config/database";
+import { backtest } from "./routes/backtest";
 
 // Helper to parse token IDs from JSON string
 function parseTokenIds(clobTokenIds: string): string[] {
@@ -59,14 +60,23 @@ function getShardForMarket(conditionId: string): string {
 
 // ============================================================
 // Durable Object Location Hints
+// Per-market co-location for optimal latency
 // ============================================================
 
 /**
- * Location hint for Durable Objects - co-locate with Polymarket servers
- * Polymarket's primary servers are in eu-west-2 (London)
- * "weur" = Western Europe (closest Cloudflare region)
+ * Location hints per market source.
+ * Based on where each market's servers are located.
  */
-const DO_LOCATION_HINT: DurableObjectLocationHint = "weur";
+const MARKET_LOCATION_HINTS: Record<string, DurableObjectLocationHint> = {
+  polymarket: "weur",  // London (eu-west-2) - Polymarket servers
+  kalshi: "enam",      // US East - Kalshi servers (CFTC regulated, US-based)
+  manifold: "wnam",    // US West - Manifold Markets
+};
+
+/**
+ * Default location hint for unknown markets
+ */
+const DEFAULT_LOCATION_HINT: DurableObjectLocationHint = "weur";
 
 /**
  * Extended idFromName with location hint support
@@ -77,11 +87,30 @@ interface DurableObjectNamespaceExt {
 }
 
 /**
- * Get OrderbookManager DO stub with location hint for low-latency Polymarket connection
+ * Get OrderbookManager DO stub with per-market location hint for optimal latency.
+ * @param env - Worker environment
+ * @param marketSource - Market source identifier (e.g., "polymarket", "kalshi")
+ * @param shardId - Shard identifier
+ * @returns DO stub co-located near the market's servers
+ */
+function getOrderbookManagerStubForMarket(
+  env: Env,
+  marketSource: string,
+  shardId: string
+): DurableObjectStub {
+  const hint = MARKET_LOCATION_HINTS[marketSource] || DEFAULT_LOCATION_HINT;
+  const ns = env.ORDERBOOK_MANAGER as unknown as DurableObjectNamespaceExt;
+  const doId = ns.idFromName(`${marketSource}-${shardId}`, { locationHint: hint });
+  return env.ORDERBOOK_MANAGER.get(doId);
+}
+
+/**
+ * Get OrderbookManager DO stub with location hint (default: Polymarket).
+ * Backward-compatible helper for existing code.
  */
 function getOrderbookManagerStub(env: Env, shardId: string): DurableObjectStub {
   const ns = env.ORDERBOOK_MANAGER as unknown as DurableObjectNamespaceExt;
-  const doId = ns.idFromName(shardId, { locationHint: DO_LOCATION_HINT });
+  const doId = ns.idFromName(shardId, { locationHint: DEFAULT_LOCATION_HINT });
   return env.ORDERBOOK_MANAGER.get(doId);
 }
 
@@ -90,7 +119,7 @@ function getOrderbookManagerStub(env: Env, shardId: string): DurableObjectStub {
  */
 function getTriggerEventBufferStub(env: Env): DurableObjectStub {
   const ns = env.TRIGGER_EVENT_BUFFER as unknown as DurableObjectNamespaceExt;
-  const doId = ns.idFromName("global", { locationHint: DO_LOCATION_HINT });
+  const doId = ns.idFromName("global", { locationHint: DEFAULT_LOCATION_HINT });
   return env.TRIGGER_EVENT_BUFFER.get(doId);
 }
 
@@ -1767,6 +1796,9 @@ dashboardApi.get("/triggers/events", async (c) => {
 // Mount dashboard API under /api/v1
 app.route("/api/v1", dashboardApi);
 
+// Mount backtest API under /api/v1/backtest
+app.route("/api/v1/backtest", backtest);
+
 // Export Durable Objects
 export { OrderbookManager, TriggerEventBuffer };
 
@@ -1814,7 +1846,7 @@ async function getTotalSubscriptions(env: Env): Promise<number> {
 /**
  * Bootstrap all active markets from Gamma API
  */
-async function bootstrapActiveMarkets(env: Env): Promise<{ subscribed: number; errors: number; metadataSynced: number }> {
+async function bootstrapActiveMarkets(env: Env): Promise<{ subscribed: number; errors: number; metadataSynced: number; cacheSynced: number }> {
   console.log("[Bootstrap] Fetching all active markets from Gamma API");
 
   const response = await fetch(

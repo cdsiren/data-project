@@ -4,7 +4,7 @@
 /**
  * Supported market sources
  */
-export type MarketSource = "polymarket";
+export type MarketSource = "polymarket" | "kalshi";
 
 /**
  * Market categories

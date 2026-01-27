@@ -4,28 +4,43 @@
 import { DB_CONFIG } from "../config/database";
 
 /**
+ * Centralized async insert configuration for maintainability.
+ * Adjust these values to tune latency vs throughput trade-offs.
+ */
+export const ASYNC_INSERT_CONFIG = {
+  /** Low-latency profile: flush quickly for data freshness */
+  LOW_LATENCY: {
+    busy_timeout_ms: 10000,    // 10s - flush frequently
+    stale_timeout_ms: 10000,   // 10s - don't wait for full buffer
+  },
+  /** Batch-optimized profile: accumulate larger batches for efficiency */
+  BATCH_OPTIMIZED: {
+    busy_timeout_ms: 30000,    // 30s - larger batches
+    stale_timeout_ms: 30000,   // 30s - balance freshness vs throughput
+  },
+  /** Maximum data size per async insert batch */
+  max_data_size: 52428800,     // 50MB - reduce merge operations
+} as const;
+
+/**
  * Build a ClickHouse INSERT URL with async insert parameters.
- *
- * Configuration optimized for high-throughput with cost efficiency:
- * - wait_for_async_insert=0: Non-blocking (2-5x throughput improvement)
- * - 60s timeout: Accumulate larger batches for fewer merge operations (30-40% reduction)
- * - 50MB buffer: Larger batches = fewer merge operations
- * - 30s stale timeout: Flush after 30s even if buffer not full (data freshness)
+ * Uses LOW_LATENCY profile for real-time data ingestion.
  */
 export function buildAsyncInsertUrl(baseUrl: string, table: string): string {
   const params = new URLSearchParams({
     query: `INSERT INTO ${table} FORMAT JSONEachRow`,
     async_insert: "1",
     wait_for_async_insert: "0",
-    async_insert_busy_timeout_ms: "60000",      // 60s - accumulate larger batches
-    async_insert_max_data_size: "52428800",     // 50MB - reduce merge operations
-    async_insert_stale_timeout_ms: "30000",     // 30s - flush even if not full
+    async_insert_busy_timeout_ms: String(ASYNC_INSERT_CONFIG.LOW_LATENCY.busy_timeout_ms),
+    async_insert_max_data_size: String(ASYNC_INSERT_CONFIG.max_data_size),
+    async_insert_stale_timeout_ms: String(ASYNC_INSERT_CONFIG.LOW_LATENCY.stale_timeout_ms),
   });
   return `${baseUrl}/?${params.toString()}`;
 }
 
 /**
  * Build a ClickHouse INSERT URL with async insert and explicit columns.
+ * Uses BATCH_OPTIMIZED profile for bulk operations.
  */
 export function buildAsyncInsertUrlWithColumns(
   baseUrl: string,
@@ -37,7 +52,7 @@ export function buildAsyncInsertUrlWithColumns(
     query: `INSERT INTO ${DB_CONFIG.DATABASE}.${table} (${columns.join(", ")}) FORMAT JSONEachRow`,
     async_insert: "1",
     wait_for_async_insert: "0",
-    async_insert_busy_timeout_ms: "30000",
+    async_insert_busy_timeout_ms: String(ASYNC_INSERT_CONFIG.BATCH_OPTIMIZED.busy_timeout_ms),
   });
   return `${baseUrl}?${params.toString()}`;
 }

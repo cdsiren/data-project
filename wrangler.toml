@@ -31,7 +31,7 @@ binding = "SNAPSHOT_QUEUE"
 [[queues.consumers]]
 queue = "orderbook-snapshot-queue"
 max_batch_size = 100      # Max allowed by Cloudflare
-max_batch_timeout = 60    # Max allowed by Cloudflare
+max_batch_timeout = 5     # Reduced from 60s for low-latency writes
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 
@@ -55,7 +55,7 @@ binding = "TRADE_QUEUE"
 [[queues.consumers]]
 queue = "trade-tick-queue"
 max_batch_size = 100      # Max allowed by Cloudflare
-max_batch_timeout = 60    # Max allowed by Cloudflare
+max_batch_timeout = 5     # Reduced from 60s for low-latency writes
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 
@@ -67,7 +67,7 @@ binding = "LEVEL_CHANGE_QUEUE"
 [[queues.consumers]]
 queue = "level-change-queue"
 max_batch_size = 100      # Max allowed by Cloudflare
-max_batch_timeout = 60    # Max allowed by Cloudflare
+max_batch_timeout = 5     # Reduced from 60s for low-latency writes
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 
@@ -79,7 +79,7 @@ binding = "FULL_L2_QUEUE"
 [[queues.consumers]]
 queue = "full-l2-queue"
 max_batch_size = 100      # Max allowed by Cloudflare
-max_batch_timeout = 60    # Max allowed by Cloudflare
+max_batch_timeout = 5     # Reduced from 60s for low-latency writes
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 

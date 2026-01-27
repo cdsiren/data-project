@@ -9,6 +9,7 @@ import type { MarketSource, MarketType } from "../core/enums";
  */
 export const MARKET_SOURCE_TO_TYPE: Record<MarketSource, MarketType> = {
   polymarket: "prediction",
+  kalshi: "prediction",
 } as const;
 
 export const DB_CONFIG = {
