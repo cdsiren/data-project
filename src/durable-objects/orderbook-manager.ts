@@ -994,8 +994,26 @@ export class OrderbookManager extends DurableObject<Env> {
           console.warn(`[WS ${connId}] Unknown event type: ${parsed.type} (market: ${state.marketSource})`);
       }
     } else {
-      // FALLBACK: Legacy handling without connector (should not happen with new code)
-      this.handleMessageLegacy(data, connId, state, ingestionTsFloor);
+      // CRITICAL: Connector should ALWAYS exist - this indicates initialization failure
+      console.error(
+        `[WS ${connId}] CRITICAL: Missing connector for market ${state.marketSource}. ` +
+        `Connection may not be properly initialized. Asset count: ${state.assets.size}`
+      );
+
+      // Track failures for all assets on this broken connection
+      for (const assetId of state.assets) {
+        const failures = (this.subscriptionFailures.get(assetId) || 0) + 1;
+        this.subscriptionFailures.set(assetId, failures);
+      }
+
+      // Close the broken connection and trigger reconnection
+      if (state.ws) {
+        state.ws.close(1011, "Missing connector - reinitializing");
+      }
+      this.connections.delete(connId);
+
+      // Schedule reconnection via alarm
+      this.scheduleAlarm(this.RECONNECT_BASE_DELAY_MS);
     }
   }
 
@@ -1207,7 +1225,15 @@ export class OrderbookManager extends DurableObject<Env> {
     ingestionTs: number
   ): void {
     const levelChanges = connector.normalizeLevelChange(raw);
-    if (!levelChanges || levelChanges.length === 0) return;
+    if (!levelChanges || levelChanges.length === 0) {
+      // Log warning to enable debugging of normalization failures
+      const rawEvent = raw as { event_type?: string; asset_id?: string };
+      console.warn(
+        `[DO ${this.shardId}] Connector ${connector.marketSource} failed to normalize price_change. ` +
+        `Event type: ${rawEvent?.event_type || 'unknown'}, asset: ${rawEvent?.asset_id?.slice(0, 12) || 'unknown'}`
+      );
+      return;
+    }
 
     // Group by asset
     const byAsset = new Map<string, typeof levelChanges>();
@@ -1285,7 +1311,15 @@ export class OrderbookManager extends DurableObject<Env> {
     ingestionTs: number
   ): void {
     const trade = connector.normalizeTrade(raw);
-    if (!trade) return;
+    if (!trade) {
+      // Log warning to enable debugging of normalization failures
+      const rawEvent = raw as { event_type?: string; asset_id?: string };
+      console.warn(
+        `[DO ${this.shardId}] Connector ${connector.marketSource} failed to normalize trade. ` +
+        `Event type: ${rawEvent?.event_type || 'unknown'}, asset: ${rawEvent?.asset_id?.slice(0, 12) || 'unknown'}`
+      );
+      return;
+    }
 
     // Update with correct condition ID from local state
     const conditionId = this.assetToMarket.get(trade.asset_id) || trade.condition_id;

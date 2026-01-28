@@ -24,7 +24,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Execute a function with exponential backoff retry
+ * Execute a function with exponential backoff retry and jitter.
+ * Jitter prevents thundering herd when multiple workers retry simultaneously.
  */
 async function withRetry<T>(
   fn: () => Promise<T>,
@@ -39,7 +40,10 @@ async function withRetry<T>(
       lastError = error instanceof Error ? error : new Error(String(error));
 
       if (attempt < RETRY_CONFIG.maxAttempts) {
-        const delayMs = RETRY_CONFIG.baseDelayMs * Math.pow(2, attempt - 1);
+        // Add jitter (±25%) to prevent thundering herd during outages
+        const baseDelay = RETRY_CONFIG.baseDelayMs * Math.pow(2, attempt - 1);
+        const jitter = baseDelay * 0.25 * (Math.random() * 2 - 1);
+        const delayMs = Math.round(baseDelay + jitter);
         console.warn(
           `[MarketLifecycle] ${context} failed (attempt ${attempt}/${RETRY_CONFIG.maxAttempts}), retrying in ${delayMs}ms:`,
           lastError.message

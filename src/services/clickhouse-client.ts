@@ -82,6 +82,8 @@ export function buildSyncInsertUrlWithColumns(
     async_insert: "1",
     wait_for_async_insert: "1", // CRITICAL: Wait for insert confirmation
     async_insert_busy_timeout_ms: String(ASYNC_INSERT_CONFIG.BATCH_OPTIMIZED.busy_timeout_ms),
+    async_insert_max_data_size: String(ASYNC_INSERT_CONFIG.max_data_size),
+    async_insert_stale_timeout_ms: String(ASYNC_INSERT_CONFIG.BATCH_OPTIMIZED.stale_timeout_ms),
   });
   return `${baseUrl}?${params.toString()}`;
 }

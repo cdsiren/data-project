@@ -72,6 +72,9 @@ export class KalshiConnector implements MarketConnector {
   }
 
   normalizeBookEvent(raw: unknown): BBOSnapshot | null {
+    // FAIL-FAST: Throw error to prevent silent data loss
+    // Kalshi integration is not yet complete - do not use in production
+    //
     // TODO: Implement Kalshi book event normalization
     // Kalshi sends orderbook updates in a different format:
     // {
@@ -84,8 +87,10 @@ export class KalshiConnector implements MarketConnector {
     //     "no_ask": [[price, size], ...]
     //   }
     // }
-    console.warn("[KalshiConnector] normalizeBookEvent not implemented");
-    return null;
+    throw new Error(
+      "[KalshiConnector] normalizeBookEvent not yet implemented. " +
+      "Kalshi integration is incomplete - use market_source='polymarket' only."
+    );
   }
 
   normalizeFullL2(
@@ -95,18 +100,23 @@ export class KalshiConnector implements MarketConnector {
     negRisk?: boolean,
     orderMinSize?: number
   ): FullL2Snapshot | null {
-    // TODO: Implement Kalshi full L2 normalization
-    console.warn("[KalshiConnector] normalizeFullL2 not implemented");
-    return null;
+    // FAIL-FAST: Throw error to prevent silent data loss
+    throw new Error(
+      "[KalshiConnector] normalizeFullL2 not yet implemented. " +
+      "Kalshi integration is incomplete - use market_source='polymarket' only."
+    );
   }
 
   normalizeLevelChange(raw: unknown): OrderbookLevelChange[] | null {
-    // TODO: Implement Kalshi level change normalization
-    console.warn("[KalshiConnector] normalizeLevelChange not implemented");
-    return null;
+    // FAIL-FAST: Throw error to prevent silent data loss
+    throw new Error(
+      "[KalshiConnector] normalizeLevelChange not yet implemented. " +
+      "Kalshi integration is incomplete - use market_source='polymarket' only."
+    );
   }
 
   normalizeTrade(raw: unknown): TradeTick | null {
+    // FAIL-FAST: Throw error to prevent silent data loss
     // TODO: Implement Kalshi trade normalization
     // Kalshi sends trade updates in format:
     // {
@@ -118,8 +128,10 @@ export class KalshiConnector implements MarketConnector {
     //     "taker_side": "yes"
     //   }
     // }
-    console.warn("[KalshiConnector] normalizeTrade not implemented");
-    return null;
+    throw new Error(
+      "[KalshiConnector] normalizeTrade not yet implemented. " +
+      "Kalshi integration is incomplete - use market_source='polymarket' only."
+    );
   }
 
   getSubscriptionMessage(assets: string[]): string {
