@@ -16,7 +16,7 @@ import { tradeTickConsumer } from "./consumers/trade-tick-consumer";
 import { levelChangeConsumer } from "./consumers/level-change-consumer";
 import { fullL2SnapshotConsumer } from "./consumers/full-l2-snapshot-consumer";
 import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
-import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache, type MarketLifecycleWebhook } from "./services/market-lifecycle";
+import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache, refreshAllMarketMetadata, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { MarketCacheService } from "./services/market-cache";
 import { MarketCleanupService } from "./services/market-cleanup";
 import { DB_CONFIG } from "./config/database";
@@ -1917,7 +1917,32 @@ async function scheduledHandler(
 ) {
   const now = new Date().toISOString();
 
-  // Market lifecycle check every 5 minutes (cron: "*/5 * * * *")
+  // ============================================================
+  // HOURLY CRON: Full metadata refresh (cron: "0 * * * *")
+  // Ensures market_metadata table stays populated even if
+  // incremental updates fail. Runs at the top of each hour.
+  // ============================================================
+  if (event.cron === "0 * * * *") {
+    console.log("[Scheduled] Running hourly metadata refresh at", now);
+
+    ctx.waitUntil(
+      refreshAllMarketMetadata(env)
+        .then((refreshed) => {
+          console.log(`[Scheduled] Hourly metadata refresh complete: ${refreshed} markets refreshed`);
+        })
+        .catch((error) => {
+          // CRITICAL: Log errors - don't let them disappear silently
+          console.error("[Scheduled] CRON FAILED - Hourly metadata refresh error:", error);
+        })
+    );
+    return; // Don't run other crons in same invocation
+  }
+
+  // ============================================================
+  // 5-MINUTE CRON: Market lifecycle check (cron: "*/5 * * * *")
+  // Detects new markets, resolved markets, and syncs metadata
+  // for newly discovered markets only.
+  // ============================================================
   if (event.cron === "*/5 * * * *") {
     console.log("[Scheduled] Running market lifecycle check at", now);
 
@@ -1927,9 +1952,14 @@ async function scheduledHandler(
     if (totalSubscriptions === 0) {
       console.log("[Scheduled] No markets subscribed - running automatic bootstrap");
       ctx.waitUntil(
-        bootstrapActiveMarkets(env).then((result) => {
-          console.log(`[Scheduled] Bootstrap complete: ${result.subscribed} subscribed, ${result.errors} errors, ${result.metadataSynced} metadata, ${result.cacheSynced} cached`);
-        })
+        bootstrapActiveMarkets(env)
+          .then((result) => {
+            console.log(`[Scheduled] Bootstrap complete: ${result.subscribed} subscribed, ${result.errors} errors, ${result.metadataSynced} metadata, ${result.cacheSynced} cached`);
+          })
+          .catch((error) => {
+            // CRITICAL: Log errors - don't let them disappear silently
+            console.error("[Scheduled] CRON FAILED - Bootstrap error:", error);
+          })
       );
       return; // Skip lifecycle check on bootstrap run
     }
@@ -1943,32 +1973,37 @@ async function scheduledHandler(
     }
 
     ctx.waitUntil(
-      lifecycle.runCheck().then(async (results) => {
-        console.log(
-          `[Scheduled] Lifecycle check complete: ${results.resolutions} resolutions, ${results.new_markets} new markets, ${results.metadata_synced} metadata synced`
-        );
+      lifecycle.runCheck()
+        .then(async (results) => {
+          console.log(
+            `[Scheduled] Lifecycle check complete: ${results.resolutions} resolutions, ${results.new_markets} new markets, ${results.metadata_synced} metadata synced`
+          );
 
-        // Subscribe new markets to OrderbookManager DOs for real-time monitoring
-        if (results.newMarketEvents.length > 0) {
-          console.log(`[Scheduled] Subscribing ${results.newMarketEvents.length} new markets`);
-          const subscription = await subscribeNewMarkets(env, results.newMarketEvents);
-          console.log(`[Scheduled] Subscribed ${subscription.subscribed} markets, ${subscription.errors.length} errors`);
-          subscription.errors.forEach((err) => console.error(`[Scheduled] ${err}`));
-        }
+          // Subscribe new markets to OrderbookManager DOs for real-time monitoring
+          if (results.newMarketEvents.length > 0) {
+            console.log(`[Scheduled] Subscribing ${results.newMarketEvents.length} new markets`);
+            const subscription = await subscribeNewMarkets(env, results.newMarketEvents);
+            console.log(`[Scheduled] Subscribed ${subscription.subscribed} markets, ${subscription.errors.length} errors`);
+            subscription.errors.forEach((err) => console.error(`[Scheduled] ${err}`));
+          }
 
-        // Clean up resolved markets using coordinated cleanup service
-        if (results.resolutionEvents.length > 0) {
-          const cleanupService = new MarketCleanupService(env, getShardForMarket);
+          // Clean up resolved markets using coordinated cleanup service
+          if (results.resolutionEvents.length > 0) {
+            const cleanupService = new MarketCleanupService(env, getShardForMarket);
 
-          for (const event of results.resolutionEvents) {
-            try {
-              await cleanupService.cleanupMarket(event.condition_id, event.token_ids);
-            } catch (err) {
-              console.error(`[Scheduled] Failed to cleanup market ${event.condition_id}:`, err);
+            for (const event of results.resolutionEvents) {
+              try {
+                await cleanupService.cleanupMarket(event.condition_id, event.token_ids);
+              } catch (err) {
+                console.error(`[Scheduled] Failed to cleanup market ${event.condition_id}:`, err);
+              }
             }
           }
-        }
-      })
+        })
+        .catch((error) => {
+          // CRITICAL: Log errors - don't let them disappear silently
+          console.error("[Scheduled] CRON FAILED - Lifecycle check error:", error);
+        })
     );
   }
 }

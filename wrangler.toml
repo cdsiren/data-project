@@ -111,10 +111,11 @@ id = "2d5f178dcab04f4697eb6f6a9a0946a5"
 # ============================================================
 # SCHEDULED TRIGGERS
 # - Market lifecycle check every 5 minutes (resolutions & new markets)
+# - Full metadata refresh hourly (ensures stale data doesn't accumulate)
 # ============================================================
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "0 * * * *"]
 
 # ============================================================
 # ENVIRONMENT VARIABLES

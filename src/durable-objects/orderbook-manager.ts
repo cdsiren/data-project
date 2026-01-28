@@ -967,44 +967,31 @@ export class OrderbookManager extends DurableObject<Env> {
         this.subscriptionFailures.delete(parsed.assetId);
       }
 
-      // ADAPTER-DRIVEN DISPATCH: Route to appropriate handler based on canonical event type
+      // UNIFIED DISPATCH: All markets route through canonical handlers
+      // This ensures optimizations benefit all markets equally (Nautilus-style)
       switch (parsed.type) {
         case "book":
-          // For Polymarket, we have optimized handlers that work directly with raw events
-          // For other markets, the connector would normalize to canonical types
-          if (state.marketSource === "polymarket") {
-            this.handleBookEvent(parsed.raw as PolymarketBookEvent, ingestionTsFloor);
-          } else {
-            // Generic path for other markets - use connector normalization
-            this.handleCanonicalBookEvent(state.connector, parsed.raw, ingestionTsFloor);
-          }
+          // Full orderbook snapshot - initialize/reset local book
+          this.handleCanonicalBookEvent(state.connector, parsed.raw, ingestionTsFloor);
           break;
 
         case "price_change":
-          if (state.marketSource === "polymarket") {
-            this.handlePriceChangeEvent(parsed.raw as PolymarketPriceChangeEvent, ingestionTsFloor);
-          } else {
-            this.handleCanonicalPriceChange(state.connector, parsed.raw, ingestionTsFloor);
-          }
+          // Incremental update - apply deltas to local book
+          this.handleCanonicalPriceChange(state.connector, parsed.raw, ingestionTsFloor);
           break;
 
         case "trade":
-          if (state.marketSource === "polymarket") {
-            this.handleTradeEvent(parsed.raw as PolymarketLastTradePriceEvent, ingestionTsFloor);
-          } else {
-            this.handleCanonicalTrade(state.connector, parsed.raw, ingestionTsFloor);
-          }
+          // Trade execution - capture for backtesting
+          this.handleCanonicalTrade(state.connector, parsed.raw, ingestionTsFloor);
           break;
 
         case "tick_size":
-          if (state.marketSource === "polymarket") {
-            this.handleTickSizeChange(parsed.raw as PolymarketTickSizeChangeEvent);
-          }
-          // Other markets can implement tick_size handling as needed
+          // Tick size update - handled via connector if supported
+          this.handleCanonicalTickSizeChange(state.connector, parsed.raw);
           break;
 
         default:
-          console.warn(`[WS ${connId}] Unknown event type: ${parsed.type}`);
+          console.warn(`[WS ${connId}] Unknown event type: ${parsed.type} (market: ${state.marketSource})`);
       }
     } else {
       // FALLBACK: Legacy handling without connector (should not happen with new code)
@@ -1100,8 +1087,10 @@ export class OrderbookManager extends DurableObject<Env> {
 
   /**
    * CANONICAL BOOK EVENT HANDLER
-   * Handles book events from any market using connector normalization.
-   * This is the generic path for non-Polymarket markets.
+   * Handles book events from ANY market using connector normalization.
+   * This is the unified path for all markets (Polymarket, Kalshi, etc.)
+   *
+   * CRITICAL: This handler includes hash chain verification to detect gaps.
    */
   private handleCanonicalBookEvent(
     connector: MarketConnector,
@@ -1110,14 +1099,41 @@ export class OrderbookManager extends DurableObject<Env> {
   ): void {
     // Use connector to normalize to canonical BBO snapshot
     const snapshot = connector.normalizeBookEvent(raw);
-    if (!snapshot) return;
+    if (!snapshot) {
+      console.warn(`[DO ${this.shardId}] Connector ${connector.marketSource} failed to normalize book event`);
+      return;
+    }
 
     // Get condition ID and tick size from local state
     const conditionId = this.assetToMarket.get(snapshot.asset_id) || snapshot.condition_id;
     const tickSize = this.tickSizes.get(snapshot.asset_id) || snapshot.tick_size;
+    const marketSource = connector.marketSource as MarketSource;
 
-    // Clear missing book tracking
+    // Clear missing book tracking since we received the book
     this.missingBookFirstSeen.delete(snapshot.asset_id);
+
+    // DATA INTEGRITY: Check if this is a resync (we already had a book with different hash)
+    const existingBook = this.localBooks.get(snapshot.asset_id);
+    const isResync = existingBook && existingBook.last_hash !== snapshot.book_hash;
+
+    if (isResync) {
+      // Book event with different hash - this is a resync (gap detected)
+      console.log(
+        `[DO ${this.shardId}] Book resync for ${snapshot.asset_id.slice(0, 12)}... (market: ${connector.marketSource}): ` +
+        `old_hash=${existingBook.last_hash.slice(0, 12)}..., new_hash=${snapshot.book_hash.slice(0, 12)}...`
+      );
+      // Record the gap event for monitoring and audit
+      const clickhouse = new ClickHouseOrderbookClient(this.env);
+      this.ctx.waitUntil(
+        clickhouse.recordGapEvent(
+          snapshot.asset_id,
+          existingBook.last_hash,
+          snapshot.book_hash,
+          snapshot.source_ts - existingBook.last_update_ts,
+          marketSource
+        )
+      );
+    }
 
     // Get full L2 snapshot using connector
     const fullL2 = connector.normalizeFullL2(
@@ -1129,9 +1145,9 @@ export class OrderbookManager extends DurableObject<Env> {
     );
 
     if (fullL2) {
-      // Initialize local book from full L2
+      // Initialize/reset local orderbook state
       const localBook: LocalOrderbook = {
-        market_source: connector.marketSource as MarketSource,
+        market_source: marketSource,
         asset_id: snapshot.asset_id,
         condition_id: conditionId,
         bids: new Map(fullL2.bids.map((b) => [b.price, b.size])),
@@ -1143,7 +1159,7 @@ export class OrderbookManager extends DurableObject<Env> {
       };
       this.localBooks.set(snapshot.asset_id, localBook);
 
-      // Emit full L2 snapshot
+      // Emit full L2 snapshot (initial or resync)
       this.ctx.waitUntil(
         this.sendToQueue("FULL_L2_QUEUE", this.env.FULL_L2_QUEUE, fullL2)
       );
@@ -1281,6 +1297,42 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // Buffer for direct ClickHouse write
     this.bufferTrade(finalTrade);
+  }
+
+  /**
+   * CANONICAL TICK SIZE CHANGE HANDLER
+   * Handles tick size changes from any market.
+   * Tick size changes are rare but important for order precision.
+   */
+  private handleCanonicalTickSizeChange(
+    connector: MarketConnector,
+    raw: unknown
+  ): void {
+    // Extract tick size change info - markets have different formats
+    // For now, we support Polymarket format directly, other markets can extend
+    const event = raw as { asset_id?: string; new_tick_size?: string; old_tick_size?: string };
+
+    if (!event.asset_id || !event.new_tick_size) {
+      console.warn(`[DO ${this.shardId}] Invalid tick size change event from ${connector.marketSource}`);
+      return;
+    }
+
+    const newTickSize = parseFloat(event.new_tick_size);
+    const oldTickSize = event.old_tick_size ? parseFloat(event.old_tick_size) : this.tickSizes.get(event.asset_id);
+
+    console.log(
+      `[DO ${this.shardId}] Tick size change for ${event.asset_id} (market: ${connector.marketSource}): ` +
+      `${oldTickSize} -> ${newTickSize}`
+    );
+
+    // Update stored tick size
+    this.tickSizes.set(event.asset_id, newTickSize);
+
+    // Update local book tick size (book will be rebuilt on next 'book' event if needed)
+    const localBook = this.localBooks.get(event.asset_id);
+    if (localBook) {
+      localBook.tick_size = newTickSize;
+    }
   }
 
   private removeAsset(assetId: string): void {

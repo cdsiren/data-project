@@ -4,9 +4,53 @@
 // Also syncs market metadata to ClickHouse on 5-minute cron
 
 import type { Env, PolymarketMarket, MarketMetadataRecord, MarketEventRecord } from "../types";
-import { buildAsyncInsertUrlWithColumns } from "./clickhouse-client";
+import { buildSyncInsertUrlWithColumns } from "./clickhouse-client";
 import { WebhookSigner } from "./webhook-signer";
 import { DB_CONFIG } from "../config/database";
+
+/**
+ * Retry configuration for ClickHouse operations
+ */
+const RETRY_CONFIG = {
+  maxAttempts: 3,
+  baseDelayMs: 1000, // 1s, 2s, 4s with exponential backoff
+} as const;
+
+/**
+ * Sleep utility for retry delays
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute a function with exponential backoff retry
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  context: string
+): Promise<T> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 1; attempt <= RETRY_CONFIG.maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+
+      if (attempt < RETRY_CONFIG.maxAttempts) {
+        const delayMs = RETRY_CONFIG.baseDelayMs * Math.pow(2, attempt - 1);
+        console.warn(
+          `[MarketLifecycle] ${context} failed (attempt ${attempt}/${RETRY_CONFIG.maxAttempts}), retrying in ${delayMs}ms:`,
+          lastError.message
+        );
+        await sleep(delayMs);
+      }
+    }
+  }
+
+  throw lastError;
+}
 
 interface GammaMarket {
   id: string;
@@ -409,7 +453,10 @@ async function insertMarketsIntoClickHouse(
 }
 
 /**
- * Insert records into ClickHouse using async insert
+ * Insert records into ClickHouse using SYNCHRONOUS insert with retry.
+ *
+ * Uses wait_for_async_insert=1 to guarantee data persistence before returning.
+ * Includes exponential backoff retry for transient failures.
  */
 async function insertIntoClickHouse(
   env: Env,
@@ -418,28 +465,31 @@ async function insertIntoClickHouse(
   columns: string[]
 ): Promise<void> {
   const body = records.map((record) => JSON.stringify(record)).join("\n");
-  const url = buildAsyncInsertUrlWithColumns(env.CLICKHOUSE_URL, table, columns);
+  // Use SYNC insert (wait_for_async_insert=1) for guaranteed persistence
+  const url = buildSyncInsertUrlWithColumns(env.CLICKHOUSE_URL, table, columns);
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "X-ClickHouse-User": env.CLICKHOUSE_USER || "default",
-      "X-ClickHouse-Key": env.CLICKHOUSE_TOKEN,
-      "Content-Type": "application/x-ndjson",
-    },
-    body: body,
-  });
+  await withRetry(async () => {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "X-ClickHouse-User": env.CLICKHOUSE_USER || "default",
+        "X-ClickHouse-Key": env.CLICKHOUSE_TOKEN,
+        "Content-Type": "application/x-ndjson",
+      },
+      body: body,
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `ClickHouse insert failed: ${response.status} ${response.statusText} - ${errorText}`
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `ClickHouse insert failed: ${response.status} ${response.statusText} - ${errorText}`
+      );
+    }
+
+    console.log(
+      `[MarketLifecycle] Successfully inserted ${records.length} records into ${DB_CONFIG.DATABASE}.${table}`
     );
-  }
-
-  console.log(
-    `[MarketLifecycle] Successfully inserted ${records.length} records into ${DB_CONFIG.DATABASE}.${table}`
-  );
+  }, `insert into ${table}`);
 }
 
 /**
@@ -496,5 +546,108 @@ async function updateMarketCache(
   }
 }
 
-export { insertMarketsIntoClickHouse, updateMarketCache };
+/**
+ * Fetch ALL active markets from Gamma API for full metadata refresh.
+ * Used by periodic refresh to ensure stale data doesn't accumulate.
+ *
+ * @param env - Environment bindings
+ * @param limit - Max markets to fetch per page (default 100)
+ * @returns Array of all active markets
+ */
+async function fetchAllActiveMarkets(
+  env: Env,
+  limit: number = 100
+): Promise<PolymarketMarket[]> {
+  const allMarkets: PolymarketMarket[] = [];
+  let offset = 0;
+  let hasMore = true;
+
+  console.log("[MarketLifecycle] Starting full market metadata fetch...");
+
+  while (hasMore) {
+    try {
+      const url = `${env.GAMMA_API_URL}/markets?active=true&closed=false&enableOrderBook=true&limit=${limit}&offset=${offset}`;
+
+      const response = await fetch(url, {
+        headers: { Accept: "application/json" },
+      });
+
+      if (!response.ok) {
+        console.error(`[MarketLifecycle] Gamma API error: ${response.status}`);
+        break;
+      }
+
+      const markets = (await response.json()) as PolymarketMarket[];
+
+      if (markets.length === 0) {
+        hasMore = false;
+      } else {
+        allMarkets.push(...markets);
+        offset += markets.length;
+
+        // Safety limit to prevent infinite loops
+        if (offset >= 5000) {
+          console.warn("[MarketLifecycle] Hit safety limit of 5000 markets");
+          hasMore = false;
+        }
+      }
+    } catch (error) {
+      console.error("[MarketLifecycle] Error fetching markets:", error);
+      break;
+    }
+  }
+
+  console.log(`[MarketLifecycle] Fetched ${allMarkets.length} total active markets`);
+  return allMarkets;
+}
+
+/**
+ * Refresh ALL active market metadata in ClickHouse.
+ * Call this periodically (e.g., hourly) to ensure metadata stays fresh.
+ *
+ * Uses ReplacingMergeTree deduplication - existing records with same
+ * (condition_id, id) key will be replaced with newer versions on merge.
+ *
+ * @param env - Environment bindings
+ * @returns Number of markets refreshed
+ */
+async function refreshAllMarketMetadata(env: Env): Promise<number> {
+  console.log("[MarketLifecycle] Starting periodic metadata refresh...");
+
+  const markets = await fetchAllActiveMarkets(env);
+
+  if (markets.length === 0) {
+    console.warn("[MarketLifecycle] No active markets found for refresh");
+    return 0;
+  }
+
+  // Insert in batches to avoid overwhelming ClickHouse
+  const BATCH_SIZE = 100;
+  let totalRefreshed = 0;
+
+  for (let i = 0; i < markets.length; i += BATCH_SIZE) {
+    const batch = markets.slice(i, i + BATCH_SIZE);
+
+    try {
+      await insertMarketsIntoClickHouse(batch, env);
+      await updateMarketCache(batch, env);
+      totalRefreshed += batch.length;
+
+      console.log(
+        `[MarketLifecycle] Refreshed batch ${Math.floor(i / BATCH_SIZE) + 1}: ${batch.length} markets (${totalRefreshed}/${markets.length} total)`
+      );
+    } catch (error) {
+      console.error(
+        `[MarketLifecycle] Failed to refresh batch at offset ${i}:`,
+        error
+      );
+      // Continue with next batch - partial refresh is better than no refresh
+    }
+  }
+
+  console.log(`[MarketLifecycle] Periodic refresh complete: ${totalRefreshed}/${markets.length} markets refreshed`);
+  return totalRefreshed;
+}
+
+export { insertMarketsIntoClickHouse, updateMarketCache, refreshAllMarketMetadata };
 export type { MarketLifecycleEvent, MarketLifecycleWebhook };
