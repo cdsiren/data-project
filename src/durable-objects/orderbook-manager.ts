@@ -2870,6 +2870,24 @@ export class OrderbookManager extends DurableObject<Env> {
   // ============================================================
 
   private evaluateTriggersSync(snapshot: BBOSnapshot): void {
+    try {
+      this.evaluateTriggersCore(snapshot);
+    } catch (error) {
+      // CRITICAL: Don't let trigger evaluation crash the DO
+      // Log error and continue processing orderbook updates
+      console.error(
+        `[Trigger] CRITICAL: Evaluation crashed for ${snapshot.asset_id.slice(0, 12)}...:`,
+        error instanceof Error ? error.message : String(error)
+      );
+      // Optionally disable problematic triggers here in the future
+    }
+  }
+
+  /**
+   * Core trigger evaluation logic, separated for error isolation.
+   * Any exception here is caught by evaluateTriggersSync.
+   */
+  private evaluateTriggersCore(snapshot: BBOSnapshot): void {
     // Store latest BBO for arbitrage calculations
     // Mark as NOT stale since we just received fresh data
     this.latestBBO.set(snapshot.asset_id, {

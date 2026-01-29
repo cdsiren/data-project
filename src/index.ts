@@ -1918,11 +1918,12 @@ async function scheduledHandler(
   const now = new Date().toISOString();
 
   // ============================================================
-  // HOURLY CRON: Full metadata refresh (cron: "0 * * * *")
+  // HOURLY CRON: Full metadata refresh (cron: "2 * * * *")
   // Ensures market_metadata table stays populated even if
-  // incremental updates fail. Runs at the top of each hour.
+  // incremental updates fail. Runs at minute 2 of each hour.
+  // (Minute 2 avoids collision with 5-minute cron at :00)
   // ============================================================
-  if (event.cron === "0 * * * *") {
+  if (event.cron === "2 * * * *") {
     console.log("[Scheduled] Running hourly metadata refresh at", now);
 
     ctx.waitUntil(
