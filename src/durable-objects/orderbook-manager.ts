@@ -2874,12 +2874,12 @@ export class OrderbookManager extends DurableObject<Env> {
       this.evaluateTriggersCore(snapshot);
     } catch (error) {
       // CRITICAL: Don't let trigger evaluation crash the DO
-      // Log error and continue processing orderbook updates
+      // Log error with stack trace and continue processing orderbook updates
       console.error(
         `[Trigger] CRITICAL: Evaluation crashed for ${snapshot.asset_id.slice(0, 12)}...:`,
-        error instanceof Error ? error.message : String(error)
+        error instanceof Error ? error.stack || error.message : String(error)
       );
-      // Optionally disable problematic triggers here in the future
+      // TODO: Implement circuit breaker to auto-disable triggers after repeated failures
     }
   }
 
