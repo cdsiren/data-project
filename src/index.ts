@@ -19,6 +19,7 @@ import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
 import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache, refreshAllMarketMetadata, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { MarketCacheService } from "./services/market-cache";
 import { MarketCleanupService } from "./services/market-cleanup";
+import { CronErrorTracker, withCronErrorTracking } from "./services/cron-error-tracker";
 import { DB_CONFIG } from "./config/database";
 import { backtest } from "./routes/backtest";
 
@@ -1209,6 +1210,36 @@ app.get("/health/subscriptions", authMiddleware, async (c) => {
 });
 
 /**
+ * Cron job health check endpoint.
+ * Returns recent cron errors for observability and monitoring.
+ *
+ * Usage:
+ *   GET /cron/health - Get cron job health status and recent errors
+ */
+app.get("/cron/health", authMiddleware, async (c) => {
+  const tracker = new CronErrorTracker(c.env.MARKET_CACHE);
+  const health = await tracker.getHealthStatus();
+
+  // Return appropriate HTTP status based on health
+  const httpStatus = health.status === "healthy" ? 200 : health.status === "degraded" ? 200 : 503;
+
+  return c.json({
+    ...health,
+    timestamp: new Date().toISOString(),
+  }, httpStatus);
+});
+
+/**
+ * Admin endpoint to clear cron error history.
+ * Useful for resetting after fixing issues.
+ */
+app.post("/cron/clear-errors", authMiddleware, async (c) => {
+  const tracker = new CronErrorTracker(c.env.MARKET_CACHE);
+  const cleared = await tracker.clearErrors();
+  return c.json({ status: "ok", cleared });
+});
+
+/**
  * Admin endpoint to delete all test triggers and clear event buffer.
  * Use this to clean up after testing and prepare for production.
  */
@@ -1927,14 +1958,18 @@ async function scheduledHandler(
     console.log("[Scheduled] Running hourly metadata refresh at", now);
 
     ctx.waitUntil(
-      refreshAllMarketMetadata(env)
-        .then((refreshed) => {
+      withCronErrorTracking(
+        env.MARKET_CACHE,
+        "2 * * * *",
+        "hourly-metadata-refresh",
+        async () => {
+          const refreshed = await refreshAllMarketMetadata(env);
           console.log(`[Scheduled] Hourly metadata refresh complete: ${refreshed} markets refreshed`);
-        })
-        .catch((error) => {
-          // CRITICAL: Log errors - don't let them disappear silently
-          console.error("[Scheduled] CRON FAILED - Hourly metadata refresh error:", error);
-        })
+        }
+      ).catch((error) => {
+        // Error already persisted to KV by withCronErrorTracking
+        console.error("[Scheduled] CRON FAILED - Hourly metadata refresh error:", error);
+      })
     );
     return; // Don't run other crons in same invocation
   }
@@ -1953,14 +1988,18 @@ async function scheduledHandler(
     if (totalSubscriptions === 0) {
       console.log("[Scheduled] No markets subscribed - running automatic bootstrap");
       ctx.waitUntil(
-        bootstrapActiveMarkets(env)
-          .then((result) => {
+        withCronErrorTracking(
+          env.MARKET_CACHE,
+          "*/5 * * * *",
+          "auto-bootstrap",
+          async () => {
+            const result = await bootstrapActiveMarkets(env);
             console.log(`[Scheduled] Bootstrap complete: ${result.subscribed} subscribed, ${result.errors} errors, ${result.metadataSynced} metadata, ${result.cacheSynced} cached`);
-          })
-          .catch((error) => {
-            // CRITICAL: Log errors - don't let them disappear silently
-            console.error("[Scheduled] CRON FAILED - Bootstrap error:", error);
-          })
+          }
+        ).catch((error) => {
+          // Error already persisted to KV by withCronErrorTracking
+          console.error("[Scheduled] CRON FAILED - Bootstrap error:", error);
+        })
       );
       return; // Skip lifecycle check on bootstrap run
     }
@@ -1974,8 +2013,12 @@ async function scheduledHandler(
     }
 
     ctx.waitUntil(
-      lifecycle.runCheck()
-        .then(async (results) => {
+      withCronErrorTracking(
+        env.MARKET_CACHE,
+        "*/5 * * * *",
+        "lifecycle-check",
+        async () => {
+          const results = await lifecycle.runCheck();
           console.log(
             `[Scheduled] Lifecycle check complete: ${results.resolutions} resolutions, ${results.new_markets} new markets, ${results.metadata_synced} metadata synced`
           );
@@ -2000,11 +2043,11 @@ async function scheduledHandler(
               }
             }
           }
-        })
-        .catch((error) => {
-          // CRITICAL: Log errors - don't let them disappear silently
-          console.error("[Scheduled] CRON FAILED - Lifecycle check error:", error);
-        })
+        }
+      ).catch((error) => {
+        // Error already persisted to KV by withCronErrorTracking
+        console.error("[Scheduled] CRON FAILED - Lifecycle check error:", error);
+      })
     );
   }
 }

@@ -2716,6 +2716,17 @@ export class OrderbookManager extends DurableObject<Env> {
           { status: 400 }
         );
       }
+      if (body.asset_id !== "*" && !this.assetToMarket.has(body.asset_id)) {
+        return Response.json(
+          {
+            trigger_id: "",
+            status: "error",
+            message: `Asset ${body.asset_id.slice(0, 20)}... is not subscribed on this shard. ` +
+                     `Ensure condition_id is provided for correct routing, or the asset must be subscribed first.`,
+          } as TriggerRegistration,
+          { status: 400 }
+        );
+      }
 
       // Check trigger limit per asset
       const existingCount = this.triggersByAsset.get(body.asset_id)?.size || 0;
