@@ -6,7 +6,13 @@
 -- L2 Orderbook Snapshots
 -- Primary storage for orderbook state over time
 -- NOTE: Uses Decimal128(18) for price data to avoid floating-point precision errors
+-- NOTE: market_source must match src/core/enums.ts::MarketSource type
+--       Currently supported: 'polymarket'
+-- NOTE: market_type must match src/core/enums.ts::MarketType type
+--       Currently supported: 'prediction'
 CREATE TABLE IF NOT EXISTS trading_data.ob_snapshots (
+    market_source LowCardinality(String) DEFAULT 'polymarket',
+    market_type LowCardinality(String) DEFAULT 'prediction',
     asset_id String,
     condition_id String,
     source_ts DateTime64(3, 'UTC'),      -- Polymarket's timestamp
@@ -70,7 +76,10 @@ ALTER TABLE trading_data.ob_snapshots ADD INDEX IF NOT EXISTS idx_book_hash book
 
 
 -- Gap Detection Audit Log
+-- NOTE: market_source/market_type values must match src/core/enums.ts types
 CREATE TABLE IF NOT EXISTS trading_data.ob_gap_events (
+    market_source LowCardinality(String) DEFAULT 'polymarket',
+    market_type LowCardinality(String) DEFAULT 'prediction',
     asset_id String,
     detected_at DateTime64(3, 'UTC'),
     last_known_hash String,
@@ -86,7 +95,10 @@ ORDER BY (asset_id, detected_at);
 
 
 -- Ingestion Latency Metrics
+-- NOTE: market_source/market_type values must match src/core/enums.ts types
 CREATE TABLE IF NOT EXISTS trading_data.ob_latency (
+    market_source LowCardinality(String) DEFAULT 'polymarket',
+    market_type LowCardinality(String) DEFAULT 'prediction',
     asset_id String,
     source_ts DateTime64(3, 'UTC'),
     ingestion_ts DateTime64(6, 'UTC'),
@@ -147,7 +159,10 @@ GROUP BY hour;
 
 -- Main BBO table (target for buffer flush)
 -- NOTE: Uses Decimal128(18) for price data to avoid floating-point precision errors
+-- NOTE: market_source/market_type values must match src/core/enums.ts types
 CREATE TABLE IF NOT EXISTS trading_data.ob_bbo (
+    market_source LowCardinality(String) DEFAULT 'polymarket',
+    market_type LowCardinality(String) DEFAULT 'prediction',
     asset_id String,
     condition_id String,
     source_ts DateTime64(3, 'UTC'),
@@ -186,7 +201,10 @@ SETTINGS index_granularity = 8192;
 -- Captures every add/remove/update event at each price level
 -- ============================================================
 
+-- NOTE: market_source/market_type values must match src/core/enums.ts types
 CREATE TABLE IF NOT EXISTS trading_data.ob_level_changes (
+    market_source LowCardinality(String) DEFAULT 'polymarket',
+    market_type LowCardinality(String) DEFAULT 'prediction',
     asset_id String,
     condition_id String,
     source_ts DateTime64(3, 'UTC'),
@@ -233,7 +251,10 @@ ALTER TABLE trading_data.ob_level_changes ADD INDEX IF NOT EXISTS idx_change_typ
 -- Stores messages that failed processing after max retries
 -- ============================================================
 
+-- NOTE: market_source/market_type values must match src/core/enums.ts types
 CREATE TABLE IF NOT EXISTS trading_data.dead_letter_messages (
+    market_source LowCardinality(String) DEFAULT 'polymarket',
+    market_type LowCardinality(String) DEFAULT 'prediction',
     original_queue LowCardinality(String),
     message_type LowCardinality(String),  -- 'bbo_snapshot', 'gap_backfill', etc.
     payload String,                        -- JSON serialized original message
@@ -275,7 +296,9 @@ CREATE TABLE IF NOT EXISTS trading_data.market_metadata (
     clob_token_ids String,              -- JSON array of token IDs
     neg_risk UInt8,
     neg_risk_market_id String,
-    neg_risk_request_id String
+    neg_risk_request_id String,
+    description String DEFAULT '',           -- Market description (contains resolution criteria)
+    category String DEFAULT ''               -- Market category (e.g., "Politics", "Sports")
 )
 ENGINE = ReplacingMergeTree()
 ORDER BY (condition_id, id);
@@ -288,7 +311,10 @@ ORDER BY (condition_id, id);
 CREATE TABLE IF NOT EXISTS trading_data.market_events (
     event_id String,
     market_id String,
-    title String
+    title String,
+    -- For dependency graph building
+    slug String DEFAULT '',
+    description String DEFAULT ''
 )
 ENGINE = ReplacingMergeTree()
 ORDER BY (event_id, market_id);

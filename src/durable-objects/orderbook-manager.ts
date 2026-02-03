@@ -25,6 +25,12 @@ import { getDefaultMarketSource } from "../config/database";
 import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
 import type { MarketConnector } from "../adapters/base-connector";
 import { getConnector } from "../adapters/registry";
+import { LatencyTracker } from "../utils/ring-buffer";
+import {
+  calculateArbitrageSizing,
+  isTimestampFresh,
+  STALE_DATA_THRESHOLD_US,
+} from "../utils/arbitrage-calculations";
 
 interface ConnectionState {
   ws: WebSocket | null;
@@ -33,7 +39,7 @@ interface ConnectionState {
   lastPing: number;
   subscriptionSent: boolean; // Track if we've sent subscription for current connection
   abortController: AbortController | null; // For cleanup of event listeners
-  marketSource: string; // Market source for this connection (e.g., "polymarket", "kalshi")
+  marketSource: string; // Market source for this connection (e.g., "polymarket")
   connector: MarketConnector | null; // Adapter for market-specific normalization
 }
 
@@ -92,7 +98,15 @@ export class OrderbookManager extends DurableObject<Env> {
   private priceHistory: Map<string, PriceHistoryEntry[]> = new Map(); // asset_id -> price history for PRICE_MOVE
   // Latest BBO per asset for arbitrage trigger evaluation
   // Includes stale flag to prevent false arbitrage signals from mismatched YES/NO data
-  private latestBBO: Map<string, { best_bid: number | null; best_ask: number | null; ts: number; stale: boolean }> = new Map();
+  // Includes size data for trade sizing calculations
+  private latestBBO: Map<string, {
+    best_bid: number | null;
+    best_ask: number | null;
+    bid_size: number | null;
+    ask_size: number | null;
+    ts: number;
+    stale: boolean;
+  }> = new Map();
   // Market relationships for arbitrage: maps asset_id -> Set of related asset_ids (YES/NO pairs)
   // Used to proactively mark counterpart BBO as stale when primary updates
   private marketRelationships: Map<string, Set<string>> = new Map();
@@ -120,6 +134,14 @@ export class OrderbookManager extends DurableObject<Env> {
   // Cached DO stub for SSE publishing (avoids stub lookup on every event)
   private eventBufferStub: DurableObjectStub | null = null;
 
+  // Circuit breaker: auto-disable triggers after repeated failures
+  private triggerFailureCount: Map<string, number> = new Map();
+  private triggerCircuitOpen: Map<string, number> = new Map();
+  private readonly CIRCUIT_BREAKER_THRESHOLD = 5;
+  private readonly CIRCUIT_BREAKER_RESET_MS = 60000;
+  // Latency percentile tracker for metrics endpoint
+  private latencyTracker = new LatencyTracker(1000);
+
   // ============================================================
   // DO-DIRECT WRITE BUFFERS
   // Buffer snapshots in memory and flush directly to ClickHouse
@@ -130,7 +152,9 @@ export class OrderbookManager extends DurableObject<Env> {
   private tradeBuffer: TradeTick[] = [];
   private readonly BUFFER_SIZE = 100;
   private readonly BUFFER_FLUSH_MS = 5000;
+  private readonly MAX_BUFFER_SIZE = 1000; // Backpressure: prevent OOM during ClickHouse slowdowns
   private snapshotFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private isFlushingSnapshots = false; // Guard against concurrent flushes
   private levelChangeFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private tradeFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -156,6 +180,7 @@ export class OrderbookManager extends DurableObject<Env> {
   private readonly MAX_RECONNECT_DELAY_MS = 30000;
   private readonly PING_INTERVAL_MS = 10000; // Send PING every 10 seconds
   private readonly CONNECTION_TIMEOUT_MS = 15000; // Timeout for WebSocket connection attempts (increased from 5s)
+  private readonly PREWARM_INTERVAL_MS = 55000; // Just under 60s hibernation threshold
   private readonly SNAPSHOT_INTERVAL_MS: number;
   // COST OPTIMIZATION: Increased from 5 minutes to 30 minutes
   // Full L2 snapshots are only needed for gap recovery, not backtesting
@@ -322,6 +347,11 @@ export class OrderbookManager extends DurableObject<Env> {
           }
           this.connections.get(connId)!.assets.add(assetId);
         }
+
+        // Pre-warm event buffer stub to avoid first-call latency
+        this.eventBufferStub = this.env.TRIGGER_EVENT_BUFFER.get(
+          this.env.TRIGGER_EVENT_BUFFER.idFromName("global")
+        );
 
         // Nautilus-style: Don't reconnect immediately on wake
         // Schedule delayed connection with jitter to avoid thundering herd
@@ -491,6 +521,8 @@ export class OrderbookManager extends DurableObject<Env> {
         return new Response("method not allowed", { status: 405 });
       case "/triggers/delete":
         return this.handleDeleteTrigger(request);
+      case "/metrics":
+        return this.handleMetrics();
       default:
         return new Response("not found", { status: 404 });
     }
@@ -642,6 +674,38 @@ export class OrderbookManager extends DurableObject<Env> {
   }
 
   /**
+   * Returns latency percentile metrics for trigger processing.
+   * Used for SLA monitoring and performance analysis.
+   */
+  private handleMetrics(): Response {
+    const stats = this.latencyTracker.getStats();
+    const toMs = (us: number) => Math.round(us / 1000);
+
+    return Response.json({
+      latency: {
+        total: {
+          p50_ms: toMs(stats.total.p50), p95_ms: toMs(stats.total.p95), p99_ms: toMs(stats.total.p99),
+          mean_ms: toMs(stats.total.mean), min_ms: toMs(stats.total.min), max_ms: toMs(stats.total.max),
+          sample_count: stats.total.count,
+        },
+        processing: {
+          p50_ms: toMs(stats.processing.p50), p95_ms: toMs(stats.processing.p95), p99_ms: toMs(stats.processing.p99),
+          mean_ms: toMs(stats.processing.mean), min_ms: toMs(stats.processing.min), max_ms: toMs(stats.processing.max),
+          sample_count: stats.processing.count,
+        },
+        window_ms: stats.total.window_ms,
+      },
+      triggers: { registered: this.triggers.size, by_asset: this.triggersByAsset.size },
+      circuit_breaker: {
+        open: this.triggerCircuitOpen.size,
+        failing: this.triggerFailureCount.size,
+        open_ids: Array.from(this.triggerCircuitOpen.keys()),
+      },
+      shard: this.shardId,
+    });
+  }
+
+  /**
    * Find an existing connection with capacity for the given market source.
    * Connections are market-specific since different markets have different WebSocket endpoints.
    *
@@ -668,7 +732,7 @@ export class OrderbookManager extends DurableObject<Env> {
    * Create a new WebSocket connection for a specific market source.
    * Uses the market's adapter to get the WebSocket URL and subscription format.
    *
-   * @param marketSource - The market source (e.g., "polymarket", "kalshi")
+   * @param marketSource - The market source (e.g., "polymarket")
    * @returns The connection ID
    */
   private async createConnection(marketSource: string = getDefaultMarketSource()): Promise<string> {
@@ -1106,7 +1170,7 @@ export class OrderbookManager extends DurableObject<Env> {
   /**
    * CANONICAL BOOK EVENT HANDLER
    * Handles book events from ANY market using connector normalization.
-   * This is the unified path for all markets (Polymarket, Kalshi, etc.)
+   * This is the unified path for all markets via the adapter pattern.
    *
    * CRITICAL: This handler includes hash chain verification to detect gaps.
    */
@@ -1390,7 +1454,7 @@ export class OrderbookManager extends DurableObject<Env> {
     event: PolymarketBookEvent,
     ingestionTs: number
   ): void {
-    const sourceTs = parseInt(event.timestamp);
+    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
     const conditionId = this.assetToMarket.get(event.asset_id) || event.market;
     const tickSize = this.tickSizes.get(event.asset_id) || 0.01;
 
@@ -1521,7 +1585,7 @@ export class OrderbookManager extends DurableObject<Env> {
     event: PolymarketPriceChangeEvent,
     ingestionTs: number
   ): void {
-    const sourceTs = parseInt(event.timestamp);
+    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
 
     // Group price changes by asset_id (each change has its own asset_id)
     const changesByAsset = new Map<string, typeof event.price_changes>();
@@ -1724,7 +1788,7 @@ export class OrderbookManager extends DurableObject<Env> {
     event: PolymarketLastTradePriceEvent,
     ingestionTs: number
   ): void {
-    const sourceTs = parseInt(event.timestamp);
+    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
     const conditionId = this.assetToMarket.get(event.asset_id) || event.market;
 
     const tradeTick: TradeTick = {
@@ -1861,6 +1925,18 @@ export class OrderbookManager extends DurableObject<Env> {
     // DATA INTEGRITY: Check for missing book events and stale data requiring resync
     this.checkDataIntegrity();
 
+    // PRE-WARMING: Keep DO warm if we have subscribed assets or triggers
+    // This prevents hibernation and cold start penalties (50-200ms)
+    if (this.assetToConnection.size > 0 || this.triggers.size > 0) {
+      await this.ctx.storage.put("_prewarm_ts", Date.now());
+
+      // Schedule next alarm even without active WebSocket connections
+      // to maintain DO warmth for trigger processing
+      if (!hasActiveConnections && this.connections.size === 0) {
+        await this.scheduleAlarm(this.PREWARM_INTERVAL_MS);
+      }
+    }
+
     // Schedule next alarm if we have active connections
     if (hasActiveConnections || this.connections.size > 0) {
       await this.scheduleAlarm(this.PING_INTERVAL_MS);
@@ -1957,7 +2033,9 @@ export class OrderbookManager extends DurableObject<Env> {
             asset_id: assetId,
             condition_id: conditionId,
             fired_at: Math.floor(now),
-            latency_us: 0, // N/A for stale quote detection
+            // For stale quote: latency = time since last quote update (meaningful metric)
+            total_latency_us: latestBBO?.ts ? Math.floor(now - latestBBO.ts) : 0,
+            processing_latency_us: latestBBO?.ts ? Math.floor(now - latestBBO.ts) : 0,
 
             best_bid: latestBBO?.best_bid ?? null,
             best_ask: latestBBO?.best_ask ?? null,
@@ -2109,6 +2187,9 @@ export class OrderbookManager extends DurableObject<Env> {
    * Add snapshot to buffer and schedule flush
    */
   private bufferSnapshot(snapshot: BBOSnapshot): void {
+    if (this.snapshotBuffer.length >= this.MAX_BUFFER_SIZE) {
+      this.snapshotBuffer.shift(); // Drop oldest to prevent OOM
+    }
     this.snapshotBuffer.push(snapshot);
     if (this.snapshotBuffer.length >= this.BUFFER_SIZE) {
       // Clear pending timer before size-triggered flush to prevent race condition
@@ -2128,9 +2209,11 @@ export class OrderbookManager extends DurableObject<Env> {
    * Flush snapshot buffer directly to ClickHouse
    */
   private async flushSnapshotBuffer(): Promise<void> {
-    if (this.snapshotBuffer.length === 0) return;
+    if (this.snapshotBuffer.length === 0 || this.isFlushingSnapshots) return;
 
-    const batch = this.snapshotBuffer.splice(0);
+    this.isFlushingSnapshots = true;
+    const batchSize = this.snapshotBuffer.length;
+    const batch = this.snapshotBuffer.slice(0, batchSize); // Copy, don't mutate yet
     if (this.snapshotFlushTimer) {
       clearTimeout(this.snapshotFlushTimer);
       this.snapshotFlushTimer = null;
@@ -2139,10 +2222,18 @@ export class OrderbookManager extends DurableObject<Env> {
     try {
       const clickhouse = new ClickHouseOrderbookClient(this.env);
       await clickhouse.insertSnapshots(batch);
+      this.snapshotBuffer.splice(0, batchSize); // Clear only after success
     } catch (error) {
       // Fallback: send to queue for retry
       console.error(`[DO ${this.shardId}] ClickHouse insert failed, falling back to queue:`, error);
-      await this.sendBatchToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, batch);
+      const queued = await this.sendBatchToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, batch);
+      if (queued) {
+        this.snapshotBuffer.splice(0, batchSize); // Clear only after queue accepts
+      } else {
+        console.error(`[DO ${this.shardId}] CRITICAL: Both ClickHouse and queue failed, retaining ${batchSize} snapshots`);
+      }
+    } finally {
+      this.isFlushingSnapshots = false;
     }
   }
 
@@ -2787,6 +2878,13 @@ export class OrderbookManager extends DurableObject<Env> {
       }
       this.triggersByAsset.get(trigger.asset_id)!.add(trigger.id);
 
+      // Pre-warm HMAC key cache if webhook has a secret (avoids 100-500μs on first fire)
+      if (trigger.webhook_secret) {
+        this.getOrCreateHmacKey(trigger.id, trigger.webhook_secret).catch((err) => {
+          console.error(`[Trigger] Failed to pre-warm HMAC key for ${trigger.id}:`, err);
+        });
+      }
+
       // Also index wildcard triggers
       if (trigger.asset_id === "*") {
         for (const assetId of this.assetToConnection.keys()) {
@@ -2890,8 +2988,44 @@ export class OrderbookManager extends DurableObject<Env> {
         `[Trigger] CRITICAL: Evaluation crashed for ${snapshot.asset_id.slice(0, 12)}...:`,
         error instanceof Error ? error.stack || error.message : String(error)
       );
-      // TODO: Implement circuit breaker to auto-disable triggers after repeated failures
+
+      // Circuit breaker: Track failures for all triggers associated with this asset
+      // When a crash occurs, we can't know which trigger caused it, so we track
+      // failures at the asset level and propagate to all triggers for this asset
+      this.recordTriggerFailuresForAsset(snapshot.asset_id);
     }
+  }
+
+  private recordTriggerFailure(triggerId: string): void {
+    const count = (this.triggerFailureCount.get(triggerId) || 0) + 1;
+    this.triggerFailureCount.set(triggerId, count);
+    if (count >= this.CIRCUIT_BREAKER_THRESHOLD) {
+      this.triggerCircuitOpen.set(triggerId, Date.now() + this.CIRCUIT_BREAKER_RESET_MS);
+      console.error(`[CircuitBreaker] OPENED for trigger ${triggerId} after ${count} failures`);
+    }
+  }
+
+  private recordTriggerFailuresForAsset(assetId: string): void {
+    const triggerIds = this.triggersByAsset.get(assetId);
+    if (triggerIds) {
+      for (const id of triggerIds) this.recordTriggerFailure(id);
+    }
+  }
+
+  private recordTriggerSuccess(triggerId: string): void {
+    if (this.triggerFailureCount.delete(triggerId) && this.triggerCircuitOpen.delete(triggerId)) {
+      console.log(`[CircuitBreaker] CLOSED for trigger ${triggerId}`);
+    }
+  }
+
+  private isTriggerCircuitClosed(triggerId: string): boolean {
+    const resetTime = this.triggerCircuitOpen.get(triggerId);
+    if (!resetTime) return true;
+    if (Date.now() >= resetTime) {
+      console.log(`[CircuitBreaker] HALF-OPEN for trigger ${triggerId}`);
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -2901,9 +3035,12 @@ export class OrderbookManager extends DurableObject<Env> {
   private evaluateTriggersCore(snapshot: BBOSnapshot): void {
     // Store latest BBO for arbitrage calculations
     // Mark as NOT stale since we just received fresh data
+    // Include size data for trade sizing calculations
     this.latestBBO.set(snapshot.asset_id, {
       best_bid: snapshot.best_bid,
       best_ask: snapshot.best_ask,
+      bid_size: snapshot.bid_size,
+      ask_size: snapshot.ask_size,
       ts: snapshot.source_ts,
       stale: false,
     });
@@ -2923,13 +3060,12 @@ export class OrderbookManager extends DurableObject<Env> {
       for (const id of wildcardTriggerIds) triggerIdsToCheck.add(id);
     }
 
-    if (triggerIdsToCheck.size === 0) return;
-
+    const hasRegisteredTriggers = triggerIdsToCheck.size > 0;
     const now = Date.now() * 1000; // Microseconds
 
-    // Update price history for PRICE_MOVE triggers
-    // OPTIMIZATION: Only track history if we have active triggers (prevents memory leak)
-    if (snapshot.mid_price !== null && triggerIdsToCheck.size > 0) {
+    // Update price history for PRICE_MOVE triggers and VOLATILITY_SPIKE global trigger
+    // Always track since global triggers need this data for volatility calculations
+    if (snapshot.mid_price !== null) {
       let history = this.priceHistory.get(snapshot.asset_id);
       if (!history) {
         history = [];
@@ -3021,45 +3157,67 @@ export class OrderbookManager extends DurableObject<Env> {
     // CRITICAL PATH OPTIMIZATION: Collect all fired events for potential batched dispatch
     const firedEvents: { trigger: Trigger; event: TriggerEvent }[] = [];
 
-    for (const triggerId of triggerIdsToCheck) {
-      const trigger = this.triggers.get(triggerId);
-      if (!trigger || !trigger.enabled) continue;
+    // Only evaluate registered triggers if any exist
+    if (hasRegisteredTriggers) {
+      for (const triggerId of triggerIdsToCheck) {
+        const trigger = this.triggers.get(triggerId);
+        if (!trigger || !trigger.enabled) continue;
 
-      // Check cooldown
-      const lastFire = this.lastTriggerFire.get(triggerId) || 0;
-      if (now - lastFire < trigger.cooldown_ms * 1000) continue; // Convert ms to us
+        // Circuit breaker: Skip triggers with open circuits
+        if (!this.isTriggerCircuitClosed(triggerId)) {
+          continue;
+        }
 
-      const result = this.checkTriggerCondition(trigger, snapshot);
-      if (result.fired) {
-        this.lastTriggerFire.set(triggerId, now);
+        // Check cooldown
+        const lastFire = this.lastTriggerFire.get(triggerId) || 0;
+        if (now - lastFire < trigger.cooldown_ms * 1000) continue; // Convert ms to us
 
-        const event: TriggerEvent = {
-          trigger_id: triggerId,
-          trigger_type: trigger.condition.type,
-          asset_id: snapshot.asset_id,
-          condition_id: snapshot.condition_id,
-          fired_at: Math.floor(now),
-          latency_us: Math.floor(now - snapshot.source_ts * 1000), // source_ts is ms, convert to us
+        let result: { fired: boolean; actualValue: number; arbitrageData?: Partial<TriggerEvent> };
+        try {
+          result = this.checkTriggerCondition(trigger, snapshot);
+          this.recordTriggerSuccess(triggerId);
+        } catch (error) {
+          console.error(`[Trigger] Failed ${triggerId}: ${error instanceof Error ? error.message : error}`);
+          this.recordTriggerFailure(triggerId);
+          continue;
+        }
 
-          best_bid: snapshot.best_bid,
-          best_ask: snapshot.best_ask,
-          bid_size: snapshot.bid_size,
-          ask_size: snapshot.ask_size,
-          mid_price: snapshot.mid_price,
-          spread_bps: snapshot.spread_bps,
+        if (result.fired) {
+          this.lastTriggerFire.set(triggerId, now);
 
-          threshold: trigger.condition.threshold,
-          actual_value: result.actualValue,
+          const event: TriggerEvent = {
+            trigger_id: triggerId,
+            trigger_type: trigger.condition.type,
+            asset_id: snapshot.asset_id,
+            condition_id: snapshot.condition_id,
+            fired_at: Math.floor(now),
+            // Dual latency tracking (both timestamps are in microseconds)
+            total_latency_us: Math.floor(now - snapshot.source_ts), // includes network latency
+            processing_latency_us: Math.floor(now - snapshot.ingestion_ts), // DO processing only
 
-          // Add arbitrage-specific fields if applicable
-          ...result.arbitrageData,
+            best_bid: snapshot.best_bid,
+            best_ask: snapshot.best_ask,
+            bid_size: snapshot.bid_size,
+            ask_size: snapshot.ask_size,
+            mid_price: snapshot.mid_price,
+            spread_bps: snapshot.spread_bps,
 
-          book_hash: snapshot.book_hash,
-          sequence_number: snapshot.sequence_number,
-          metadata: trigger.metadata,
-        };
+            threshold: trigger.condition.threshold,
+            actual_value: result.actualValue,
 
-        firedEvents.push({ trigger, event });
+            // Add arbitrage-specific fields if applicable
+            ...result.arbitrageData,
+
+            book_hash: snapshot.book_hash,
+            sequence_number: snapshot.sequence_number,
+            metadata: trigger.metadata,
+          };
+
+          firedEvents.push({ trigger, event });
+
+          // Record latency for metrics tracking
+          this.latencyTracker.record(event.total_latency_us, event.processing_latency_us);
+        }
       }
     }
 
@@ -3069,6 +3227,10 @@ export class OrderbookManager extends DurableObject<Env> {
     // ============================================================
     const globalEvents = this.evaluateGlobalTriggers(snapshot, now);
 
+    // Note: Global trigger latency is NOT recorded separately - they're included
+    // in allEvents which is sufficient for dashboard display. Registered triggers
+    // already record latency at line 3218 above.
+
     // LARGE_FILL: Update previousBBO BEFORE dispatch to ensure state consistency
     // (if dispatch throws, we still have correct state for next evaluation)
     this.previousBBO.set(snapshot.asset_id, {
@@ -3077,10 +3239,10 @@ export class OrderbookManager extends DurableObject<Env> {
     });
 
     // Collect all events for batched SSE publish (reduces DO hops)
-    const allEvents = [
-      ...firedEvents.map(f => f.event),
-      ...globalEvents,
-    ];
+    // OPTIMIZED: Push loop instead of spread operator to avoid intermediate allocations
+    const allEvents: TriggerEvent[] = [];
+    for (const f of firedEvents) allEvents.push(f.event);
+    for (const e of globalEvents) allEvents.push(e);
 
     // Single batched SSE publish for all events (fire-and-forget)
     if (allEvents.length > 0) {
@@ -3092,28 +3254,9 @@ export class OrderbookManager extends DurableObject<Env> {
       if (trigger.webhook_url) {
         this.ctx.waitUntil(this.dispatchWebhook(trigger, event));
       }
-      // Log trigger fires (backgrounded)
-      this.ctx.waitUntil(
-        Promise.resolve().then(() =>
-          console.log(
-            `[Trigger] Fired ${trigger.id} (${trigger.condition.type}) for ${event.asset_id} ` +
-              `@ ${event.actual_value.toFixed(4)}, latency=${Math.round(event.latency_us / 1000)}ms`
-          )
-        )
-      );
     }
-
-    // Log global trigger fires (backgrounded)
-    for (const event of globalEvents) {
-      this.ctx.waitUntil(
-        Promise.resolve().then(() =>
-          console.log(
-            `[Trigger] Global ${event.trigger_type} for ${event.asset_id?.slice(0, 12)}... ` +
-              `@ ${event.actual_value.toFixed(4)}`
-          )
-        )
-      );
-    }
+    // Note: Removed per-trigger console.log to avoid microtask overhead in hot path.
+    // Trigger fires are observable via SSE stream and metrics endpoint.
   }
 
   private checkTriggerCondition(
@@ -3198,14 +3341,25 @@ export class OrderbookManager extends DurableObject<Env> {
         // Convert window_ms to microseconds (source_ts is in microseconds)
         const windowStartUs = snapshot.source_ts - (window_ms * 1000);
 
-        // Find oldest entry within the window using explicit loop
-        // History is sorted ascending by timestamp, so first match is oldest in window
+        // Binary search for first entry within window (O(log n) vs O(n) linear scan)
+        // History is sorted ascending by timestamp, so we find leftmost entry >= windowStartUs
         let baselineEntry: PriceHistoryEntry | null = null;
-        for (let i = 0; i < history.length; i++) {
-          if (history[i].ts >= windowStartUs) {
-            baselineEntry = history[i];
-            break;
+        let left = 0;
+        let right = history.length - 1;
+        let firstValidIdx = history.length;
+
+        while (left <= right) {
+          const mid = Math.floor((left + right) / 2);
+          if (history[mid].ts >= windowStartUs) {
+            firstValidIdx = mid;
+            right = mid - 1; // Continue searching left for earliest valid entry
+          } else {
+            left = mid + 1; // Search right for valid entries
           }
+        }
+
+        if (firstValidIdx < history.length) {
+          baselineEntry = history[firstValidIdx];
         }
 
         if (baselineEntry && baselineEntry.mid_price > 0) {
@@ -3252,12 +3406,21 @@ export class OrderbookManager extends DurableObject<Env> {
         // CRITICAL: Check BOTH explicit stale flag AND time delta to prevent false signals
         // Stale flag is set proactively when counterpart data is old relative to new updates
         if (counterpartBBO.stale) break;
-        if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > 5000) break;
+        if (!isTimestampFresh(snapshot.source_ts, counterpartBBO.ts)) break;
 
         const sumOfAsks = snapshot.best_ask + counterpartBBO.best_ask;
         if (sumOfAsks < threshold) {
           // Profit = 1 - sumOfAsks (guaranteed payout is $1)
           const profitBps = (1 - sumOfAsks) * 10000;
+
+          // Trade sizing using shared utility
+          const sizing = calculateArbitrageSizing({
+            primarySize: snapshot.ask_size,
+            counterpartSize: counterpartBBO.ask_size,
+            priceSum: sumOfAsks,
+            profitPerShare: 1 - sumOfAsks,
+          });
+
           return {
             fired: true,
             actualValue: sumOfAsks,
@@ -3265,8 +3428,11 @@ export class OrderbookManager extends DurableObject<Env> {
               counterpart_asset_id,
               counterpart_best_bid: counterpartBBO.best_bid,
               counterpart_best_ask: counterpartBBO.best_ask,
+              counterpart_bid_size: counterpartBBO.bid_size,
+              counterpart_ask_size: counterpartBBO.ask_size,
               sum_of_asks: sumOfAsks,
               potential_profit_bps: profitBps,
+              ...sizing,
             },
           };
         }
@@ -3284,12 +3450,21 @@ export class OrderbookManager extends DurableObject<Env> {
         // CRITICAL: Check BOTH explicit stale flag AND time delta to prevent false signals
         // Stale flag is set proactively when counterpart data is old relative to new updates
         if (counterpartBBO.stale) break;
-        if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > 5000) break;
+        if (!isTimestampFresh(snapshot.source_ts, counterpartBBO.ts)) break;
 
         const sumOfBids = snapshot.best_bid + counterpartBBO.best_bid;
         if (sumOfBids > threshold) {
           // Profit = sumOfBids - 1 (you receive more than the $1 you'll pay out)
           const profitBps = (sumOfBids - 1) * 10000;
+
+          // Trade sizing using shared utility
+          const sizing = calculateArbitrageSizing({
+            primarySize: snapshot.bid_size,
+            counterpartSize: counterpartBBO.bid_size,
+            priceSum: sumOfBids,
+            profitPerShare: sumOfBids - 1,
+          });
+
           return {
             fired: true,
             actualValue: sumOfBids,
@@ -3297,8 +3472,11 @@ export class OrderbookManager extends DurableObject<Env> {
               counterpart_asset_id,
               counterpart_best_bid: counterpartBBO.best_bid,
               counterpart_best_ask: counterpartBBO.best_ask,
+              counterpart_bid_size: counterpartBBO.bid_size,
+              counterpart_ask_size: counterpartBBO.ask_size,
               sum_of_bids: sumOfBids,
               potential_profit_bps: profitBps,
+              ...sizing,
             },
           };
         }
@@ -3320,26 +3498,47 @@ export class OrderbookManager extends DurableObject<Env> {
         // Convert window_ms to microseconds
         const windowStartUs = snapshot.source_ts - (window_ms * 1000);
 
-        // Get entries within window
-        const windowEntries = history.filter(e => e.ts >= windowStartUs);
-        if (windowEntries.length < 2) break;
+        // OPTIMIZED: Binary search for window start index - O(log n) instead of O(n) filter
+        let startIdx = 0;
+        {
+          let left = 0;
+          let right = history.length;
+          while (left < right) {
+            const mid = (left + right) >>> 1;
+            if (history[mid].ts < windowStartUs) {
+              left = mid + 1;
+            } else {
+              right = mid;
+            }
+          }
+          startIdx = left;
+        }
 
-        // Calculate returns
-        const returns: number[] = [];
-        for (let i = 1; i < windowEntries.length; i++) {
-          const prevPrice = windowEntries[i - 1].mid_price;
+        const windowLength = history.length - startIdx;
+        if (windowLength < 2) break;
+
+        // OPTIMIZED: Calculate variance in single pass using Welford's online algorithm
+        // No intermediate array allocations
+        let count = 0;
+        let mean = 0;
+        let m2 = 0; // Sum of squared differences from mean
+
+        for (let i = startIdx + 1; i < history.length; i++) {
+          const prevPrice = history[i - 1].mid_price;
           if (prevPrice > 0) {
-            returns.push((windowEntries[i].mid_price - prevPrice) / prevPrice);
+            const ret = (history[i].mid_price - prevPrice) / prevPrice;
+            count++;
+            const delta = ret - mean;
+            mean += delta / count;
+            const delta2 = ret - mean;
+            m2 += delta * delta2;
           }
         }
 
-        if (returns.length < 2) break;
+        if (count < 2) break;
 
-        // Calculate standard deviation
-        const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
-        const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
-        const stdDev = Math.sqrt(variance);
-        const volatilityPct = stdDev * 100;
+        const variance = m2 / count;
+        const volatilityPct = Math.sqrt(Math.max(0, variance)) * 100;
 
         if (volatilityPct > threshold) {
           return {
@@ -3392,13 +3591,23 @@ export class OrderbookManager extends DurableObject<Env> {
         const imbHistory = this.imbalanceHistory.get(snapshot.asset_id);
         if (!imbHistory || imbHistory.length === 0) break;
 
-        // Find imbalance at window start
+        // OPTIMIZED: Binary search for window start - O(log n) instead of O(n) linear scan
         const windowStartUs = snapshot.source_ts - (window_ms * 1000);
         let previousImbalance: number | null = null;
-        for (let i = 0; i < imbHistory.length; i++) {
-          if (imbHistory[i].ts >= windowStartUs) {
-            previousImbalance = imbHistory[i].imbalance;
-            break;
+        {
+          let left = 0;
+          let right = imbHistory.length;
+          while (left < right) {
+            const mid = (left + right) >>> 1;
+            if (imbHistory[mid].ts < windowStartUs) {
+              left = mid + 1;
+            } else {
+              right = mid;
+            }
+          }
+          // left is now the first index where ts >= windowStartUs
+          if (left < imbHistory.length) {
+            previousImbalance = imbHistory[left].imbalance;
           }
         }
 
@@ -3485,16 +3694,23 @@ export class OrderbookManager extends DurableObject<Env> {
 
         let sumOfAsks = 0;
         let validCount = 0;
+        let minAskSize: number | null = null;
 
         for (const assetId of outcome_asset_ids) {
           const bbo = this.latestBBO.get(assetId);
           if (!bbo || bbo.best_ask === null) continue;
 
-          // Check staleness (5 second max age)
-          if (Math.abs(snapshot.source_ts - bbo.ts) > 5000) continue;
+          // Check staleness using shared constant
+          if (!isTimestampFresh(snapshot.source_ts, bbo.ts)) continue;
 
           sumOfAsks += bbo.best_ask;
           validCount++;
+
+          // Track minimum ask size across all outcomes (liquidity-constrained)
+          const askSize = bbo.ask_size ?? 0;
+          if (minAskSize === null || askSize < minAskSize) {
+            minAskSize = askSize;
+          }
         }
 
         // Need data for all outcomes
@@ -3502,6 +3718,9 @@ export class OrderbookManager extends DurableObject<Env> {
 
         if (sumOfAsks < threshold) {
           const profitBps = (1 - sumOfAsks) * 10000;
+          const profitPerShare = 1 - sumOfAsks;
+          const recommendedSize = minAskSize ?? 0;
+
           return {
             fired: true,
             actualValue: sumOfAsks,
@@ -3509,6 +3728,9 @@ export class OrderbookManager extends DurableObject<Env> {
               outcome_ask_sum: sumOfAsks,
               outcome_count: validCount,
               potential_profit_bps: profitBps,
+              recommended_size: recommendedSize,
+              max_notional: recommendedSize * sumOfAsks,
+              expected_profit: recommendedSize * profitPerShare,
             },
           };
         }
@@ -3602,7 +3824,9 @@ export class OrderbookManager extends DurableObject<Env> {
         asset_id: assetId,
         condition_id: snapshot.condition_id,
         fired_at: Math.floor(nowUs),
-        latency_us: Math.floor(nowUs - snapshot.source_ts * 1000),
+        // Dual latency tracking (both timestamps are in microseconds)
+        total_latency_us: Math.floor(nowUs - snapshot.source_ts),
+        processing_latency_us: Math.floor(nowUs - snapshot.ingestion_ts),
 
         best_bid: snapshot.best_bid,
         best_ask: snapshot.best_ask,
@@ -3728,25 +3952,48 @@ export class OrderbookManager extends DurableObject<Env> {
     }
 
     // VOLATILITY_SPIKE: Fire when volatility > 2% (checked with 10s window)
+    // OPTIMIZED: Uses binary search + in-place variance calculation to avoid allocations
     if (snapshot.mid_price !== null) {
       const history = this.priceHistory.get(assetId);
       if (history && history.length >= 5) {
         const windowStartUs = snapshot.source_ts - 10000000; // 10 second window
-        const windowEntries = history.filter(e => e.ts >= windowStartUs);
 
-        if (windowEntries.length >= 3) {
-          const returns: number[] = [];
-          for (let i = 1; i < windowEntries.length; i++) {
-            const prevPrice = windowEntries[i - 1].mid_price;
+        // Binary search for window start index - O(log n) instead of O(n) filter
+        let startIdx = 0;
+        let left = 0, right = history.length;
+        while (left < right) {
+          const mid = (left + right) >>> 1;
+          if (history[mid].ts < windowStartUs) {
+            left = mid + 1;
+          } else {
+            right = mid;
+          }
+        }
+        startIdx = left;
+
+        const windowLength = history.length - startIdx;
+        if (windowLength >= 3) {
+          // Calculate returns and variance in single pass without allocation
+          // Using Welford's online algorithm for numerical stability
+          let count = 0;
+          let mean = 0;
+          let m2 = 0; // Sum of squared differences from mean
+
+          for (let i = startIdx + 1; i < history.length; i++) {
+            const prevPrice = history[i - 1].mid_price;
             if (prevPrice > 0) {
-              returns.push((windowEntries[i].mid_price - prevPrice) / prevPrice);
+              const ret = (history[i].mid_price - prevPrice) / prevPrice;
+              count++;
+              const delta = ret - mean;
+              mean += delta / count;
+              const delta2 = ret - mean;
+              m2 += delta * delta2;
             }
           }
 
-          if (returns.length >= 2) {
-            const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
-            const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
-            const volatilityPct = Math.sqrt(variance) * 100;
+          if (count >= 2) {
+            const variance = m2 / count;
+            const volatilityPct = Math.sqrt(Math.max(0, variance)) * 100;
 
             if (volatilityPct > 2) {
               maybeFireGlobal("VOLATILITY_SPIKE", 2, volatilityPct, {
@@ -3776,10 +4023,20 @@ export class OrderbookManager extends DurableObject<Env> {
     let firstValidIdx = 0;
 
     // Time-based pruning (if cutoff provided)
-    if (cutoffUs !== undefined) {
-      while (firstValidIdx < history.length && history[firstValidIdx].ts < cutoffUs) {
-        firstValidIdx++;
+    // OPTIMIZED: Binary search O(log n) instead of linear scan O(n)
+    if (cutoffUs !== undefined && history.length > 0) {
+      let left = 0;
+      let right = history.length;
+      // Find first index where ts >= cutoffUs
+      while (left < right) {
+        const mid = (left + right) >>> 1;
+        if (history[mid].ts < cutoffUs) {
+          left = mid + 1;
+        } else {
+          right = mid;
+        }
       }
+      firstValidIdx = left;
     }
 
     // Enforce count-based limit

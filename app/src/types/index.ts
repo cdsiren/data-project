@@ -37,7 +37,10 @@ export interface TriggerEvent {
   asset_id: string;
   condition_id: string;
   fired_at: number;
-  latency_us: number;
+
+  // Dual latency tracking
+  total_latency_us: number; // includes network (source_ts → fired_at)
+  processing_latency_us: number; // DO processing only (ingestion_ts → fired_at)
 
   best_bid: number | null;
   best_ask: number | null;

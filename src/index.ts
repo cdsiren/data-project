@@ -18,10 +18,12 @@ import { fullL2SnapshotConsumer } from "./consumers/full-l2-snapshot-consumer";
 import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
 import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache, refreshAllMarketMetadata, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { MarketCacheService } from "./services/market-cache";
+import { TriggerValidator } from "./services/trigger-evaluator/trigger-validator";
 import { MarketCleanupService } from "./services/market-cleanup";
 import { CronErrorTracker, withCronErrorTracking } from "./services/cron-error-tracker";
 import { DB_CONFIG } from "./config/database";
 import { backtest } from "./routes/backtest";
+import { apiV1 } from "./routes/api-v1";
 
 // Helper to parse token IDs from JSON string
 function parseTokenIds(clobTokenIds: string): string[] {
@@ -67,11 +69,10 @@ function getShardForMarket(conditionId: string): string {
 /**
  * Location hints per market source.
  * Based on where each market's servers are located.
+ * Add new markets here when implementing additional adapters.
  */
 const MARKET_LOCATION_HINTS: Record<string, DurableObjectLocationHint> = {
   polymarket: "weur",  // London (eu-west-2) - Polymarket servers
-  kalshi: "enam",      // US East - Kalshi servers (CFTC regulated, US-based)
-  manifold: "wnam",    // US West - Manifold Markets
 };
 
 /**
@@ -90,7 +91,7 @@ interface DurableObjectNamespaceExt {
 /**
  * Get OrderbookManager DO stub with per-market location hint for optimal latency.
  * @param env - Worker environment
- * @param marketSource - Market source identifier (e.g., "polymarket", "kalshi")
+ * @param marketSource - Market source identifier (e.g., "polymarket")
  * @param shardId - Shard identifier
  * @returns DO stub co-located near the market's servers
  */
@@ -283,6 +284,27 @@ app.post("/triggers", authMiddleware, async (c) => {
     return c.json({ error: "Missing required field: asset_id" }, 400);
   }
 
+  if (!body.condition) {
+    return c.json({ error: "Missing required field: condition" }, 400);
+  }
+
+  // Validate trigger-market compatibility
+  // Currently all markets are prediction markets, but this enables future expansion
+  const validator = new TriggerValidator();
+  const marketType = body.market_type || "prediction"; // Default to prediction for now
+  const validation = validator.validateForMarket(body.condition, marketType);
+
+  if (!validation.valid) {
+    return c.json(
+      {
+        error: "Invalid trigger configuration",
+        details: validation.errors,
+        hint: `Supported triggers for ${marketType} markets: ${validator.getSupportedTriggers(marketType).join(", ")}`,
+      },
+      400
+    );
+  }
+
   // Determine condition_id for market-based shard routing
   let conditionId: string | null = body.condition_id || null;
 
@@ -370,6 +392,95 @@ app.delete("/triggers", authMiddleware, async (c) => {
 // ============================================================
 // Shard Monitoring
 // ============================================================
+
+// Get aggregated latency metrics from all shards
+// No auth required - metrics are public for dashboard monitoring
+// CORS enabled for dashboard access from localhost
+app.get("/do/metrics", cors({
+  origin: (origin) => origin || "*",
+  allowMethods: ["GET", "OPTIONS"],
+  credentials: true,
+}), async (c) => {
+  interface ShardMetrics {
+    latency: {
+      total: { p50_ms: number; p95_ms: number; p99_ms: number; mean_ms: number; sample_count: number };
+      processing: { p50_ms: number; p95_ms: number; p99_ms: number; mean_ms: number; sample_count: number };
+      window_ms: number;
+    };
+    triggers: { registered: number; by_asset: number };
+    shard: string;
+  }
+
+  const shardResults = await forEachShard<ShardMetrics>(
+    c.env,
+    async (stub) => {
+      const resp = await stub.fetch("http://do/metrics");
+      return resp.json() as Promise<ShardMetrics>;
+    },
+    { continueOnError: true }
+  );
+
+  // Aggregate metrics across all shards
+  // Use weighted average for percentiles based on sample counts
+  let totalSamples = 0;
+  let processingWeightedP50 = 0;
+  let processingWeightedP95 = 0;
+  let processingWeightedP99 = 0;
+  let processingWeightedMean = 0;
+  let totalWeightedP50 = 0;
+  let totalWeightedP95 = 0;
+  let totalWeightedP99 = 0;
+  let totalWeightedMean = 0;
+  let triggersRegistered = 0;
+
+  const shardMetrics = shardResults.map((r) => {
+    if (r.result && r.result.latency.total.sample_count > 0) {
+      const count = r.result.latency.total.sample_count;
+      totalSamples += count;
+      processingWeightedP50 += r.result.latency.processing.p50_ms * count;
+      processingWeightedP95 += r.result.latency.processing.p95_ms * count;
+      processingWeightedP99 += r.result.latency.processing.p99_ms * count;
+      processingWeightedMean += r.result.latency.processing.mean_ms * count;
+      totalWeightedP50 += r.result.latency.total.p50_ms * count;
+      totalWeightedP95 += r.result.latency.total.p95_ms * count;
+      totalWeightedP99 += r.result.latency.total.p99_ms * count;
+      totalWeightedMean += r.result.latency.total.mean_ms * count;
+    }
+    if (r.result?.triggers) {
+      triggersRegistered += r.result.triggers.registered;
+    }
+    return {
+      shard: r.shard,
+      ...(r.result && { metrics: r.result }),
+      ...(r.error && { error: r.error }),
+    };
+  });
+
+  // Calculate weighted averages
+  const aggregated = totalSamples > 0 ? {
+    total: {
+      p50_ms: Math.round(totalWeightedP50 / totalSamples),
+      p95_ms: Math.round(totalWeightedP95 / totalSamples),
+      p99_ms: Math.round(totalWeightedP99 / totalSamples),
+      mean_ms: Math.round(totalWeightedMean / totalSamples),
+    },
+    processing: {
+      p50_ms: Math.round(processingWeightedP50 / totalSamples),
+      p95_ms: Math.round(processingWeightedP95 / totalSamples),
+      p99_ms: Math.round(processingWeightedP99 / totalSamples),
+      mean_ms: Math.round(processingWeightedMean / totalSamples),
+    },
+    sample_count: totalSamples,
+    triggers_registered: triggersRegistered,
+  } : null;
+
+  return c.json({
+    aggregated,
+    shards: shardMetrics,
+    shard_count: SHARD_COUNT,
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // Get status of all shards - health check and asset distribution
 app.get("/shards/status", authMiddleware, async (c) => {
@@ -815,14 +926,18 @@ app.post("/admin/migrate", authMiddleware, async (c) => {
       clob_token_ids String,
       neg_risk UInt8,
       neg_risk_market_id String,
-      neg_risk_request_id String
+      neg_risk_request_id String,
+      description String CODEC(ZSTD(3)),
+      category String
     ) ENGINE = ReplacingMergeTree() ORDER BY (condition_id, id)`,
 
     // market_events table - stores event metadata linked to markets
     `CREATE TABLE IF NOT EXISTS ${DB_CONFIG.DATABASE}.market_events (
       event_id String,
       market_id String,
-      title String
+      title String,
+      slug String,
+      description String CODEC(ZSTD(3))
     ) ENGINE = ReplacingMergeTree() ORDER BY (event_id, market_id)`,
   ];
 
@@ -1527,14 +1642,15 @@ app.get("/test/all", async (c) => {
 });
 
 // ============================================================
-// Dashboard API Endpoints (Public - CORS enabled)
+// Dashboard API Endpoints (OpenAPI-enabled - see routes/api-v1.ts)
 // ============================================================
 
-// CORS middleware for dashboard API
-const dashboardApi = new Hono<{ Bindings: Env }>();
+// Legacy auth endpoints preserved for backward compatibility
+// Main API routes moved to routes/api-v1.ts with OpenAPI/Zod validation
+const legacyDashboardApi = new Hono<{ Bindings: Env }>();
 
-dashboardApi.use("*", cors({
-  origin: (origin) => origin || "*", // Allow the requesting origin for credentials
+legacyDashboardApi.use("*", cors({
+  origin: (origin) => origin || "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
   allowHeaders: ["Content-Type", "X-API-Key"],
   credentials: true,
@@ -1606,7 +1722,7 @@ async function verifySessionToken(token: string, apiKey: string): Promise<boolea
  * Auth endpoint - validates API key and sets session cookie
  * POST /api/v1/auth with X-API-Key header or { "api_key": "..." } body
  */
-dashboardApi.post("/auth", async (c) => {
+legacyDashboardApi.post("/auth", async (c) => {
   const apiKey = c.req.header("X-API-Key") || (await c.req.json().catch(() => ({}))).api_key;
 
   if (!apiKey || apiKey !== c.env.VITE_DASHBOARD_API_KEY) {
@@ -1639,7 +1755,7 @@ async function validateSession(c: Context<{ Bindings: Env }>): Promise<boolean> 
 }
 
 // Top Activity Endpoint - Most active market by tick count
-dashboardApi.get("/markets/top-activity", async (c) => {
+legacyDashboardApi.get("/markets/top-activity", async (c) => {
   if (!c.env.CLICKHOUSE_URL) {
     return c.json({ error: "CLICKHOUSE_URL not configured" }, 503);
   }
@@ -1707,8 +1823,172 @@ dashboardApi.get("/markets/top-activity", async (c) => {
   }
 });
 
+/**
+ * Markets Endpoint - List available markets with metadata
+ * GET /api/v1/markets
+ *
+ * Query params:
+ * - market_source: Filter by market source (polymarket)
+ * - active: Filter by active markets only (default: true)
+ * - limit: Number of markets to return (default: 100, max: 1000)
+ * - offset: Pagination offset (default: 0)
+ *
+ * Response includes:
+ * - asset_id: Unique identifier for the asset
+ * - condition_id: Market grouping ID
+ * - question: Human-readable market question
+ * - market_source: Source exchange
+ * - market_type: Market type (prediction, dex, etc.)
+ * - tick_count: Recent activity count (last 24h)
+ * - last_tick: Timestamp of most recent data
+ * - end_date: Market expiration date (if applicable)
+ */
+legacyDashboardApi.get("/markets", async (c) => {
+  if (!c.env.CLICKHOUSE_URL) {
+    return c.json({ error: "CLICKHOUSE_URL not configured" }, 503);
+  }
+
+  const marketSource = c.req.query("market_source");
+  const activeOnly = c.req.query("active") !== "false"; // default true
+  const limit = Math.min(parseInt(c.req.query("limit") || "100"), 1000);
+  const offset = parseInt(c.req.query("offset") || "0");
+
+  const headers = {
+    "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
+    "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
+  };
+
+  // Build WHERE clauses
+  const whereConditions: string[] = [];
+  if (marketSource) {
+    whereConditions.push(`m.market_source = '${marketSource.replace(/'/g, "''")}'`);
+  }
+  if (activeOnly) {
+    whereConditions.push("mm.end_date > now()");
+  }
+  const whereClause = whereConditions.length > 0
+    ? `WHERE ${whereConditions.join(" AND ")}`
+    : "";
+
+  // Query markets with metadata and recent activity
+  const query = `
+    WITH market_activity AS (
+      SELECT
+        asset_id,
+        market_source,
+        market_type,
+        countMerge(tick_count_state) as tick_count,
+        maxMerge(last_ts_state) as last_tick
+      FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
+      WHERE minute >= now() - INTERVAL 24 HOUR
+      GROUP BY asset_id, market_source, market_type
+    ),
+    tokens AS (
+      SELECT
+        id,
+        question,
+        condition_id,
+        slug,
+        end_date,
+        neg_risk,
+        category,
+        arrayJoin(JSONExtractArrayRaw(clob_token_ids)) as token
+      FROM ${DB_CONFIG.DATABASE}.market_metadata
+    )
+    SELECT
+      replaceAll(t.token, '"', '') as asset_id,
+      t.condition_id,
+      t.question,
+      coalesce(m.market_source, 'polymarket') as market_source,
+      coalesce(m.market_type, 'prediction') as market_type,
+      t.category,
+      t.neg_risk,
+      t.end_date,
+      coalesce(m.tick_count, 0) as tick_count,
+      m.last_tick
+    FROM tokens t
+    LEFT JOIN market_activity m ON replaceAll(t.token, '"', '') = m.asset_id
+    ${whereClause}
+    ORDER BY tick_count DESC, t.end_date ASC
+    LIMIT ${limit}
+    OFFSET ${offset}
+    FORMAT JSONEachRow
+  `;
+
+  try {
+    const response = await fetch(
+      `${c.env.CLICKHOUSE_URL}/?async_insert=0`,
+      {
+        method: "POST",
+        headers,
+        body: query,
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("[markets] ClickHouse error:", errorText);
+      return c.json({ error: "Database query failed", details: errorText }, 500);
+    }
+
+    const text = await response.text();
+    const markets = text.trim().split("\n").filter(Boolean).map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+
+    // Also get total count for pagination
+    const countQuery = `
+      WITH tokens AS (
+        SELECT
+          id,
+          end_date,
+          arrayJoin(JSONExtractArrayRaw(clob_token_ids)) as token
+        FROM ${DB_CONFIG.DATABASE}.market_metadata
+        ${activeOnly ? "WHERE end_date > now()" : ""}
+      )
+      SELECT count() as total FROM tokens
+    `;
+
+    const countResponse = await fetch(
+      `${c.env.CLICKHOUSE_URL}/?async_insert=0`,
+      {
+        method: "POST",
+        headers,
+        body: countQuery,
+      }
+    );
+
+    let total = markets.length;
+    if (countResponse.ok) {
+      const countText = await countResponse.text();
+      const match = countText.match(/(\d+)/);
+      if (match) {
+        total = parseInt(match[1]);
+      }
+    }
+
+    return c.json({
+      data: markets,
+      pagination: {
+        limit,
+        offset,
+        total,
+        has_more: offset + markets.length < total,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("[markets] Error:", error);
+    return c.json({ error: "Failed to query markets", details: String(error) }, 500);
+  }
+});
+
 // OHLC Endpoint - Candlestick data for charting
-dashboardApi.get("/ohlc/:asset_id", async (c) => {
+legacyDashboardApi.get("/ohlc/:asset_id", async (c) => {
   const assetId = c.req.param("asset_id");
   const interval = c.req.query("interval") || "1m";
   const hours = parseInt(c.req.query("hours") || "24");
@@ -1785,7 +2065,7 @@ dashboardApi.get("/ohlc/:asset_id", async (c) => {
 
 // SSE Endpoint - Stream trigger events
 // Uses cookie-based auth (call POST /auth first to get session cookie)
-dashboardApi.get("/triggers/events/sse", async (c) => {
+legacyDashboardApi.get("/triggers/events/sse", async (c) => {
   if (!(await validateSession(c))) {
     return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
   }
@@ -1799,7 +2079,7 @@ dashboardApi.get("/triggers/events/sse", async (c) => {
 });
 
 // Trigger event buffer status
-dashboardApi.get("/triggers/events/status", async (c) => {
+legacyDashboardApi.get("/triggers/events/status", async (c) => {
   if (!(await validateSession(c))) {
     return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
   }
@@ -1810,7 +2090,7 @@ dashboardApi.get("/triggers/events/status", async (c) => {
 });
 
 // Get buffered trigger events for validation/debugging
-dashboardApi.get("/triggers/events", async (c) => {
+legacyDashboardApi.get("/triggers/events", async (c) => {
   if (!(await validateSession(c))) {
     return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
   }
@@ -1824,8 +2104,12 @@ dashboardApi.get("/triggers/events", async (c) => {
   return response;
 });
 
-// Mount dashboard API under /api/v1
-app.route("/api/v1", dashboardApi);
+// Mount OpenAPI-enabled API (new routes with Zod validation, rate limiting, docs)
+app.route("/api/v1", apiV1);
+
+// Mount legacy dashboard API endpoints (auth, SSE) under /api/v1 as fallback
+// These routes take precedence in legacyDashboardApi but apiV1 handles the main endpoints
+app.route("/api/v1", legacyDashboardApi);
 
 // Mount backtest API under /api/v1/backtest
 app.route("/api/v1/backtest", backtest);

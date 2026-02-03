@@ -7,6 +7,12 @@ import type {
 } from "./types/orderbook";
 import type { MarketSource, MarketType } from "./core/enums";
 
+// Re-export Polymarket types from their canonical location (avoid duplication)
+export type {
+  PolymarketEvent,
+  PolymarketMarket,
+} from "./adapters/polymarket/types";
+
 export interface Env {
   // KV Namespaces
   MARKET_CACHE: KVNamespace;
@@ -34,46 +40,6 @@ export interface Env {
   VITE_DASHBOARD_API_KEY: string;  // Required key for dashboard API access
 }
 
-// Polymarket API Response Types
-export interface PolymarketEvent {
-  id: string;
-  title: string;
-  ticker?: string;
-  slug?: string;
-  description?: string;
-  resolutionSource?: string;
-  startDate?: string;
-  creationDate?: string;
-  endDate?: string;
-  image?: string;
-  icon?: string;
-  active?: boolean;
-  closed?: boolean;
-  archived?: boolean;
-}
-
-export interface PolymarketMarket {
-  id: string;
-  question: string;
-  conditionId: string;
-  slug: string;
-  resolutionSource: string;
-  endDate: string;
-  startDate: string;
-  createdAt: string;
-  submitted_by: string;
-  resolvedBy: string;
-  restricted: boolean;
-  enableOrderBook: boolean;
-  orderPriceMinTickSize: number;
-  orderMinSize: number;
-  clobTokenIds: string;
-  negRisk: boolean;
-  negRiskMarketID?: string;
-  negRiskRequestID?: string;
-  events: PolymarketEvent[];
-}
-
 // Database record types
 export interface MarketMetadataRecord {
   id: string;
@@ -94,12 +60,16 @@ export interface MarketMetadataRecord {
   neg_risk: number;
   neg_risk_market_id: string;
   neg_risk_request_id: string;
+  description: string;
+  category: string;
 }
 
 export interface MarketEventRecord {
   event_id: string;
   market_id: string; // Foreign key to MarketMetadataRecord.id
   title: string;
+  slug: string;
+  description: string;
 }
 
 // Dead Letter Queue message for failed processing

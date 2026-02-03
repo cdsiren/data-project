@@ -71,7 +71,9 @@ export abstract class BaseTriggerEvaluator implements ITriggerEvaluator {
       asset_id: snapshot.asset_id,
       condition_id: snapshot.condition_id,
       fired_at: nowUs,
-      latency_us: nowUs - snapshot.source_ts,
+      // Dual latency tracking
+      total_latency_us: nowUs - snapshot.source_ts,
+      processing_latency_us: nowUs - snapshot.ingestion_ts,
       best_bid: snapshot.best_bid,
       best_ask: snapshot.best_ask,
       bid_size: snapshot.bid_size,
@@ -371,38 +373,30 @@ export function updatePriceHistory(
   // Add new entry (mutates in place for better performance)
   history.push({ ts: snapshot.source_ts, mid_price: snapshot.mid_price });
 
-  // Early return if under limits - no pruning needed
-  if (history.length <= maxEntries) {
-    const cutoffUs = snapshot.source_ts - (maxAgeMs * 1000);
-    if (history[0].ts >= cutoffUs) {
-      return history; // No pruning needed
-    }
+  // Calculate cutoff once, reuse below
+  const cutoffUs = snapshot.source_ts - (maxAgeMs * 1000);
+
+  // Fast path: if oldest entry is still valid and under count limit, no pruning needed
+  if (history[0].ts >= cutoffUs && history.length <= maxEntries) {
+    return history;
   }
 
-  // Binary search for first valid entry (since array is sorted by ts)
-  // This is O(log n) vs O(n) for linear scan
-  const cutoffUs = snapshot.source_ts - (maxAgeMs * 1000);
+  // Binary search for first valid entry using lower-bound pattern
+  // O(log n) vs O(n) for linear scan - critical for high-frequency triggers
   let left = 0;
-  let right = history.length - 1;
-  let firstValidIdx = history.length;
-
-  while (left <= right) {
-    const mid = Math.floor((left + right) / 2);
-    if (history[mid].ts >= cutoffUs) {
-      firstValidIdx = mid;
-      right = mid - 1;
-    } else {
+  let right = history.length;
+  while (left < right) {
+    const mid = (left + right) >>> 1; // Unsigned right shift = floor division by 2
+    if (history[mid].ts < cutoffUs) {
       left = mid + 1;
+    } else {
+      right = mid;
     }
   }
 
   // Determine final start index (consider both time-based and count-based limits)
-  const startIdx = Math.max(firstValidIdx, history.length - maxEntries);
+  const startIdx = Math.max(left, history.length - maxEntries);
 
-  // Only slice if necessary
-  if (startIdx > 0) {
-    return history.slice(startIdx);
-  }
-
-  return history;
+  // Slice if needed, otherwise return as-is
+  return startIdx > 0 ? history.slice(startIdx) : history;
 }

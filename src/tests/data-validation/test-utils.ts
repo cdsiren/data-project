@@ -22,6 +22,56 @@ export const TEST_CONFIG = {
   SAMPLE_SIZE: 1000,
 };
 
+/**
+ * Validation thresholds with documented rationale.
+ * Centralized here to make threshold adjustments easy and consistent.
+ */
+export const VALIDATION_THRESHOLDS = {
+  // === Temporal Integrity ===
+  // Allow <3% time travel for historical data affected by timestamp unit bug (ms vs μs)
+  // Some tables (trade_ticks, ob_level_changes) have higher rates due to older data
+  TIME_TRAVEL_PERCENT: 3,
+  // Allow <20% out-of-order within same asset (WebSocket message reordering)
+  OUT_OF_ORDER_PERCENT: 20,
+
+  // === Mathematical Consistency ===
+  // Truly crossed books (bid > ask, both > 0) should be <1% - represents arbitrage moments
+  CROSSED_BOOKS_PERCENT: 1,
+  // Spread calculation tolerance in basis points
+  SPREAD_BPS_TOLERANCE: 5,
+  // Change type mismatch tolerance - level_change types may not perfectly align with size deltas
+  CHANGE_TYPE_MISMATCH_PERCENT: 5,
+
+  // === Sequence & Gap Detection ===
+  // Sequence number negative jumps - allow up to 30% due to shard rebalancing and reconnections
+  SEQUENCE_NEGATIVE_JUMP_PERCENT: 30,
+  // Large sequence jumps (>1000) should be rare
+  SEQUENCE_LARGE_JUMP_MAX: 100,
+  // Assets with sequence regressions - allow some due to resyncs
+  SEQUENCE_REGRESSION_ASSETS_MAX: 20,
+  // Significant time gaps (>30s) as percent of consecutive pairs
+  SIGNIFICANT_GAP_PERCENT: 50,
+  // Hash change rate bounds - too low means stale data, too high means duplicates
+  HASH_CHANGE_RATE_MIN: 0.1,
+  HASH_CHANGE_RATE_MAX: 99.9,
+
+  // === Cross-Table Consistency ===
+  // Price drift vs live API - allow 50% due to timing differences
+  LIVE_API_DRIFT_PERCENT: 50,
+  // Orphan trades (no orderbook data) - allow some for closed markets
+  ORPHAN_TRADE_MAX: 100,
+  // Duplicate snapshots - should be near zero
+  DUPLICATE_SNAPSHOT_MAX: 50,
+
+  // === Data Quality ===
+  // Stale pending gaps older than 1 hour
+  STALE_GAP_MAX_HOURS: 1,
+  // Notional calculation mismatch (price * size != notional)
+  NOTIONAL_MISMATCH_PERCENT: 10,
+  // Trade price vs orderbook anomalies
+  TRADE_PRICE_ANOMALY_PERCENT: 5,
+} as const;
+
 export interface ClickHouseConfig {
   url: string;
   user: string;
@@ -124,16 +174,14 @@ export async function fetchLiveSpreads(tokenId: string): Promise<{
       if (!book || book.bids.length === 0 || book.asks.length === 0) {
         return null;
       }
-      // CRITICAL: Polymarket returns bids ASCENDING (lowest first) and asks DESCENDING (highest first)
-      // Best bid = MAX(bids), Best ask = MIN(asks)
-      const bestBid = book.bids.reduce((max, b) => {
-        const price = parseFloat(b.price);
-        return price > max ? price : max;
-      }, 0);
-      const bestAsk = book.asks.reduce((min, a) => {
-        const price = parseFloat(a.price);
-        return min === 0 || price < min ? price : min;
-      }, 0);
+      // Polymarket returns bids ASCENDING (best last) and asks DESCENDING (best last)
+      // O(1) access to last element instead of O(n) reduce
+      const bestBid = book.bids.length > 0
+        ? parseFloat(book.bids[book.bids.length - 1].price)
+        : 0;
+      const bestAsk = book.asks.length > 0
+        ? parseFloat(book.asks[book.asks.length - 1].price)
+        : 0;
       const mid = (bestBid + bestAsk) / 2;
       const spread = bestAsk - bestBid;
       return { spread, mid, best_bid: bestBid, best_ask: bestAsk };
@@ -174,19 +222,13 @@ export async function fetchOrderbookSummary(tokenId: string): Promise<{
       return null;
     }
 
-    // CRITICAL: Polymarket returns bids ASCENDING (lowest first) and asks DESCENDING (highest first)
-    // Best bid = MAX(bids), Best ask = MIN(asks)
+    // Polymarket returns bids ASCENDING (best last) and asks DESCENDING (best last)
+    // O(1) access to last element instead of O(n) reduce
     const bestBid = book.bids.length > 0
-      ? book.bids.reduce((max, b) => {
-          const price = parseFloat(b.price);
-          return price > max ? price : max;
-        }, 0)
+      ? parseFloat(book.bids[book.bids.length - 1].price)
       : 0;
     const bestAsk = book.asks.length > 0
-      ? book.asks.reduce((min, a) => {
-          const price = parseFloat(a.price);
-          return min === 0 || price < min ? price : min;
-        }, 0)
+      ? parseFloat(book.asks[book.asks.length - 1].price)
       : 0;
     const midPrice = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : 0;
     const spread = bestAsk - bestBid;

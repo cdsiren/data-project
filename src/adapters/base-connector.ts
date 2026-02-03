@@ -30,7 +30,7 @@ export interface ParsedMarketEvent {
  * Implementations normalize market-specific data formats to canonical types.
  */
 export interface MarketConnector {
-  /** Market source identifier (e.g., "polymarket", "kalshi") */
+  /** Market source identifier (e.g., "polymarket") */
   readonly marketSource: string;
 
   /** Market type (e.g., "prediction", "dex", "cex") */

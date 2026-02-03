@@ -80,7 +80,10 @@ export interface TriggerEvent {
   asset_id: string;
   condition_id: string;
   fired_at: number;               // Microsecond timestamp
-  latency_us: number;             // Time from source_ts to fired_at
+
+  // Dual latency tracking
+  total_latency_us: number;       // fired_at - source_ts (includes network)
+  processing_latency_us: number;  // fired_at - ingestion_ts (DO only)
 
   // Current market state
   best_bid: number | null;
@@ -95,12 +98,70 @@ export interface TriggerEvent {
   actual_value: number;           // The value that triggered (price, spread, ratio, etc.)
 
   // Arbitrage-specific fields (for prediction market triggers)
+  /** The counterpart outcome's asset ID (e.g., NO token for YES trigger) */
   counterpart_asset_id?: string;
+  /** Counterpart's best bid price */
   counterpart_best_bid?: number | null;
+  /** Counterpart's best ask price */
   counterpart_best_ask?: number | null;
-  sum_of_asks?: number;           // YES_ask + NO_ask (for ARBITRAGE_BUY)
-  sum_of_bids?: number;           // YES_bid + NO_bid (for ARBITRAGE_SELL)
-  potential_profit_bps?: number;  // Estimated profit in basis points
+  /** Counterpart's bid-side liquidity at BBO. Units: shares */
+  counterpart_bid_size?: number | null;
+  /** Counterpart's ask-side liquidity at BBO. Units: shares */
+  counterpart_ask_size?: number | null;
+  /** YES_ask + NO_ask (for ARBITRAGE_BUY) */
+  sum_of_asks?: number;
+  /** YES_bid + NO_bid (for ARBITRAGE_SELL) */
+  sum_of_bids?: number;
+  /** Estimated profit in basis points: (1 - sum) * 10000 for buy, (sum - 1) * 10000 for sell */
+  potential_profit_bps?: number;
+
+  /**
+   * Maximum executable size for the arbitrage opportunity.
+   *
+   * For ARBITRAGE_BUY/SELL: min(primary_side_size, counterpart_side_size)
+   * For MULTI_OUTCOME_ARBITRAGE: min(ask_size across all outcomes)
+   *
+   * This is the liquidity-constrained size - the maximum number of shares
+   * you can trade while maintaining the arbitrage spread on all sides.
+   *
+   * **Important for MULTI_OUTCOME_ARBITRAGE**: This is the amount to buy of EACH
+   * outcome, not the total. To realize the arbitrage, buy `recommended_size` shares
+   * of every asset in `outcome_asset_ids`.
+   *
+   * A value of 0 indicates the arbitrage exists but has no liquidity on one or more sides.
+   * Only populated for: ARBITRAGE_BUY, ARBITRAGE_SELL, MULTI_OUTCOME_ARBITRAGE
+   *
+   * Units: shares or contracts
+   */
+  recommended_size?: number;
+
+  /**
+   * Total capital required (or received) to execute the recommended size.
+   *
+   * For ARBITRAGE_BUY: recommended_size * (YES_ask + NO_ask) = capital needed
+   * For ARBITRAGE_SELL: recommended_size * (YES_bid + NO_bid) = capital received
+   *
+   * This represents the gross transaction amount before considering profit.
+   * Only populated for: ARBITRAGE_BUY, ARBITRAGE_SELL, MULTI_OUTCOME_ARBITRAGE
+   *
+   * Units: dollars (USD)
+   */
+  max_notional?: number;
+
+  /**
+   * Expected profit from executing the recommended size.
+   * Calculated as: recommended_size * profit_per_share
+   *
+   * For ARBITRAGE_BUY: recommended_size * (1 - sum_of_asks)
+   * For ARBITRAGE_SELL: recommended_size * (sum_of_bids - 1)
+   *
+   * This is the theoretical profit before fees, slippage, and gas costs.
+   * A value of 0 indicates zero liquidity (recommended_size = 0).
+   * Only populated for: ARBITRAGE_BUY, ARBITRAGE_SELL, MULTI_OUTCOME_ARBITRAGE
+   *
+   * Units: dollars (USD)
+   */
+  expected_profit?: number;
 
   // HFT trigger-specific fields
   volatility?: number;            // VOLATILITY_SPIKE: realized volatility %
@@ -157,8 +218,17 @@ export interface ImbalanceHistoryEntry {
 export interface TriggerContext {
   /** Latest BBO for all assets (for cross-asset triggers like arbitrage)
    * Includes stale flag to prevent false arbitrage signals from mismatched YES/NO data
+   * Includes size data for trade sizing calculations
    */
-  latestBBO: Map<string, { best_bid: number | null; best_ask: number | null; ts: number; stale?: boolean }>;
+  latestBBO: Map<string, {
+    best_bid: number | null;
+    best_ask: number | null;
+    bid_size: number | null;
+    ask_size: number | null;
+    ts: number;
+    /** Whether this BBO data is stale (counterpart updated more recently). Always set explicitly. */
+    stale: boolean;
+  }>;
 
   /** Price history for PRICE_MOVE and VOLATILITY_SPIKE triggers */
   priceHistory: Map<string, PriceHistoryEntry[]>;

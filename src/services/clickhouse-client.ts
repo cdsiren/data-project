@@ -30,7 +30,7 @@ export function buildAsyncInsertUrl(baseUrl: string, table: string): string {
   const params = new URLSearchParams({
     query: `INSERT INTO ${table} FORMAT JSONEachRow`,
     async_insert: "1",
-    wait_for_async_insert: "0",
+    wait_for_async_insert: "1", // Guarantee durability before returning
     async_insert_busy_timeout_ms: String(ASYNC_INSERT_CONFIG.LOW_LATENCY.busy_timeout_ms),
     async_insert_max_data_size: String(ASYNC_INSERT_CONFIG.max_data_size),
     async_insert_stale_timeout_ms: String(ASYNC_INSERT_CONFIG.LOW_LATENCY.stale_timeout_ms),
@@ -41,10 +41,6 @@ export function buildAsyncInsertUrl(baseUrl: string, table: string): string {
 /**
  * Build a ClickHouse INSERT URL with async insert and explicit columns.
  * Uses BATCH_OPTIMIZED profile for bulk operations.
- *
- * WARNING: This does NOT wait for insert confirmation (wait_for_async_insert=0).
- * Data may be lost if ClickHouse crashes during buffer flush.
- * Use buildSyncInsertUrlWithColumns for critical tables like market_metadata.
  */
 export function buildAsyncInsertUrlWithColumns(
   baseUrl: string,
@@ -55,7 +51,7 @@ export function buildAsyncInsertUrlWithColumns(
     database: DB_CONFIG.DATABASE,
     query: `INSERT INTO ${DB_CONFIG.DATABASE}.${table} (${columns.join(", ")}) FORMAT JSONEachRow`,
     async_insert: "1",
-    wait_for_async_insert: "0",
+    wait_for_async_insert: "1", // Guarantee durability before returning
     async_insert_busy_timeout_ms: String(ASYNC_INSERT_CONFIG.BATCH_OPTIMIZED.busy_timeout_ms),
   });
   return `${baseUrl}?${params.toString()}`;

@@ -21,6 +21,11 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import type { TriggerType, Trigger, TriggerCondition, PriceHistoryEntry } from "../core/triggers";
 import type { BBOSnapshot } from "../core/orderbook";
+import {
+  STALE_DATA_THRESHOLD_US,
+  calculateArbitrageSizing,
+  isTimestampFresh,
+} from "../utils/arbitrage-calculations";
 
 // Simulate the checkTriggerCondition logic from orderbook-manager.ts
 // This allows us to test the trigger evaluation without spinning up a full DO
@@ -33,7 +38,14 @@ interface TriggerResult {
 
 interface TriggerState {
   priceHistory: Map<string, PriceHistoryEntry[]>;
-  latestBBO: Map<string, { best_bid: number | null; best_ask: number | null; ts: number; stale?: boolean }>;
+  latestBBO: Map<string, {
+    best_bid: number | null;
+    best_ask: number | null;
+    bid_size: number | null;
+    ask_size: number | null;
+    ts: number;
+    stale: boolean;  // Required, not optional
+  }>;
   updateCounts: Map<string, { count: number; windowStartUs: number }>;
   trendTracker: Map<string, { lastMid: number; consecutiveMoves: number; direction: "UP" | "DOWN" }>;
   imbalanceHistory: Map<string, { imbalance: number; ts: number }[]>;
@@ -432,11 +444,20 @@ function evaluateTrigger(
       if (!counterpartBBO || counterpartBBO.best_ask === null) break;
 
       if (counterpartBBO.stale) break;
-      if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > 5000) break;
+      if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > STALE_DATA_THRESHOLD_US) break;
 
       const sumOfAsks = snapshot.best_ask + counterpartBBO.best_ask;
       if (sumOfAsks < threshold) {
         const profitBps = (1 - sumOfAsks) * 10000;
+
+        // Trade sizing using shared utility
+        const sizing = calculateArbitrageSizing({
+          primarySize: snapshot.ask_size,
+          counterpartSize: counterpartBBO.ask_size,
+          priceSum: sumOfAsks,
+          profitPerShare: 1 - sumOfAsks,
+        });
+
         return {
           fired: true,
           actualValue: sumOfAsks,
@@ -444,8 +465,11 @@ function evaluateTrigger(
             counterpart_asset_id,
             counterpart_best_bid: counterpartBBO.best_bid,
             counterpart_best_ask: counterpartBBO.best_ask,
+            counterpart_bid_size: counterpartBBO.bid_size,
+            counterpart_ask_size: counterpartBBO.ask_size,
             sum_of_asks: sumOfAsks,
             potential_profit_bps: profitBps,
+            ...sizing,
           },
         };
       }
@@ -459,11 +483,20 @@ function evaluateTrigger(
       if (!counterpartBBO || counterpartBBO.best_bid === null) break;
 
       if (counterpartBBO.stale) break;
-      if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > 5000) break;
+      if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > STALE_DATA_THRESHOLD_US) break;
 
       const sumOfBids = snapshot.best_bid + counterpartBBO.best_bid;
       if (sumOfBids > threshold) {
         const profitBps = (sumOfBids - 1) * 10000;
+
+        // Trade sizing using shared utility
+        const sizing = calculateArbitrageSizing({
+          primarySize: snapshot.bid_size,
+          counterpartSize: counterpartBBO.bid_size,
+          priceSum: sumOfBids,
+          profitPerShare: sumOfBids - 1,
+        });
+
         return {
           fired: true,
           actualValue: sumOfBids,
@@ -471,8 +504,11 @@ function evaluateTrigger(
             counterpart_asset_id,
             counterpart_best_bid: counterpartBBO.best_bid,
             counterpart_best_ask: counterpartBBO.best_ask,
+            counterpart_bid_size: counterpartBBO.bid_size,
+            counterpart_ask_size: counterpartBBO.ask_size,
             sum_of_bids: sumOfBids,
             potential_profit_bps: profitBps,
+            ...sizing,
           },
         };
       }
@@ -484,20 +520,30 @@ function evaluateTrigger(
 
       let sumOfAsks = 0;
       let validCount = 0;
+      let minAskSize: number | null = null;
 
       for (const assetId of outcome_asset_ids) {
         const bbo = state.latestBBO.get(assetId);
         if (!bbo || bbo.best_ask === null) continue;
-        if (Math.abs(snapshot.source_ts - bbo.ts) > 5000) continue;
+        if (!isTimestampFresh(snapshot.source_ts, bbo.ts)) continue;
 
         sumOfAsks += bbo.best_ask;
         validCount++;
+
+        // Track minimum ask size across all outcomes (liquidity-constrained)
+        const askSize = bbo.ask_size ?? 0;
+        if (minAskSize === null || askSize < minAskSize) {
+          minAskSize = askSize;
+        }
       }
 
       if (validCount !== outcome_asset_ids.length) break;
 
       if (sumOfAsks < threshold) {
         const profitBps = (1 - sumOfAsks) * 10000;
+        const profitPerShare = 1 - sumOfAsks;
+        const recommendedSize = minAskSize ?? 0;
+
         return {
           fired: true,
           actualValue: sumOfAsks,
@@ -505,6 +551,9 @@ function evaluateTrigger(
             outcome_ask_sum: sumOfAsks,
             outcome_count: validCount,
             potential_profit_bps: profitBps,
+            recommended_size: recommendedSize,
+            max_notional: recommendedSize * sumOfAsks,
+            expected_profit: recommendedSize * profitPerShare,
           },
         };
       }
@@ -1161,10 +1210,12 @@ describe("Prediction Market Triggers", () => {
       });
       const baseTs = Date.now() * 1000;
 
-      // NO token BBO
+      // NO token BBO with size
       state.latestBBO.set("no_token", {
         best_bid: 0.48,
         best_ask: 0.50, // NO ask
+        bid_size: 2000,
+        ask_size: 3000,
         ts: baseTs,
         stale: false,
       });
@@ -1173,6 +1224,7 @@ describe("Prediction Market Triggers", () => {
       const snapshot = createMockSnapshot({
         source_ts: baseTs,
         best_ask: 0.48, // YES ask
+        ask_size: 5000,
       });
       // Sum = 0.48 + 0.50 = 0.98 < 0.99 threshold
 
@@ -1184,6 +1236,102 @@ describe("Prediction Market Triggers", () => {
       expect(result.arbitrageData?.potential_profit_bps).toBeCloseTo(200); // 2% profit
     });
 
+    it("should calculate recommended_size as min of both ask sizes", () => {
+      const trigger = createMockTrigger("ARBITRAGE_BUY", 0.99, {
+        counterpart_asset_id: "no_token",
+      });
+      const baseTs = Date.now() * 1000;
+
+      // Counterpart has less liquidity (3000 < 5000)
+      state.latestBBO.set("no_token", {
+        best_bid: 0.48,
+        best_ask: 0.48,
+        bid_size: 2000,
+        ask_size: 3000, // Less liquidity
+        ts: baseTs,
+        stale: false,
+      });
+
+      const snapshot = createMockSnapshot({
+        source_ts: baseTs,
+        best_ask: 0.48,
+        ask_size: 5000, // More liquidity
+      });
+      // Sum = 0.96, profit = 4 cents per share
+
+      const result = evaluateTrigger(trigger, snapshot, state);
+
+      expect(result.fired).toBe(true);
+      expect(result.arbitrageData?.recommended_size).toBe(3000); // min(5000, 3000)
+      expect(result.arbitrageData?.counterpart_ask_size).toBe(3000);
+      // max_notional = 3000 * 0.96 = 2880
+      expect(result.arbitrageData?.max_notional).toBeCloseTo(2880);
+      // expected_profit = 3000 * 0.04 = 120
+      expect(result.arbitrageData?.expected_profit).toBeCloseTo(120);
+    });
+
+    it("should handle null sizes gracefully (all sizing metrics = 0)", () => {
+      const trigger = createMockTrigger("ARBITRAGE_BUY", 0.99, {
+        counterpart_asset_id: "no_token",
+      });
+      const baseTs = Date.now() * 1000;
+
+      state.latestBBO.set("no_token", {
+        best_bid: 0.48,
+        best_ask: 0.48,
+        bid_size: null,
+        ask_size: null, // No size data
+        ts: baseTs,
+        stale: false,
+      });
+
+      const snapshot = createMockSnapshot({
+        source_ts: baseTs,
+        best_ask: 0.48,
+        ask_size: 5000,
+      });
+
+      const result = evaluateTrigger(trigger, snapshot, state);
+
+      expect(result.fired).toBe(true);
+      // Comprehensive validation of all sizing fields
+      expect(result.arbitrageData?.recommended_size).toBe(0); // min(5000, 0)
+      expect(result.arbitrageData?.max_notional).toBe(0); // 0 * price = 0
+      expect(result.arbitrageData?.expected_profit).toBe(0); // 0 * profit = 0
+      // Still tracks the arbitrage opportunity metrics
+      expect(result.arbitrageData?.sum_of_asks).toBeCloseTo(0.96);
+      expect(result.arbitrageData?.potential_profit_bps).toBeCloseTo(400);
+    });
+
+    it("should handle zero sizes the same as null sizes", () => {
+      const trigger = createMockTrigger("ARBITRAGE_BUY", 0.99, {
+        counterpart_asset_id: "no_token",
+      });
+      const baseTs = Date.now() * 1000;
+
+      state.latestBBO.set("no_token", {
+        best_bid: 0.48,
+        best_ask: 0.48,
+        bid_size: 0, // Zero instead of null
+        ask_size: 0,
+        ts: baseTs,
+        stale: false,
+      });
+
+      const snapshot = createMockSnapshot({
+        source_ts: baseTs,
+        best_ask: 0.48,
+        ask_size: 0, // Zero on primary side too
+      });
+
+      const result = evaluateTrigger(trigger, snapshot, state);
+
+      expect(result.fired).toBe(true);
+      expect(result.arbitrageData?.recommended_size).toBe(0);
+      expect(result.arbitrageData?.max_notional).toBe(0);
+      expect(result.arbitrageData?.expected_profit).toBe(0);
+    });
+
     it("should NOT fire when sum exceeds threshold", () => {
       const trigger = createMockTrigger("ARBITRAGE_BUY", 0.99, {
         counterpart_asset_id: "no_token",
@@ -1193,6 +1341,8 @@ describe("Prediction Market Triggers", () => {
       state.latestBBO.set("no_token", {
         best_bid: 0.50,
         best_ask: 0.52,
+        bid_size: 1000,
+        ask_size: 1000,
         ts: baseTs,
         stale: false,
       });
@@ -1217,6 +1367,8 @@ describe("Prediction Market Triggers", () => {
       state.latestBBO.set("no_token", {
         best_bid: 0.48,
         best_ask: 0.48,
+        bid_size: 1000,
+        ask_size: 1000,
         ts: baseTs,
         stale: true, // Stale!
       });
@@ -1242,6 +1394,8 @@ describe("Prediction Market Triggers", () => {
       state.latestBBO.set("no_token", {
         best_bid: 0.52, // NO bid
         best_ask: 0.54,
+        bid_size: 2000,
+        ask_size: 1500,
         ts: baseTs,
         stale: false,
       });
@@ -1249,6 +1403,7 @@ describe("Prediction Market Triggers", () => {
       const snapshot = createMockSnapshot({
         source_ts: baseTs,
         best_bid: 0.52, // YES bid
+        bid_size: 3000,
       });
       // Sum = 0.52 + 0.52 = 1.04 > 1.01
 
@@ -1260,6 +1415,68 @@ describe("Prediction Market Triggers", () => {
       expect(result.arbitrageData?.potential_profit_bps).toBeCloseTo(400); // 4% profit
     });
 
+    it("should calculate recommended_size as min of both bid sizes", () => {
+      const trigger = createMockTrigger("ARBITRAGE_SELL", 1.01, {
+        counterpart_asset_id: "no_token",
+      });
+      const baseTs = Date.now() * 1000;
+
+      // Counterpart has less liquidity (2000 < 5000)
+      state.latestBBO.set("no_token", {
+        best_bid: 0.52,
+        best_ask: 0.54,
+        bid_size: 2000, // Less liquidity
+        ask_size: 1500,
+        ts: baseTs,
+        stale: false,
+      });
+
+      const snapshot = createMockSnapshot({
+        source_ts: baseTs,
+        best_bid: 0.52,
+        bid_size: 5000, // More liquidity
+      });
+      // Sum = 1.04, profit = 4 cents per share
+
+      const result = evaluateTrigger(trigger, snapshot, state);
+
+      expect(result.fired).toBe(true);
+      expect(result.arbitrageData?.recommended_size).toBe(2000); // min(5000, 2000)
+      expect(result.arbitrageData?.counterpart_bid_size).toBe(2000);
+      // max_notional = 2000 * 1.04 = 2080
+      expect(result.arbitrageData?.max_notional).toBeCloseTo(2080);
+      // expected_profit = 2000 * 0.04 = 80
+      expect(result.arbitrageData?.expected_profit).toBeCloseTo(80);
+    });
+
+    it("should handle asymmetric liquidity (primary has less)", () => {
+      const trigger = createMockTrigger("ARBITRAGE_SELL", 1.01, {
+        counterpart_asset_id: "no_token",
+      });
+      const baseTs = Date.now() * 1000;
+
+      state.latestBBO.set("no_token", {
+        best_bid: 0.52,
+        best_ask: 0.54,
+        bid_size: 10000, // More liquidity
+        ask_size: 5000,
+        ts: baseTs,
+        stale: false,
+      });
+
+      const snapshot = createMockSnapshot({
+        source_ts: baseTs,
+        best_bid: 0.52,
+        bid_size: 500, // Less liquidity - bottleneck
+      });
+
+      const result = evaluateTrigger(trigger, snapshot, state);
+
+      expect(result.fired).toBe(true);
+      expect(result.arbitrageData?.recommended_size).toBe(500); // min(500, 10000)
+      expect(result.arbitrageData?.expected_profit).toBeCloseTo(20); // 500 * 0.04
+    });
+
     it("should NOT fire when sum is below threshold", () => {
       const trigger = createMockTrigger("ARBITRAGE_SELL", 1.01, {
         counterpart_asset_id: "no_token",
@@ -1269,6 +1486,8 @@ describe("Prediction Market Triggers", () => {
       state.latestBBO.set("no_token", {
         best_bid: 0.48,
         best_ask: 0.50,
+        bid_size: 1000,
+        ask_size: 1000,
         ts: baseTs,
         stale: false,
       });
@@ -1294,13 +1513,13 @@ describe("Prediction Market Triggers", () => {
 
       // 3 outcomes with asks: 0.30 + 0.30 + 0.35 = 0.95 < 0.99
       state.latestBBO.set("outcome_a", {
-        best_bid: 0.28, best_ask: 0.30, ts: baseTs,
+        best_bid: 0.28, best_ask: 0.30, bid_size: 1000, ask_size: 1000, ts: baseTs, stale: false,
       });
       state.latestBBO.set("outcome_b", {
-        best_bid: 0.28, best_ask: 0.30, ts: baseTs,
+        best_bid: 0.28, best_ask: 0.30, bid_size: 1000, ask_size: 1000, ts: baseTs, stale: false,
       });
       state.latestBBO.set("outcome_c", {
-        best_bid: 0.33, best_ask: 0.35, ts: baseTs,
+        best_bid: 0.33, best_ask: 0.35, bid_size: 1000, ask_size: 1000, ts: baseTs, stale: false,
       });
 
       const snapshot = createMockSnapshot({ source_ts: baseTs });
@@ -1311,6 +1530,37 @@ describe("Prediction Market Triggers", () => {
       expect(result.actualValue).toBeCloseTo(0.95);
       expect(result.arbitrageData?.outcome_count).toBe(3);
       expect(result.arbitrageData?.potential_profit_bps).toBeCloseTo(500); // 5% profit
+      // Trade sizing: min(1000, 1000, 1000) = 1000
+      expect(result.arbitrageData?.recommended_size).toBe(1000);
+      expect(result.arbitrageData?.max_notional).toBeCloseTo(950); // 1000 * 0.95
+      expect(result.arbitrageData?.expected_profit).toBeCloseTo(50); // 1000 * 0.05
+    });
+
+    it("should calculate trade sizing with asymmetric sizes", () => {
+      const trigger = createMockTrigger("MULTI_OUTCOME_ARBITRAGE", 0.99, {
+        outcome_asset_ids: ["outcome_a", "outcome_b", "outcome_c"],
+      });
+      const baseTs = Date.now() * 1000;
+
+      // Asymmetric sizes: outcome_b has smallest ask_size (200)
+      state.latestBBO.set("outcome_a", {
+        best_bid: 0.28, best_ask: 0.30, bid_size: 5000, ask_size: 5000, ts: baseTs, stale: false,
+      });
+      state.latestBBO.set("outcome_b", {
+        best_bid: 0.28, best_ask: 0.30, bid_size: 200, ask_size: 200, ts: baseTs, stale: false,
+      });
+      state.latestBBO.set("outcome_c", {
+        best_bid: 0.33, best_ask: 0.35, bid_size: 1000, ask_size: 1000, ts: baseTs, stale: false,
+      });
+
+      const snapshot = createMockSnapshot({ source_ts: baseTs });
+      const result = evaluateTrigger(trigger, snapshot, state);
+
+      expect(result.fired).toBe(true);
+      // recommended_size = min(5000, 200, 1000) = 200
+      expect(result.arbitrageData?.recommended_size).toBe(200);
+      expect(result.arbitrageData?.max_notional).toBeCloseTo(190); // 200 * 0.95
+      expect(result.arbitrageData?.expected_profit).toBeCloseTo(10); // 200 * 0.05
     });
 
     it("should NOT fire when sum exceeds threshold", () => {
@@ -1320,10 +1570,10 @@ describe("Prediction Market Triggers", () => {
       const baseTs = Date.now() * 1000;
 
       state.latestBBO.set("outcome_a", {
-        best_bid: 0.50, best_ask: 0.52, ts: baseTs,
+        best_bid: 0.50, best_ask: 0.52, bid_size: 1000, ask_size: 1000, ts: baseTs, stale: false,
       });
       state.latestBBO.set("outcome_b", {
-        best_bid: 0.50, best_ask: 0.52, ts: baseTs,
+        best_bid: 0.50, best_ask: 0.52, bid_size: 1000, ask_size: 1000, ts: baseTs, stale: false,
       });
       // Sum = 0.52 + 0.52 = 1.04 > 0.99
 
@@ -1342,10 +1592,10 @@ describe("Prediction Market Triggers", () => {
 
       // Only 2 of 3 outcomes have data
       state.latestBBO.set("outcome_a", {
-        best_bid: 0.30, best_ask: 0.32, ts: baseTs,
+        best_bid: 0.30, best_ask: 0.32, bid_size: 1000, ask_size: 1000, ts: baseTs, stale: false,
       });
       state.latestBBO.set("outcome_b", {
-        best_bid: 0.30, best_ask: 0.32, ts: baseTs,
+        best_bid: 0.30, best_ask: 0.32, bid_size: 1000, ask_size: 1000, ts: baseTs, stale: false,
       });
       // outcome_c is missing
 

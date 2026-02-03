@@ -11,6 +11,10 @@ import type {
 import type { BBOSnapshot } from "../../core/orderbook";
 import { BaseTriggerEvaluator, GenericTriggerEvaluator } from "./base-evaluator";
 import type { ITriggerEvaluator } from "./base-evaluator";
+import {
+  calculateArbitrageSizing,
+  isTimestampFresh,
+} from "../../utils/arbitrage-calculations";
 
 /**
  * Prediction market trigger evaluator
@@ -19,14 +23,13 @@ import type { ITriggerEvaluator } from "./base-evaluator";
  * - ARBITRAGE_SELL: YES_bid + NO_bid > threshold (sell both for guaranteed profit)
  *
  * These triggers require access to both YES and NO token orderbooks to detect
- * arbitrage opportunities in binary prediction markets (Polymarket, Kalshi, etc.)
+ * arbitrage opportunities in binary prediction markets.
  */
 export class PredictionMarketTriggerEvaluator extends BaseTriggerEvaluator {
   readonly name = "PredictionMarketTriggerEvaluator";
   readonly marketSource: MarketSource;
 
   private genericEvaluator: GenericTriggerEvaluator;
-  private readonly STALE_DATA_THRESHOLD_MS = 5000; // 5 seconds
 
   constructor(marketSource: MarketSource = "polymarket") {
     super();
@@ -112,7 +115,7 @@ export class PredictionMarketTriggerEvaluator extends BaseTriggerEvaluator {
     if (counterpartBBO.stale) {
       return this.notFired();
     }
-    if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > this.STALE_DATA_THRESHOLD_MS) {
+    if (!isTimestampFresh(snapshot.source_ts, counterpartBBO.ts)) {
       return this.notFired();
     }
 
@@ -122,13 +125,24 @@ export class PredictionMarketTriggerEvaluator extends BaseTriggerEvaluator {
       // Profit = 1 - sumOfAsks (guaranteed payout is $1)
       const profitBps = (1 - sumOfAsks) * 10000;
 
+      // Trade sizing using shared utility
+      const sizing = calculateArbitrageSizing({
+        primarySize: snapshot.ask_size,
+        counterpartSize: counterpartBBO.ask_size,
+        priceSum: sumOfAsks,
+        profitPerShare: 1 - sumOfAsks,
+      });
+
       return this.fired(
         this.createTriggerEvent(trigger, snapshot, sumOfAsks, {
           counterpart_asset_id,
           counterpart_best_bid: counterpartBBO.best_bid,
           counterpart_best_ask: counterpartBBO.best_ask,
+          counterpart_bid_size: counterpartBBO.bid_size,
+          counterpart_ask_size: counterpartBBO.ask_size,
           sum_of_asks: sumOfAsks,
           potential_profit_bps: profitBps,
+          ...sizing,
         })
       );
     }
@@ -172,7 +186,7 @@ export class PredictionMarketTriggerEvaluator extends BaseTriggerEvaluator {
     if (counterpartBBO.stale) {
       return this.notFired();
     }
-    if (Math.abs(snapshot.source_ts - counterpartBBO.ts) > this.STALE_DATA_THRESHOLD_MS) {
+    if (!isTimestampFresh(snapshot.source_ts, counterpartBBO.ts)) {
       return this.notFired();
     }
 
@@ -182,13 +196,24 @@ export class PredictionMarketTriggerEvaluator extends BaseTriggerEvaluator {
       // Profit = sumOfBids - 1 (you receive more than the $1 you'll pay out)
       const profitBps = (sumOfBids - 1) * 10000;
 
+      // Trade sizing using shared utility
+      const sizing = calculateArbitrageSizing({
+        primarySize: snapshot.bid_size,
+        counterpartSize: counterpartBBO.bid_size,
+        priceSum: sumOfBids,
+        profitPerShare: sumOfBids - 1,
+      });
+
       return this.fired(
         this.createTriggerEvent(trigger, snapshot, sumOfBids, {
           counterpart_asset_id,
           counterpart_best_bid: counterpartBBO.best_bid,
           counterpart_best_ask: counterpartBBO.best_ask,
+          counterpart_bid_size: counterpartBBO.bid_size,
+          counterpart_ask_size: counterpartBBO.ask_size,
           sum_of_bids: sumOfBids,
           potential_profit_bps: profitBps,
+          ...sizing,
         })
       );
     }
