@@ -1214,7 +1214,10 @@ export class OrderbookManager extends DurableObject<Env> {
           lastAttempt: 0,
           backoffUntil: 0
         };
-        const failures = current.failures + 1;
+        // Check if failures should decay (1 hour since last attempt)
+        const failures = (now - current.lastAttempt > this.FAILURE_DECAY_MS)
+          ? 1  // Reset to 1 (this failure)
+          : current.failures + 1;
         const backoffMs = Math.min(1000 * Math.pow(2, failures), this.MAX_BACKOFF_MS);
         this.subscriptionState.set(assetId, {
           failures,
