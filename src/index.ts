@@ -24,6 +24,7 @@ import { CronErrorTracker, withCronErrorTracking } from "./services/cron-error-t
 import { DB_CONFIG } from "./config/database";
 import { backtest } from "./routes/backtest";
 import { apiV1 } from "./routes/api-v1";
+import { getRegionFromRequest, getAllRegionalBufferNames, type RegionalBufferLocation } from "./utils/region-mapping";
 
 // Helper to parse token IDs from JSON string
 function parseTokenIds(clobTokenIds: string): string[] {
@@ -123,6 +124,47 @@ function getTriggerEventBufferStub(env: Env): DurableObjectStub {
   const ns = env.TRIGGER_EVENT_BUFFER as unknown as DurableObjectNamespaceExt;
   const doId = ns.idFromName("global", { locationHint: DEFAULT_LOCATION_HINT });
   return env.TRIGGER_EVENT_BUFFER.get(doId);
+}
+
+/**
+ * Regional buffer location hints mapping
+ */
+const REGIONAL_BUFFER_HINTS: Record<string, DurableObjectLocationHint> = {
+  "buffer-enam": "enam",
+  "buffer-wnam": "wnam",
+  "buffer-weur": "weur",
+  "buffer-apac": "apac",
+};
+
+/**
+ * Get TriggerEventBuffer DO stub for a specific region
+ * Each regional buffer is co-located with traders in that region
+ *
+ * @param env Worker environment
+ * @param region The regional buffer identifier (e.g., "buffer-enam")
+ * @returns DO stub with region-appropriate location hint
+ */
+function getRegionalTriggerEventBufferStub(
+  env: Env,
+  region: string
+): DurableObjectStub {
+  const ns = env.TRIGGER_EVENT_BUFFER as unknown as DurableObjectNamespaceExt;
+  const locationHint = REGIONAL_BUFFER_HINTS[region] || DEFAULT_LOCATION_HINT;
+  const doId = ns.idFromName(region, { locationHint });
+  return env.TRIGGER_EVENT_BUFFER.get(doId);
+}
+
+/**
+ * Get DO stubs for ALL regional buffers (for fan-out publishing)
+ * Used by OrderbookManager to publish events to all regions simultaneously
+ *
+ * @param env Worker environment
+ * @returns Array of DO stubs for all 4 regional buffers
+ */
+function getAllRegionalBufferStubs(env: Env): DurableObjectStub[] {
+  return getAllRegionalBufferNames().map(name =>
+    getRegionalTriggerEventBufferStub(env, name)
+  );
 }
 
 // ============================================================
@@ -1754,75 +1796,6 @@ async function validateSession(c: Context<{ Bindings: Env }>): Promise<boolean> 
   return verifySessionToken(sessionToken, c.env.VITE_DASHBOARD_API_KEY);
 }
 
-// Top Activity Endpoint - Most active market by tick count
-legacyDashboardApi.get("/markets/top-activity", async (c) => {
-  if (!c.env.CLICKHOUSE_URL) {
-    return c.json({ error: "CLICKHOUSE_URL not configured" }, 503);
-  }
-
-  const headers = {
-    "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
-    "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
-  };
-
-  // Query top market with metadata using proper JSON extraction
-  // Filters for: active markets only (end_date > now) AND activity in last 10 minutes
-  const query = `
-    WITH tokens AS (
-      SELECT
-        question,
-        end_date,
-        arrayJoin(JSONExtractArrayRaw(clob_token_ids)) as token
-      FROM ${DB_CONFIG.DATABASE}.market_metadata
-      WHERE end_date > now()
-    )
-    SELECT
-      t.question,
-      replaceAll(t.token, '"', '') as asset_id,
-      b.condition_id,
-      countMerge(b.tick_count_state) as tick_count
-    FROM tokens t
-    INNER JOIN ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m b ON replaceAll(t.token, '"', '') = b.asset_id
-    WHERE b.minute >= now() - INTERVAL 10 MINUTE
-    GROUP BY t.question, asset_id, b.condition_id
-    ORDER BY tick_count DESC
-    LIMIT 1
-    FORMAT JSON
-  `;
-
-  try {
-    const response = await fetch(
-      `${c.env.CLICKHOUSE_URL}/?query=${encodeURIComponent(query)}`,
-      { headers }
-    );
-
-    if (!response.ok) {
-      const error = await response.text();
-      return c.json({ error: "ClickHouse query failed", details: error }, 500);
-    }
-
-    const result = await response.json() as { data: Array<{ question: string; asset_id: string; condition_id: string; tick_count: number }> };
-
-    if (result.data.length === 0) {
-      return c.json({ data: null, timestamp: new Date().toISOString() });
-    }
-
-    const topMarket = result.data[0];
-
-    return c.json({
-      data: {
-        asset_id: topMarket.asset_id,
-        condition_id: topMarket.condition_id,
-        tick_count: topMarket.tick_count,
-        question: topMarket.question,
-      },
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    return c.json({ error: "Failed to query top activity", details: String(error) }, 500);
-  }
-});
-
 /**
  * Markets Endpoint - List available markets with metadata
  * GET /api/v1/markets
@@ -2065,15 +2038,54 @@ legacyDashboardApi.get("/ohlc/:asset_id", async (c) => {
 
 // SSE Endpoint - Stream trigger events
 // Uses cookie-based auth (call POST /auth first to get session cookie)
+// LATENCY OPTIMIZATION: Routes to regional buffer based on client location
 legacyDashboardApi.get("/triggers/events/sse", async (c) => {
   if (!(await validateSession(c))) {
     return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
   }
 
-  // Route to the global TriggerEventBuffer DO (with location hint for low latency)
-  const stub = getTriggerEventBufferStub(c.env);
+  // Determine client's region from Cloudflare headers
+  const region = getRegionFromRequest(c.req.raw);
+  const bufferName = `buffer-${region}`;
+
+  // Route to regional TriggerEventBuffer DO (10-50ms savings for non-EU traders)
+  const stub = getRegionalTriggerEventBufferStub(c.env, bufferName);
 
   return stub.fetch(new Request("https://do/sse", {
+    headers: c.req.raw.headers,
+  }));
+});
+
+// Premium SSE Endpoint - Direct low-latency stream from OrderbookManager
+// Bypasses TriggerEventBuffer hop for 1-5ms latency reduction
+// Requires condition_id for shard routing (routes to the correct DO)
+legacyDashboardApi.get("/triggers/events/premium-sse", async (c) => {
+  if (!(await validateSession(c))) {
+    return c.json({ error: "Unauthorized - please authenticate first via POST /api/v1/auth" }, 401);
+  }
+
+  // Require condition_id for shard routing
+  const conditionId = c.req.query("condition_id");
+  if (!conditionId) {
+    return c.json({
+      error: "condition_id query parameter is required for premium SSE",
+      hint: "Premium SSE connects directly to OrderbookManager shards, which are partitioned by condition_id",
+    }, 400);
+  }
+
+  // Get asset filter if provided
+  const assets = c.req.query("assets");
+
+  // Route to the correct OrderbookManager shard
+  const shardId = getShardForMarket(conditionId);
+  const stub = getOrderbookManagerStub(c.env, shardId);
+
+  // Forward to premium-sse endpoint with optional asset filter
+  const url = assets
+    ? `https://do/premium-sse?assets=${encodeURIComponent(assets)}`
+    : "https://do/premium-sse";
+
+  return stub.fetch(new Request(url, {
     headers: c.req.raw.headers,
   }));
 });

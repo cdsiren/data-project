@@ -94,9 +94,6 @@ export function resetAuth(): void {
 
 /**
  * Fetch system metrics from all shards
- */
-/**
- * Fetch system metrics from all shards
  * Public endpoint - no authentication required
  */
 export async function fetchMetrics(): Promise<MetricsResponse> {

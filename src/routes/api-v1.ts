@@ -684,6 +684,75 @@ apiV1.get(
   }
 );
 
+// GET /markets/top-activity - Most active market by tick count
+// Must be defined BEFORE /markets/:asset_id to avoid route collision
+apiV1.get("/markets/top-activity", async (c) => {
+  requireClickHouse(c.env);
+
+  const headers = getClickHouseHeaders(c.env);
+
+  // Query top market with metadata using proper JSON extraction
+  // Filters for: active markets only (end_date > now) AND activity in last 10 minutes
+  const query = `
+    WITH tokens AS (
+      SELECT
+        question,
+        end_date,
+        arrayJoin(JSONExtractArrayRaw(clob_token_ids)) as token
+      FROM ${DB_CONFIG.DATABASE}.market_metadata
+      WHERE end_date > now()
+    )
+    SELECT
+      t.question,
+      replaceAll(t.token, '"', '') as asset_id,
+      b.condition_id,
+      countMerge(b.tick_count_state) as tick_count
+    FROM tokens t
+    INNER JOIN ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m b ON replaceAll(t.token, '"', '') = b.asset_id
+    WHERE b.minute >= now() - INTERVAL 10 MINUTE
+    GROUP BY t.question, asset_id, b.condition_id
+    ORDER BY tick_count DESC
+    LIMIT 1
+    FORMAT JSON
+  `;
+
+  const response = await fetchWithTimeout(
+    `${c.env.CLICKHOUSE_URL}/?query=${encodeURIComponent(query)}`,
+    { headers },
+    QUERY_TIMEOUT_MS
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new ClickHouseError("Top activity query failed", query, errorText);
+  }
+
+  const result = (await response.json()) as {
+    data: Array<{
+      question: string;
+      asset_id: string;
+      condition_id: string;
+      tick_count: number;
+    }>;
+  };
+
+  if (result.data.length === 0) {
+    return c.json({ data: null, timestamp: new Date().toISOString() });
+  }
+
+  const topMarket = result.data[0];
+
+  return c.json({
+    data: {
+      asset_id: topMarket.asset_id,
+      condition_id: topMarket.condition_id,
+      tick_count: topMarket.tick_count,
+      question: topMarket.question,
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // GET /markets/:asset_id - Get market details with Zod validation
 apiV1.get(
   "/markets/:asset_id",
