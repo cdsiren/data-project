@@ -1,5 +1,7 @@
 // Metrics types for dashboard health monitoring
 
+import { SYSTEM_CONFIG } from "@/lib/constants";
+
 export interface LatencyStats {
   p50_ms: number;
   p95_ms: number;
@@ -63,5 +65,5 @@ export const HEALTH_THRESHOLDS = {
   // Shard health thresholds
   SHARDS_HEALTHY: 24,
   SHARDS_DEGRADED: 20,
-  TOTAL_SHARDS: 25,
+  TOTAL_SHARDS: SYSTEM_CONFIG.SHARD_COUNT,
 } as const;

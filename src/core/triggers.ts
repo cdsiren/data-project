@@ -247,3 +247,118 @@ export interface TriggerEvaluationResult {
   fired: boolean;
   event?: TriggerEvent;
 }
+
+/**
+ * Pre-computed bounds for trigger pre-filtering.
+ * Used to quickly skip trigger evaluation when BBO cannot possibly fire the trigger.
+ * null values mean "no constraint" on that dimension.
+ */
+export interface TriggerBounds {
+  minBid: number | null;
+  maxBid: number | null;
+  minAsk: number | null;
+  maxAsk: number | null;
+  minSpreadBps: number | null;
+  maxSpreadBps: number | null;
+  minBidSize: number | null;
+  minAskSize: number | null;
+}
+
+/**
+ * Compute bounds for a trigger to enable fast pre-filtering.
+ * Returns the BBO constraints that MUST be met for the trigger to possibly fire.
+ *
+ * For example:
+ * - PRICE_ABOVE with threshold 0.5 on BID: minBid = 0.5
+ * - PRICE_BELOW with threshold 0.3 on ASK: maxAsk = 0.3
+ * - SPREAD_NARROW with threshold 100: maxSpreadBps = 100
+ *
+ * @param trigger The trigger to compute bounds for
+ * @returns TriggerBounds with constraints, null values mean "no constraint"
+ */
+export function computeTriggerBounds(trigger: Trigger): TriggerBounds {
+  const bounds: TriggerBounds = {
+    minBid: null,
+    maxBid: null,
+    minAsk: null,
+    maxAsk: null,
+    minSpreadBps: null,
+    maxSpreadBps: null,
+    minBidSize: null,
+    minAskSize: null,
+  };
+
+  const { type, threshold, side } = trigger.condition;
+
+  switch (type) {
+    case "PRICE_ABOVE":
+      // Price must be above threshold to fire
+      if (side === "ASK") {
+        bounds.minAsk = threshold;
+      } else {
+        bounds.minBid = threshold;
+      }
+      break;
+
+    case "PRICE_BELOW":
+      // Price must be below threshold to fire
+      if (side === "ASK") {
+        bounds.maxAsk = threshold;
+      } else {
+        bounds.maxBid = threshold;
+      }
+      break;
+
+    case "SPREAD_NARROW":
+      // Spread must be below threshold to fire
+      bounds.maxSpreadBps = threshold;
+      break;
+
+    case "SPREAD_WIDE":
+      // Spread must be above threshold to fire
+      bounds.minSpreadBps = threshold;
+      break;
+
+    case "SIZE_SPIKE":
+      // Need significant size on the specified side
+      if (side === "ASK") {
+        bounds.minAskSize = threshold;
+      } else {
+        bounds.minBidSize = threshold;
+      }
+      break;
+
+    case "IMBALANCE_BID":
+    case "IMBALANCE_ASK":
+      // Imbalance triggers need both sides to have size
+      // Can't pre-filter effectively without computing imbalance
+      break;
+
+    case "CROSSED_BOOK":
+      // Can't pre-filter - need to compare bid vs ask
+      break;
+
+    case "EMPTY_BOOK":
+      // No pre-filtering possible - fires when book is empty
+      break;
+
+    case "PRICE_MOVE":
+    case "VOLATILITY_SPIKE":
+    case "MICROPRICE_DIVERGENCE":
+    case "IMBALANCE_SHIFT":
+    case "MID_PRICE_TREND":
+    case "QUOTE_VELOCITY":
+    case "STALE_QUOTE":
+    case "LARGE_FILL":
+      // Time-windowed or history-based triggers can't be pre-filtered
+      break;
+
+    case "ARBITRAGE_BUY":
+    case "ARBITRAGE_SELL":
+    case "MULTI_OUTCOME_ARBITRAGE":
+      // Cross-asset triggers can't be pre-filtered with single-asset BBO
+      break;
+  }
+
+  return bounds;
+}

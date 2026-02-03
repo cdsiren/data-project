@@ -35,14 +35,6 @@ export function getShardForCondition(conditionId: string): string {
 }
 
 /**
- * Extract shard index from shard name
- */
-export function getShardIndex(shardName: string): number {
-  const match = shardName.match(/^shard-(\d+)$/);
-  return match ? parseInt(match[1], 10) : -1;
-}
-
-/**
  * Total number of shards in the system
  */
 export { SHARD_COUNT };
