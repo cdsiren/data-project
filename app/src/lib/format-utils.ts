@@ -13,16 +13,6 @@ export function formatMs(ms: number | null | undefined): string {
 }
 
 /**
- * Format latency in microseconds to readable format with validation
- */
-export function formatLatencyUs(latencyUs: number | null | undefined): string {
-  if (latencyUs == null || isNaN(latencyUs)) return "-";
-  if (latencyUs < 0) return "-"; // Invalid
-  if (latencyUs < 1000) return `${latencyUs.toFixed(0)}μs`;
-  return `${(latencyUs / 1000).toFixed(1)}ms`;
-}
-
-/**
  * Format large numbers with K/M suffix
  */
 export function formatCount(n: number | undefined): string {

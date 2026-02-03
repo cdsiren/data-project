@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useMemo, useCallback } from "react";
 import { fetchMetrics } from "@/lib/api";
 import { METRICS_CONFIG } from "@/lib/constants";
 import type {
@@ -87,6 +87,11 @@ export function useMetrics(): UseMetricsResult {
     return data?.shard_count ?? HEALTH_THRESHOLDS.TOTAL_SHARDS;
   }, [data]);
 
+  const getShardMetricsFn = useCallback(
+    (shardName: string) => getShardMetrics(data, shardName),
+    [data]
+  );
+
   return {
     data,
     isLoading,
@@ -94,6 +99,6 @@ export function useMetrics(): UseMetricsResult {
     healthStatus,
     healthyShardCount,
     totalShardCount,
-    getShardMetrics: (shardName: string) => getShardMetrics(data, shardName),
+    getShardMetrics: getShardMetricsFn,
   };
 }
