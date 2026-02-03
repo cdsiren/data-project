@@ -189,7 +189,7 @@ Advanced triggers optimized for Avellaneda-Stoikov market making and high-freque
 
 ## Prediction Market Triggers
 
-Triggers specific to binary and multi-outcome prediction markets (Polymarket, Kalshi, etc.).
+Triggers specific to binary and multi-outcome prediction markets.
 
 ### ARBITRAGE_BUY
 **Purpose**: Detect when YES_ask + NO_ask < threshold. Buying both guarantees profit.
@@ -202,8 +202,12 @@ Triggers specific to binary and multi-outcome prediction markets (Polymarket, Ka
 **Webhook extras**:
 - `counterpart_asset_id`: The other outcome's asset ID
 - `counterpart_best_bid`, `counterpart_best_ask`: Counterpart prices
+- `counterpart_bid_size`, `counterpart_ask_size`: Counterpart liquidity at BBO
 - `sum_of_asks`: YES_ask + NO_ask
 - `potential_profit_bps`: Estimated profit in basis points
+- `recommended_size`: Max executable size (min of both ask sizes)
+- `max_notional`: Total capital required (size × sum_of_asks)
+- `expected_profit`: Projected profit in dollars (size × profit per share)
 
 ### ARBITRAGE_SELL
 **Purpose**: Detect when YES_bid + NO_bid > threshold. Selling both guarantees profit.
@@ -216,8 +220,12 @@ Triggers specific to binary and multi-outcome prediction markets (Polymarket, Ka
 **Webhook extras**:
 - `counterpart_asset_id`: The other outcome's asset ID
 - `counterpart_best_bid`, `counterpart_best_ask`: Counterpart prices
+- `counterpart_bid_size`, `counterpart_ask_size`: Counterpart liquidity at BBO
 - `sum_of_bids`: YES_bid + NO_bid
 - `potential_profit_bps`: Estimated profit in basis points
+- `recommended_size`: Max executable size (min of both bid sizes)
+- `max_notional`: Total revenue received (size × sum_of_bids)
+- `expected_profit`: Projected profit in dollars (size × profit per share)
 
 ### MULTI_OUTCOME_ARBITRAGE
 **Purpose**: Detect arbitrage in N-outcome prediction markets. Sum of all outcome asks < threshold = arbitrage.
@@ -231,6 +239,9 @@ Triggers specific to binary and multi-outcome prediction markets (Polymarket, Ka
 - `outcome_ask_sum`: Sum of all outcome asks
 - `outcome_count`: Number of outcomes
 - `potential_profit_bps`: Estimated profit in basis points
+- `recommended_size`: Amount to buy of **each** outcome (min of all outcome ask sizes). Buy this quantity of every asset in `outcome_asset_ids` to realize the arbitrage.
+- `max_notional`: Total capital required (size × sum_of_asks)
+- `expected_profit`: Projected profit in dollars (size × profit per share)
 
 ---
 

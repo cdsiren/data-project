@@ -2,7 +2,8 @@
 // Market-agnostic orderbook types for the multi-market trading framework
 // These types are used across all markets after normalization from market-specific formats
 
-import type { MarketSource, OrderSide, TickDirection, LevelChangeType } from "./enums";
+import type { MarketSource, OrderSide, TickDirection, LevelChangeType, InstrumentKey } from "./enums";
+import { asInstrumentKey } from "./enums";
 
 /**
  * BBO (Best Bid/Offer) snapshot - lightweight top-of-book data
@@ -184,4 +185,57 @@ export interface EnhancedOrderbookSnapshot extends BBOSnapshot {
 
   // ISO 8601 datetime for CCXT compatibility
   datetime?: string;
+}
+
+// ============================================================
+// SCOPED INSTRUMENT KEY FUNCTIONS
+// These prevent ID collisions when multiple markets use similar ID formats
+// ============================================================
+
+/**
+ * Create a globally unique instrument identifier.
+ * Prevents collisions when multiple markets use similar ID formats.
+ *
+ * Pattern: {market_source}:{asset_id}
+ *
+ * @example
+ * createInstrumentKey("polymarket", "21742633143...") // "polymarket:21742633143..."
+ */
+export function createInstrumentKey(marketSource: MarketSource, assetId: string): InstrumentKey {
+  return asInstrumentKey(`${marketSource}:${assetId}`);
+}
+
+/**
+ * Parse an instrument key back into its components.
+ * Format: {market_source}:{asset_id}
+ */
+export function parseInstrumentKey(key: string): { marketSource: MarketSource; assetId: string } {
+  const colonIndex = key.indexOf(":");
+  if (colonIndex === -1) {
+    throw new Error(`Invalid instrument key: ${key}`);
+  }
+  return {
+    marketSource: key.slice(0, colonIndex) as MarketSource,
+    assetId: key.slice(colonIndex + 1),
+  };
+}
+
+/**
+ * Extract asset_id from an instrument key (for backward compatibility)
+ *
+ * @param key - The instrument key or raw asset_id
+ * @returns The asset_id portion
+ */
+export function getAssetIdFromKey(key: string): string {
+  if (key.includes(":")) {
+    return key.slice(key.indexOf(":") + 1);
+  }
+  return key;
+}
+
+/**
+ * Create an instrument key from a BBOSnapshot
+ */
+export function snapshotToInstrumentKey(snapshot: BBOSnapshot): InstrumentKey {
+  return createInstrumentKey(snapshot.market_source, snapshot.asset_id);
 }

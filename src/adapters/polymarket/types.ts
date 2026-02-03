@@ -110,6 +110,8 @@ export interface PolymarketMarket {
   negRisk: boolean;
   negRiskMarketID?: string;
   negRiskRequestID?: string;
+  description?: string;      // Market description (includes resolution criteria)
+  category?: string;         // Market category
   events: PolymarketEvent[];
 }
 
@@ -164,4 +166,6 @@ export interface GammaMarket {
   orderMinSize: number;
   resolvedBy?: string;
   resolutionSource?: string;
+  description?: string;
+  category?: string;
 }

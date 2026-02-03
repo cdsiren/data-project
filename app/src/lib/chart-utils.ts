@@ -88,11 +88,11 @@ export function formatTime(timestamp: number): string {
 }
 
 /**
- * Format latency in microseconds to readable format
+ * Format latency in microseconds to readable format with validation
  */
-export function formatLatency(latencyUs: number): string {
-  if (latencyUs < 1000) {
-    return `${latencyUs}μs`;
-  }
+export function formatLatency(latencyUs: number | null | undefined): string {
+  if (latencyUs == null || isNaN(latencyUs)) return "-";
+  if (latencyUs < 0) return "-"; // Invalid (clock skew or calculation error)
+  if (latencyUs < 1000) return `${latencyUs.toFixed(0)}μs`;
   return `${(latencyUs / 1000).toFixed(1)}ms`;
 }

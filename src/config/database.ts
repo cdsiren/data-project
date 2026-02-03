@@ -5,11 +5,11 @@
 import type { MarketSource, MarketType } from "../core/enums";
 
 /**
- * Mapping from market source to market type
+ * Mapping from market source to market type.
+ * Add new markets here when implementing additional adapters.
  */
 export const MARKET_SOURCE_TO_TYPE: Record<MarketSource, MarketType> = {
   polymarket: "prediction",
-  kalshi: "prediction",
 } as const;
 
 export const DB_CONFIG = {
@@ -70,17 +70,22 @@ export function getMarketType(source: MarketSource): MarketType {
 }
 
 /**
+ * Valid market types supported by the system.
+ * Currently only "prediction" is active.
+ */
+const VALID_MARKET_TYPES: readonly MarketType[] = [
+  "prediction",
+] as const;
+
+/**
  * Check if a market source is valid
  */
 export function isValidMarketSource(source: string): source is MarketSource {
-  return source === "polymarket";
+  return source in MARKET_SOURCE_TO_TYPE;
 }
 
-/**
- * Check if a market type is valid
- */
-export function isValidMarketType(type: string): type is MarketType {
-  return type === "prediction";
+function isValidMarketType(type: string): type is MarketType {
+  return VALID_MARKET_TYPES.includes(type as MarketType);
 }
 
 /**

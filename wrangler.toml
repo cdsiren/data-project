@@ -146,22 +146,6 @@ MARKETS_CONFIG = '''
       "reconnect_base_delay_ms": 1000,
       "reconnect_max_delay_ms": 30000
     }
-  },
-  {
-    "market_source": "kalshi",
-    "market_type": "prediction",
-    "enabled": false,
-    "ws_url": "wss://trading-api.kalshi.com/v1/ws",
-    "metadata_api_url": "https://api.kalshi.com/v1",
-    "adapter_class": "KalshiConnector",
-    "config": {
-      "max_instruments_per_ws": 100,
-      "price_range": [0.0, 1.0],
-      "heartbeat_interval_ms": 10000,
-      "reconnect_base_delay_ms": 1000,
-      "reconnect_max_delay_ms": 30000,
-      "requires_auth": true
-    }
   }
 ]
 '''

@@ -71,8 +71,9 @@ export class PolymarketConnector implements MarketConnector {
     const event = raw as PolymarketBookEvent;
     if (!event || event.event_type !== "book") return null;
 
-    const sourceTs = parseInt(event.timestamp);
-    const ingestionTs = Date.now() * 1000; // Microseconds
+    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
+    // Note: ingestion_ts is set to 0 here because it's always overridden
+    // by the DO with the actual WebSocket receive timestamp
 
     // Parse levels
     const bids = event.bids.map((b) => ({
@@ -85,22 +86,23 @@ export class PolymarketConnector implements MarketConnector {
     }));
 
     // Polymarket returns bids ASCENDING (lowest first) and asks DESCENDING (highest first)
-    // Best bid = HIGHEST bid price, Best ask = LOWEST ask price
-    const bestBidLevel = bids.length > 0
-      ? bids.reduce((best, curr) => curr.price > best.price ? curr : best)
-      : null;
-    const bestAskLevel = asks.length > 0
-      ? asks.reduce((best, curr) => curr.price < best.price ? curr : best)
-      : null;
+    // Best bid = last element (highest), Best ask = last element (lowest)
+    // O(1) direct access instead of O(n) reduce
+    const bestBidLevel = bids.length > 0 ? bids[bids.length - 1] : null;
+    const bestAskLevel = asks.length > 0 ? asks[asks.length - 1] : null;
 
     const bestBid = bestBidLevel?.price ?? null;
     const bestAsk = bestAskLevel?.price ?? null;
-    const midPrice = bestBid !== null && bestAsk !== null
-      ? (bestBid + bestAsk) / 2
-      : null;
-    const spreadBps = bestBid !== null && bestAsk !== null && midPrice !== null && midPrice > 0
-      ? ((bestAsk - bestBid) / midPrice) * 10000
-      : null;
+
+    // Calculate derived metrics - single null check, no redundant conditions
+    let midPrice: number | null = null;
+    let spreadBps: number | null = null;
+    if (bestBid !== null && bestAsk !== null) {
+      midPrice = (bestBid + bestAsk) / 2;
+      if (midPrice > 0) {
+        spreadBps = ((bestAsk - bestBid) / midPrice) * 10000;
+      }
+    }
 
     return {
       market_source: this.marketSource as "polymarket",
@@ -109,7 +111,7 @@ export class PolymarketConnector implements MarketConnector {
       token_id: event.asset_id,
       condition_id: event.market,
       source_ts: sourceTs,
-      ingestion_ts: ingestionTs,
+      ingestion_ts: 0, // Placeholder - always overridden by DO with actual receive timestamp
       book_hash: event.hash,
       sequence_number: 1,
       is_resync: false,
@@ -133,8 +135,7 @@ export class PolymarketConnector implements MarketConnector {
     const event = raw as PolymarketBookEvent;
     if (!event || event.event_type !== "book") return null;
 
-    const sourceTs = parseInt(event.timestamp);
-    const ingestionTs = Date.now() * 1000;
+    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
 
     // Parse all levels
     const bids = event.bids.map((b) => ({
@@ -152,7 +153,7 @@ export class PolymarketConnector implements MarketConnector {
       token_id: event.asset_id,
       condition_id: conditionId || event.market,
       source_ts: sourceTs,
-      ingestion_ts: ingestionTs,
+      ingestion_ts: 0, // Placeholder - always overridden by DO with actual receive timestamp
       book_hash: event.hash,
       bids,
       asks,
@@ -167,8 +168,7 @@ export class PolymarketConnector implements MarketConnector {
     const event = raw as PolymarketPriceChangeEvent;
     if (!event || event.event_type !== "price_change") return null;
 
-    const sourceTs = parseInt(event.timestamp);
-    const ingestionTs = Date.now() * 1000;
+    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
 
     return event.price_changes.map((change) => ({
       market_source: this.marketSource as "polymarket",
@@ -176,7 +176,7 @@ export class PolymarketConnector implements MarketConnector {
       asset_id: change.asset_id,
       condition_id: event.market,
       source_ts: sourceTs,
-      ingestion_ts: ingestionTs,
+      ingestion_ts: 0, // Placeholder - always overridden by DO with actual receive timestamp
       side: change.side as "BUY" | "SELL",
       price: parseFloat(change.price),
       old_size: 0, // Would need local book state to determine
@@ -192,8 +192,7 @@ export class PolymarketConnector implements MarketConnector {
     const event = raw as PolymarketLastTradePriceEvent;
     if (!event || event.event_type !== "last_trade_price") return null;
 
-    const sourceTs = parseInt(event.timestamp);
-    const ingestionTs = Date.now() * 1000;
+    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
 
     return {
       market_source: this.marketSource as "polymarket",
@@ -205,7 +204,7 @@ export class PolymarketConnector implements MarketConnector {
       size: parseFloat(event.size),
       side: event.side,
       source_ts: sourceTs,
-      ingestion_ts: ingestionTs,
+      ingestion_ts: 0, // Placeholder - always overridden by DO with actual receive timestamp
     };
   }
 

@@ -1,4 +1,5 @@
 import { Header } from "@/components/layout/Header";
+import { Footer } from "@/components/layout/Footer";
 import { CandlestickChart } from "@/components/charts/CandlestickChart";
 import { TriggerTable } from "@/components/triggers/TriggerTable";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -103,6 +104,8 @@ function App() {
           />
         </div>
       </main>
+
+      <Footer />
     </div>
   );
 }

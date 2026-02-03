@@ -5,6 +5,7 @@ import type { Env } from "../types";
 import type { BBOSnapshot } from "../types/orderbook";
 import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
 import { HashChainValidator } from "../services/hash-chain";
+import { handleBatchResult } from "../services/clickhouse-utils";
 
 export async function snapshotConsumer(
   batch: MessageBatch<BBOSnapshot>,
@@ -15,14 +16,13 @@ export async function snapshotConsumer(
 
   const validSnapshots: BBOSnapshot[] = [];
   const validMessages: Message<BBOSnapshot>[] = [];
-  let duplicates = 0, gaps = 0, resyncs = 0;
+  let duplicates = 0, gaps = 0;
 
   for (const message of batch.messages) {
     const snapshot = message.body;
 
     // Resyncs bypass hash chain validation
     if (snapshot.is_resync) {
-      resyncs++;
       validSnapshots.push(snapshot);
       validMessages.push(message);
       continue;
@@ -52,48 +52,32 @@ export async function snapshotConsumer(
           v.gapDurationMs || 0,
           snapshot.market_source,
           snapshot.market_type
-        ).catch(e => console.error("[Snapshot] Gap event failed:", e));
+        ).catch(() => {});
       }
 
       validSnapshots.push(snapshot);
       validMessages.push(message);
     } catch {
-      // Hash chain errors shouldn't block data - insert anyway
       validSnapshots.push(snapshot);
       validMessages.push(message);
     }
   }
 
-  if (validSnapshots.length === 0) {
-    if (duplicates > 0) console.log(`[Snapshot] Skipped ${duplicates} duplicates`);
-    return;
-  }
+  if (validSnapshots.length === 0) return;
 
-  try {
-    await clickhouse.insertSnapshots(validSnapshots);
+  const result = await clickhouse.insertSnapshots(validSnapshots);
+  handleBatchResult(validMessages, result, "Snapshot");
 
-    // Record latency metrics for monitoring (fire-and-forget, don't block main flow)
-    // COST OPTIMIZATION: Sample 1% of snapshots for latency recording
-    // This reduces ob_latency inserts by 99% while still providing
-    // statistically valid p50/p95/p99 percentiles for monitoring
-    const sampledSnapshots = validSnapshots.filter(() => Math.random() < 0.01);
-    if (sampledSnapshots.length > 0) {
-      clickhouse.recordLatencyBatch(
-        sampledSnapshots.map(s => ({
-          assetId: s.asset_id,
-          sourceTs: s.source_ts,
-          ingestionTs: s.ingestion_ts,
-          eventType: "bbo_snapshot",
-          marketSource: s.market_source,
-          marketType: s.market_type,
-        }))
-      ).catch(e => console.error("[Snapshot] Latency recording failed:", e));
-    }
-
-    for (const msg of validMessages) msg.ack();
-    console.log(`[Snapshot] Inserted ${validSnapshots.length}/${batch.messages.length} (dup=${duplicates}, gaps=${gaps}, resync=${resyncs})`);
-  } catch (error) {
-    console.error("[Snapshot] Insert failed, retrying:", error);
-    for (const msg of validMessages) msg.retry();
+  // Sample latency metrics at 0.1%
+  if (result.success && Math.random() < 0.001 && validSnapshots.length > 0) {
+    const s = validSnapshots[0];
+    clickhouse.recordLatencyBatch([{
+      assetId: s.asset_id,
+      sourceTs: s.source_ts,
+      ingestionTs: s.ingestion_ts,
+      eventType: "bbo_snapshot",
+      marketSource: s.market_source,
+      marketType: s.market_type,
+    }]).catch(() => {});
   }
 }
