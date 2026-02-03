@@ -1039,13 +1039,18 @@ export class OrderbookManager extends DurableObject<Env> {
         state.lastPing = Date.now();
 
         // ADAPTER-DRIVEN: Use connector's subscription message format
+        // Filter out assets still in backoff period to respect exponential backoff
         if (state.assets.size > 0 && !state.subscriptionSent) {
-          const assetList = Array.from(state.assets);
-          const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
-            ?? JSON.stringify({ assets_ids: assetList, type: "market" });
-          ws.send(subscriptionMsg);
-          state.subscriptionSent = true;
-          console.log(`[WS ${connId}] Subscription sent for ${state.assets.size} assets (market: ${state.marketSource})`);
+          const assetList = this.filterAssetsNotInBackoff(Array.from(state.assets));
+          if (assetList.length > 0) {
+            const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
+              ?? JSON.stringify({ assets_ids: assetList, type: "market" });
+            ws.send(subscriptionMsg);
+            state.subscriptionSent = true;
+            console.log(`[WS ${connId}] Subscription sent for ${assetList.length}/${state.assets.size} assets (market: ${state.marketSource})`);
+          } else {
+            console.log(`[WS ${connId}] All ${state.assets.size} assets in backoff, deferring subscription`);
+          }
         }
 
         // Schedule alarm for PING heartbeat
@@ -2024,6 +2029,36 @@ export class OrderbookManager extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Filters assets that are not currently in backoff period.
+   * Also handles decay period reset for stale failure states.
+   */
+  private filterAssetsNotInBackoff(assetIds: string[]): string[] {
+    const now = Date.now();
+    return assetIds.filter(assetId => {
+      const subState = this.subscriptionState.get(assetId);
+      if (!subState) return true; // No state = not in backoff
+
+      // Reset failures after decay period (1 hour of no attempts)
+      if (now - subState.lastAttempt > this.FAILURE_DECAY_MS) {
+        this.subscriptionState.delete(assetId);
+        return true;
+      }
+
+      // Check if still in backoff period
+      if (now < subState.backoffUntil) {
+        // Only log for assets with few failures to avoid spam
+        if (subState.failures <= 2) {
+          const remainingSec = Math.round((subState.backoffUntil - now) / 1000);
+          console.log(`[WS] Asset ${assetId.slice(0, 12)}... skipped (backoff ${remainingSec}s remaining)`);
+        }
+        return false;
+      }
+
+      return true;
+    });
+  }
+
   private async syncSubscriptions(): Promise<void> {
     for (const [connId, state] of this.connections) {
       // Only send if connection is open, has assets, and hasn't sent yet (or needs update)
@@ -2034,12 +2069,17 @@ export class OrderbookManager extends DurableObject<Env> {
       ) {
         try {
           // ADAPTER-DRIVEN: Use connector's subscription message format
-          const assetList = Array.from(state.assets);
+          // Filter out assets still in backoff period to respect exponential backoff
+          const assetList = this.filterAssetsNotInBackoff(Array.from(state.assets));
+          if (assetList.length === 0) {
+            console.log(`[WS ${connId}] All ${state.assets.size} assets in backoff, skipping subscription`);
+            continue;
+          }
           const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
             ?? JSON.stringify({ assets_ids: assetList, type: "market" });
           state.ws.send(subscriptionMsg);
           state.subscriptionSent = true;
-          console.log(`[WS ${connId}] Subscription synced for ${state.assets.size} assets (market: ${state.marketSource})`);
+          console.log(`[WS ${connId}] Subscription synced for ${assetList.length}/${state.assets.size} assets (market: ${state.marketSource})`);
         } catch (error) {
           console.error(`[WS ${connId}] Failed to send subscription:`, error);
           state.subscriptionSent = false;
