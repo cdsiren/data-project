@@ -82,7 +82,7 @@ export class PolymarketConnector implements MarketConnector {
     const event = raw as PolymarketBookEvent;
     if (!event || event.event_type !== "book") return null;
 
-    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
+    const sourceTs = parseInt(event.timestamp); // Keep as ms (Polymarket native format)
     // Note: ingestion_ts is set to 0 here because it's always overridden
     // by the DO with the actual WebSocket receive timestamp
 
@@ -146,7 +146,7 @@ export class PolymarketConnector implements MarketConnector {
     const event = raw as PolymarketBookEvent;
     if (!event || event.event_type !== "book") return null;
 
-    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
+    const sourceTs = parseInt(event.timestamp); // Keep as ms (Polymarket native format)
 
     // Parse all levels
     const bids = event.bids.map((b) => ({
@@ -179,7 +179,7 @@ export class PolymarketConnector implements MarketConnector {
     const event = raw as PolymarketPriceChangeEvent;
     if (!event || event.event_type !== "price_change") return null;
 
-    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
+    const sourceTs = parseInt(event.timestamp); // Keep as ms (Polymarket native format)
 
     return event.price_changes.map((change) => ({
       market_source: this.marketSource as "polymarket",
@@ -203,7 +203,7 @@ export class PolymarketConnector implements MarketConnector {
     const event = raw as PolymarketLastTradePriceEvent;
     if (!event || event.event_type !== "last_trade_price") return null;
 
-    const sourceTs = parseInt(event.timestamp) * 1000; // Convert ms to μs
+    const sourceTs = parseInt(event.timestamp); // Keep as ms (Polymarket native format)
 
     return {
       market_source: this.marketSource as "polymarket",

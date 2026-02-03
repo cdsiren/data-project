@@ -1042,6 +1042,14 @@ export class OrderbookManager extends DurableObject<Env> {
         // Filter out assets still in backoff period to respect exponential backoff
         if (state.assets.size > 0 && !state.subscriptionSent) {
           const assetList = this.filterAssetsNotInBackoff(Array.from(state.assets));
+          // Update pendingAssets to only include assets we're actually subscribing to
+          // This prevents assets in backoff from being blamed for failures they didn't cause
+          const assetSet = new Set(assetList);
+          for (const asset of state.pendingAssets) {
+            if (!assetSet.has(asset)) {
+              state.pendingAssets.delete(asset);
+            }
+          }
           if (assetList.length > 0) {
             const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
               ?? JSON.stringify({ assets_ids: assetList, type: "market" });
@@ -2071,6 +2079,14 @@ export class OrderbookManager extends DurableObject<Env> {
           // ADAPTER-DRIVEN: Use connector's subscription message format
           // Filter out assets still in backoff period to respect exponential backoff
           const assetList = this.filterAssetsNotInBackoff(Array.from(state.assets));
+          // Update pendingAssets to only include assets we're actually subscribing to
+          // This prevents assets in backoff from being blamed for failures they didn't cause
+          const assetSet = new Set(assetList);
+          for (const asset of state.pendingAssets) {
+            if (!assetSet.has(asset)) {
+              state.pendingAssets.delete(asset);
+            }
+          }
           if (assetList.length === 0) {
             console.log(`[WS ${connId}] All ${state.assets.size} assets in backoff, skipping subscription`);
             continue;
@@ -2456,16 +2472,33 @@ export class OrderbookManager extends DurableObject<Env> {
 
     try {
       const clickhouse = new ClickHouseOrderbookClient(this.env);
-      await clickhouse.insertSnapshots(batch);
-      this.snapshotBuffer.splice(0, batchSize); // Clear only after success
+      const result = await clickhouse.insertSnapshots(batch);
+
+      if (result.success) {
+        this.snapshotBuffer.splice(0, batchSize); // Clear only after success
+      } else {
+        // ClickHouse insert failed - check if we should retry via queue
+        console.error(`[DO ${this.shardId}] ClickHouse insert failed: ${result.error}`);
+        if (result.shouldRetry) {
+          // Transient failure - try queue fallback
+          const queued = await this.sendBatchToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, batch);
+          if (queued) {
+            this.snapshotBuffer.splice(0, batchSize); // Clear only after queue accepts
+          } else {
+            console.error(`[DO ${this.shardId}] CRITICAL: Both ClickHouse and queue failed, retaining ${batchSize} snapshots`);
+          }
+        } else {
+          // Permanent failure (client error) - log and drop to prevent infinite retry
+          console.error(`[DO ${this.shardId}] Permanent ClickHouse failure, dropping ${batchSize} snapshots`);
+          this.snapshotBuffer.splice(0, batchSize);
+        }
+      }
     } catch (error) {
-      // Fallback: send to queue for retry
-      console.error(`[DO ${this.shardId}] ClickHouse insert failed, falling back to queue:`, error);
+      // Defensive: handle unexpected exceptions (should not occur with current API)
+      console.error(`[DO ${this.shardId}] Unexpected error in flushSnapshotBuffer:`, error);
       const queued = await this.sendBatchToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, batch);
       if (queued) {
-        this.snapshotBuffer.splice(0, batchSize); // Clear only after queue accepts
-      } else {
-        console.error(`[DO ${this.shardId}] CRITICAL: Both ClickHouse and queue failed, retaining ${batchSize} snapshots`);
+        this.snapshotBuffer.splice(0, batchSize);
       }
     } finally {
       this.isFlushingSnapshots = false;

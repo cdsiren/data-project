@@ -72,7 +72,7 @@ describe("PolymarketConnector", () => {
       expect(result).toEqual({
         type: "price_change",
         raw: priceChangeEvent,
-        assetId: undefined, // price_change has asset_id inside price_changes, not at top level
+        assetId: "test_asset", // fast-parse extracts first asset_id from price_changes
       });
     });
 
@@ -321,13 +321,13 @@ describe("PolymarketConnector", () => {
 
         const result = connector.normalizeBookEvent(event);
 
-        // source_ts should be in microseconds (ms * 1000)
-        expect(result!.source_ts).toBe(1700000000000 * 1000);
+        // source_ts should be in milliseconds (Polymarket native format)
+        expect(result!.source_ts).toBe(1700000000000);
       });
 
-      it("should set ingestion_ts in microseconds", () => {
-        const before = Date.now() * 1000; // μs
-
+      it("should set ingestion_ts as placeholder (0)", () => {
+        // ingestion_ts is set to 0 in the connector because it's always
+        // overridden by the DO with the actual WebSocket receive timestamp
         const event: PolymarketBookEvent = {
           event_type: "book",
           asset_id: "test_asset",
@@ -339,11 +339,9 @@ describe("PolymarketConnector", () => {
         };
 
         const result = connector.normalizeBookEvent(event);
-        const after = Date.now() * 1000; // μs
 
-        // ingestion_ts should be between before and after
-        expect(result!.ingestion_ts).toBeGreaterThanOrEqual(before);
-        expect(result!.ingestion_ts).toBeLessThanOrEqual(after);
+        // ingestion_ts is a placeholder (0) - DO will override with actual timestamp
+        expect(result!.ingestion_ts).toBe(0);
       });
     });
 
@@ -446,7 +444,7 @@ describe("PolymarketConnector", () => {
       expect(result![0].price).toBe(0.46);
       expect(result![0].new_size).toBe(50);
       expect(result![0].book_hash).toBe("hash1");
-      expect(result![0].source_ts).toBe(1700000000000 * 1000); // μs
+      expect(result![0].source_ts).toBe(1700000000000); // ms
 
       expect(result![1].asset_id).toBe("test_asset_2");
       expect(result![1].side).toBe("SELL");
@@ -537,7 +535,7 @@ describe("PolymarketConnector", () => {
       expect(result!.price).toBe(0.52);
       expect(result!.size).toBe(500);
       expect(result!.side).toBe("BUY");
-      expect(result!.source_ts).toBe(1700000000000 * 1000); // μs
+      expect(result!.source_ts).toBe(1700000000000); // ms
       expect(result!.trade_id).toContain("test_asset-");
     });
 
@@ -622,7 +620,7 @@ describe("PolymarketConnector", () => {
       expect(result!.bids).toHaveLength(3);
       expect(result!.asks).toHaveLength(3);
       expect(result!.book_hash).toBe("abc123");
-      expect(result!.source_ts).toBe(1700000000000 * 1000); // μs
+      expect(result!.source_ts).toBe(1700000000000); // ms
     });
 
     it("should preserve all bid/ask levels", () => {
