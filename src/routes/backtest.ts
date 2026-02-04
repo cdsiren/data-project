@@ -20,6 +20,7 @@ import {
   ArchiveQueryService,
   getRequiredTier,
 } from "../services/archive-query";
+import { runArchiveBackfill } from "../consumers/archive-consumer";
 
 const backtest = new Hono<{ Bindings: Env }>();
 
@@ -52,6 +53,39 @@ async function hashApiKey(apiKey: string): Promise<string> {
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+// ============================================================
+// Admin Endpoints (separate auth - defined before main middleware)
+// ============================================================
+
+/**
+ * Trigger archive backfill for all resolved markets and aged data.
+ * This endpoint queues archival jobs but does NOT delete any data.
+ *
+ * POST /admin/backfill
+ * Header: X-Admin-Key (required)
+ *
+ * Safety: Data remains in ClickHouse until manual deletion.
+ */
+backtest.post("/admin/backfill", async (c) => {
+  const adminKey = c.req.header("X-Admin-Key");
+  if (!adminKey || adminKey !== c.env.ADMIN_API_KEY) {
+    return c.json({ error: "Unauthorized" }, 403);
+  }
+
+  try {
+    const result = await runArchiveBackfill(c.env);
+    return c.json({
+      success: true,
+      marketsQueued: result.marketsQueued,
+      agedTablesQueued: result.agedTablesQueued,
+      message: "Archive jobs queued. Data will be copied to R2 without deletion.",
+    });
+  } catch (error) {
+    console.error("[Backtest] Archive backfill failed:", error);
+    return c.json({ error: "Backfill failed", details: String(error) }, 500);
+  }
+});
 
 backtest.use("*", authMiddleware);
 

@@ -42,6 +42,7 @@ export interface Env {
   CLICKHOUSE_USER: string;
   CLICKHOUSE_TOKEN: string;
   VITE_DASHBOARD_API_KEY: string;  // Required key for dashboard API access
+  ADMIN_API_KEY: string;           // Required key for admin endpoints
 }
 
 // Archive job for queue processing
