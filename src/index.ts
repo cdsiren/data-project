@@ -2269,9 +2269,7 @@ async function scheduledHandler(
           const refreshed = await refreshAllMarketMetadata(env);
           console.log(`[Scheduled] Hourly metadata refresh complete: ${refreshed} markets refreshed`);
         }
-      ).then(() => {
-        console.log("[Scheduled] Hourly metadata refresh cron completed successfully");
-      }).catch((error) => {
+      ).catch((error) => {
         // Error already persisted to KV by withCronErrorTracking
         console.error("[Scheduled] CRON FAILED - Hourly metadata refresh error:", error);
       })
@@ -2301,9 +2299,7 @@ async function scheduledHandler(
             const result = await bootstrapActiveMarkets(env);
             console.log(`[Scheduled] Bootstrap complete: ${result.subscribed} subscribed, ${result.errors} errors, ${result.metadataSynced} metadata, ${result.cacheSynced} cached`);
           }
-        ).then(() => {
-          console.log("[Scheduled] Auto-bootstrap cron completed successfully");
-        }).catch((error) => {
+        ).catch((error) => {
           // Error already persisted to KV by withCronErrorTracking
           console.error("[Scheduled] CRON FAILED - Bootstrap error:", error);
         })
@@ -2351,9 +2347,7 @@ async function scheduledHandler(
             }
           }
         }
-      ).then(() => {
-        console.log("[Scheduled] Lifecycle check cron completed successfully");
-      }).catch((error) => {
+      ).catch((error) => {
         // Error already persisted to KV by withCronErrorTracking
         console.error("[Scheduled] CRON FAILED - Lifecycle check error:", error);
       })

@@ -168,28 +168,15 @@ export async function gapBackfillConsumer(
       );
       message.ack();
     } catch (error) {
-      // Classify error to determine retry behavior
-      const errorMessage = String(error);
-      const isTransient = errorMessage.includes("fetch failed") ||
-        errorMessage.includes("CLOB API error") ||
-        errorMessage.includes("network") ||
-        errorMessage.includes("timeout");
+      console.error(
+        `[GapBackfill] Failed for ${job.asset_id.slice(0, 20)}..., will retry:`,
+        error
+      );
 
-      if (isTransient) {
-        console.error(
-          `[GapBackfill] Transient error for ${job.asset_id.slice(0, 20)}..., will retry:`,
-          error
-        );
-        // Use Cloudflare's built-in retry mechanism
-        message.retry();
-      } else {
-        console.error(
-          `[GapBackfill] Non-retryable error for ${job.asset_id.slice(0, 20)}..., acking message:`,
-          error
-        );
-        // Non-transient error (likely a bug) - ack to prevent infinite retry loops
-        message.ack();
-      }
+      // Use Cloudflare's built-in retry mechanism instead of manual re-queue
+      // This prevents message accumulation on repeated failures
+      // Max retries (5) configured in wrangler.toml - exceeding goes to dead-letter-queue
+      message.retry();
     }
   }
 }
