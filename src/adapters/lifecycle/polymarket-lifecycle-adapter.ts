@@ -217,7 +217,11 @@ export class PolymarketLifecycleAdapter implements MarketLifecycleAdapter {
           }
         }
       } catch (error) {
-        console.error("[PolymarketLifecycle] Error fetching markets:", error);
+        console.error(
+          `[PolymarketLifecycle] Error fetching markets at offset ${offset} ` +
+          `(fetched ${allMarkets.length} so far):`,
+          error
+        );
         break;
       }
     }

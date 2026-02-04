@@ -83,7 +83,10 @@ export class MarketCleanupService {
     try {
       await this.env.HASH_CHAIN_CACHE.delete(`chain:${assetId}`);
     } catch (err) {
-      console.error(`[Cleanup] Failed to delete hash chain for ${assetId.slice(0, 20)}...:`, err);
+      console.error(
+        `[Cleanup] Failed to delete hash chain for ${assetId.slice(0, 20)}... (source: gap_backfill):`,
+        err
+      );
       // Continue anyway - marking as cleaned prevents retry loops
     }
 
@@ -149,7 +152,11 @@ export class MarketCleanupService {
         await this.env.HASH_CHAIN_CACHE.delete(`chain:${tokenId}`);
         return true;
       } catch (err) {
-        console.error(`[Cleanup] Failed to delete hash chain for ${tokenId.slice(0, 20)}...:`, err);
+        console.error(
+          `[Cleanup] Failed to delete hash chain for ${tokenId.slice(0, 20)}... ` +
+          `(market: ${conditionId.slice(0, 20)}..., source: scheduled):`,
+          err
+        );
         return false;
       }
     });

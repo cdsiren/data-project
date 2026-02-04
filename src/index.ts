@@ -1769,7 +1769,10 @@ async function verifySessionToken(token: string, apiKey: string): Promise<boolea
  * POST /api/v1/auth with X-API-Key header or { "api_key": "..." } body
  */
 legacyDashboardApi.post("/auth", async (c) => {
-  const apiKey = c.req.header("X-API-Key") || (await c.req.json().catch(() => ({}))).api_key;
+  const apiKey = c.req.header("X-API-Key") || (await c.req.json().catch((err) => {
+    console.warn(`[Auth] Failed to parse JSON body for API key extraction: ${err}`);
+    return {};
+  })).api_key;
 
   if (!apiKey || apiKey !== c.env.VITE_DASHBOARD_API_KEY) {
     return c.json({ error: "Invalid API key" }, 401);

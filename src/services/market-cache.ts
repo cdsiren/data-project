@@ -60,10 +60,9 @@ export class MarketCacheService {
 
       return { metadata };
     } catch (error) {
-      return {
-        metadata: null,
-        error: `Failed to parse cache for asset ${assetId.slice(0, 20)}...: ${error}`,
-      };
+      const errorMsg = `Failed to parse cache for asset ${assetId.slice(0, 20)}...: ${error}`;
+      console.error(`[MarketCache] ${errorMsg}`);
+      return { metadata: null, error: errorMsg };
     }
   }
 

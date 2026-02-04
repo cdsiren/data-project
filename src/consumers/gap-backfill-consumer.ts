@@ -169,12 +169,13 @@ export async function gapBackfillConsumer(
       message.ack();
     } catch (error) {
       console.error(
-        `[GapBackfill] Failed for ${job.asset_id}:`,
+        `[GapBackfill] Failed for ${job.asset_id.slice(0, 20)}..., will retry:`,
         error
       );
 
       // Use Cloudflare's built-in retry mechanism instead of manual re-queue
       // This prevents message accumulation on repeated failures
+      // Max retries (5) configured in wrangler.toml - exceeding goes to dead-letter-queue
       message.retry();
     }
   }

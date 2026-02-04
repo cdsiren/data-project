@@ -76,10 +76,17 @@ export class MarketLifecycleService {
 
       const response = await fetch(webhook.url, { method: "POST", headers, body });
       if (!response.ok) {
-        console.error(`[MarketLifecycle] Webhook ${webhook.url} failed: ${response.status}`);
+        console.error(
+          `[MarketLifecycle] Webhook ${webhook.url} failed with status ${response.status} ` +
+          `for event ${event.event_type} (market: ${event.market_id}, condition: ${event.condition_id})`
+        );
       }
     } catch (error) {
-      console.error(`[MarketLifecycle] Webhook ${webhook.url} error:`, error);
+      console.error(
+        `[MarketLifecycle] Webhook ${webhook.url} error for event ${event.event_type} ` +
+        `(market: ${event.market_id}, condition: ${event.condition_id}):`,
+        error
+      );
     }
   }
 
@@ -241,6 +248,10 @@ async function updateMarketCache(markets: MarketMetadata[], env: Env): Promise<v
         );
       }
     } catch {
+      console.warn(
+        `[MarketLifecycle] Failed to parse clobTokenIds for market ${market.id} ` +
+        `(condition: ${market.conditionId}), using raw value: ${market.clobTokenIds.slice(0, 50)}...`
+      );
       cacheOperations.push(
         env.MARKET_CACHE.put(`market:${market.clobTokenIds}`, cacheValue, { expirationTtl: 86400 * 7 })
       );

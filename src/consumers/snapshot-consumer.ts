@@ -52,12 +52,20 @@ export async function snapshotConsumer(
           v.gapDurationMs || 0,
           snapshot.market_source,
           snapshot.market_type
-        ).catch(() => {});
+        ).catch((error) => {
+          console.error(
+            `[Snapshot] Failed to record gap event for asset ${snapshot.asset_id.slice(0, 20)}...: ${error}`
+          );
+        });
       }
 
       validSnapshots.push(snapshot);
       validMessages.push(message);
-    } catch {
+    } catch (error) {
+      console.error(
+        `[Snapshot] Hash chain validation failed for asset ${snapshot.asset_id.slice(0, 20)}...: ${error}. ` +
+        `Allowing snapshot through (fail-open behavior).`
+      );
       validSnapshots.push(snapshot);
       validMessages.push(message);
     }
@@ -78,6 +86,10 @@ export async function snapshotConsumer(
       eventType: "bbo_snapshot",
       marketSource: s.market_source,
       marketType: s.market_type,
-    }]).catch(() => {});
+    }]).catch((error) => {
+      console.warn(
+        `[Snapshot] Failed to record latency metrics for asset ${s.asset_id.slice(0, 20)}...: ${error}`
+      );
+    });
   }
 }

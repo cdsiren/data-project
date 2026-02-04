@@ -87,8 +87,13 @@ export class PolymarketConnector implements MarketConnector {
       const assetId = fastResult.assetId || event.asset_id;
 
       return { type, raw: event, assetId };
-    } catch {
-      return null; // Parse error
+    } catch (error) {
+      const preview = data.slice(0, 200);
+      console.warn(
+        `[Polymarket] Failed to parse message (len=${data.length}): ${error}. ` +
+        `Preview: ${preview}${data.length > 200 ? '...' : ''}`
+      );
+      return null;
     }
   }
 
