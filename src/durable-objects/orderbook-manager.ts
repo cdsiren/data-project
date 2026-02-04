@@ -1042,13 +1042,17 @@ export class OrderbookManager extends DurableObject<Env> {
         // Filter out assets still in backoff period to respect exponential backoff
         if (state.assets.size > 0 && !state.subscriptionSent) {
           const assetList = this.filterAssetsNotInBackoff(Array.from(state.assets));
-          // Update pendingAssets to only include assets we're actually subscribing to
-          // This prevents assets in backoff from being blamed for failures they didn't cause
+          // Sync pendingAssets with assets we're actually subscribing to:
+          // 1. Remove assets in backoff (not in assetList) - prevents undeserved failure blame
+          // 2. Add assets being subscribed (in assetList) - allows success to clear failure state
           const assetSet = new Set(assetList);
           for (const asset of state.pendingAssets) {
             if (!assetSet.has(asset)) {
               state.pendingAssets.delete(asset);
             }
+          }
+          for (const asset of assetList) {
+            state.pendingAssets.add(asset);
           }
           if (assetList.length > 0) {
             const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
@@ -2079,13 +2083,17 @@ export class OrderbookManager extends DurableObject<Env> {
           // ADAPTER-DRIVEN: Use connector's subscription message format
           // Filter out assets still in backoff period to respect exponential backoff
           const assetList = this.filterAssetsNotInBackoff(Array.from(state.assets));
-          // Update pendingAssets to only include assets we're actually subscribing to
-          // This prevents assets in backoff from being blamed for failures they didn't cause
+          // Sync pendingAssets with assets we're actually subscribing to:
+          // 1. Remove assets in backoff (not in assetList) - prevents undeserved failure blame
+          // 2. Add assets being subscribed (in assetList) - allows success to clear failure state
           const assetSet = new Set(assetList);
           for (const asset of state.pendingAssets) {
             if (!assetSet.has(asset)) {
               state.pendingAssets.delete(asset);
             }
+          }
+          for (const asset of assetList) {
+            state.pendingAssets.add(asset);
           }
           if (assetList.length === 0) {
             console.log(`[WS ${connId}] All ${state.assets.size} assets in backoff, skipping subscription`);
