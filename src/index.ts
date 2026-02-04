@@ -644,9 +644,10 @@ app.get("/test/websocket", async (c) => {
         bookData: null as unknown,
       };
 
+      const messages: string[] = [];
       const timeout = setTimeout(() => {
         ws.close();
-        resolve({ ...state, error: "Timeout after 15s" });
+        resolve({ ...state, error: "Timeout after 15s", messages });
       }, 15000);
 
       ws.addEventListener("open", () => {
@@ -660,13 +661,16 @@ app.get("/test/websocket", async (c) => {
         state.subscribed = true;
       });
 
-      const messages: string[] = [];
       ws.addEventListener("message", (event) => {
         const rawData = event.data as string;
-        messages.push(rawData.slice(0, 200));
+        messages.push(rawData.slice(0, 1000));
         try {
           const data = JSON.parse(rawData);
-          if (data.event_type === "book") {
+          // Handle both single objects and arrays of events
+          const events = Array.isArray(data) ? data : [data];
+          const bookEvent = events.find((e: any) => e.event_type === "book");
+          if (bookEvent) {
+            const data = bookEvent;
             state.receivedBook = true;
             state.bookData = {
               asset_id: data.asset_id,

@@ -61,16 +61,30 @@ export class PolymarketConnector implements MarketConnector {
     }
 
     try {
-      const event = JSON.parse(data) as PolymarketWSEvent;
+      const parsed = JSON.parse(data);
+
+      // Polymarket sends book events as arrays - unwrap if needed
+      const event = Array.isArray(parsed) ? parsed[0] : parsed;
+      if (!event) {
+        return null; // Empty array
+      }
 
       // Fast-path type is already normalized - use directly if available
-      // Falls back to event.event_type mapping for unknown types
-      const type: MarketEventType = fastResult.type !== "unknown"
-        ? (fastResult.type as MarketEventType)
-        : (EVENT_TYPE_MAP[event.event_type] || "unknown");
+      // Falls back to event.event_type mapping, then structure detection
+      let type: MarketEventType = "unknown";
+      if (fastResult.type !== "unknown") {
+        type = fastResult.type as MarketEventType;
+      } else if (event.event_type && EVENT_TYPE_MAP[event.event_type]) {
+        type = EVENT_TYPE_MAP[event.event_type];
+      } else if (event.bids && event.asks) {
+        // Book events identified by structure (no event_type field)
+        type = "book";
+      } else if (event.price_changes) {
+        type = "price_change";
+      }
 
       // Use pre-extracted asset_id when available
-      const assetId = fastResult.assetId || (event as any).asset_id;
+      const assetId = fastResult.assetId || event.asset_id;
 
       return { type, raw: event, assetId };
     } catch {
@@ -80,7 +94,8 @@ export class PolymarketConnector implements MarketConnector {
 
   normalizeBookEvent(raw: unknown): BBOSnapshot | null {
     const event = raw as PolymarketBookEvent;
-    if (!event || event.event_type !== "book") return null;
+    // Book events identified by having bids/asks arrays (event_type field is optional)
+    if (!event || !event.bids || !event.asks) return null;
 
     const sourceTs = parseInt(event.timestamp); // Keep as ms (Polymarket native format)
     // Note: ingestion_ts is set to 0 here because it's always overridden
