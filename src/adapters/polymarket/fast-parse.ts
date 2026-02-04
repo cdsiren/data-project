@@ -42,14 +42,20 @@ export function fastParsePolymarketMessage(data: string): FastParseResult {
     return { type: "pong", needsFullParse: false };
   }
 
-  // Non-JSON messages
-  if (!data.startsWith("{")) {
+  // Handle INVALID OPERATION
+  if (data === "INVALID OPERATION") {
+    return { type: "unknown", needsFullParse: false };
+  }
+
+  // Non-JSON messages (neither object nor array)
+  if (!data.startsWith("{") && !data.startsWith("[")) {
     return { type: "unknown", needsFullParse: false };
   }
 
   // Detect type by prefix (O(1) string comparison)
   let type: FastParseResult["type"] = "unknown";
 
+  // Check for explicit event_type field (some message formats)
   if (data.startsWith(BOOK_PREFIX)) {
     type = "book";
   } else if (data.startsWith(PRICE_CHANGE_PREFIX)) {
@@ -58,6 +64,15 @@ export function fastParsePolymarketMessage(data: string): FastParseResult {
     type = "trade";
   } else if (data.startsWith(TICK_SIZE_PREFIX)) {
     type = "tick_size";
+  }
+  // Polymarket sends book events as arrays without event_type field
+  // Detect by presence of "bids" and "asks" fields
+  else if (data.includes('"bids"') && data.includes('"asks"')) {
+    type = "book";
+  }
+  // Price changes have "price_changes" array
+  else if (data.includes('"price_changes"')) {
+    type = "price_change";
   }
 
   // For known types, extract asset_id without full parse
@@ -70,9 +85,11 @@ export function fastParsePolymarketMessage(data: string): FastParseResult {
         needsFullParse: true, // Still need full parse for data extraction
       };
     }
+    return { type, needsFullParse: true };
   }
 
-  return { type, needsFullParse: type !== "unknown" };
+  // Unknown JSON - still needs parsing to determine type
+  return { type: "unknown", needsFullParse: true };
 }
 
 /**
@@ -87,8 +104,8 @@ export function isProcessableMessage(data: string): boolean {
   if (data === "PONG" || data === "INVALID OPERATION") {
     return false;
   }
-  // Skip non-JSON
-  if (!data.startsWith("{")) {
+  // Skip non-JSON (must be object or array)
+  if (!data.startsWith("{") && !data.startsWith("[")) {
     return false;
   }
   // Process all JSON messages

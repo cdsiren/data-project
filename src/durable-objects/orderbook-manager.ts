@@ -202,8 +202,16 @@ export class OrderbookManager extends DurableObject<Env> {
   // Full L2 snapshots are only needed for gap recovery, not backtesting
   // BBO (tick-level) data is preserved at full resolution for strategies
   private readonly FULL_L2_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes for full L2 snapshots
-  private readonly MAX_SUBSCRIPTION_RETRIES = 3;
-  private subscriptionFailures: Map<string, number> = new Map(); // Track failures per asset
+  private readonly MAX_SUBSCRIPTION_RETRIES = 5; // Increased from 3 for resilience
+  private readonly FAILURE_DECAY_MS = 3600000; // Reset failures after 1 hour of no attempts
+  private readonly MAX_BACKOFF_MS = 300000; // Cap backoff at 5 minutes
+
+  // Enhanced subscription state with exponential backoff (replaces simple failure counter)
+  private subscriptionState: Map<string, {
+    failures: number;
+    lastAttempt: number;
+    backoffUntil: number;
+  }> = new Map();
 
   // Queue backpressure tracking
   private queueFailures: Map<string, { count: number; lastFailure: number }> = new Map();
@@ -468,7 +476,7 @@ export class OrderbookManager extends DurableObject<Env> {
     this.priceHistory.clear();
     this.latestBBO.clear();
     this.hmacKeyCache.clear();
-    this.subscriptionFailures.clear();
+    this.subscriptionState.clear();
     this.queueFailures.clear();
     this.marketRelationships.clear();
     // Clear HFT trigger state maps
@@ -564,11 +572,23 @@ export class OrderbookManager extends DurableObject<Env> {
       // Skip if already subscribed
       if (this.assetToConnection.has(tokenId)) continue;
 
-      // Skip if this asset has failed too many times
-      const failures = this.subscriptionFailures.get(tokenId) || 0;
-      if (failures >= this.MAX_SUBSCRIPTION_RETRIES) {
-        console.warn(`[WS] Skipping asset ${tokenId} - exceeded max subscription retries`);
-        continue;
+      // Check subscription state with exponential backoff
+      const subState = this.subscriptionState.get(tokenId);
+      if (subState) {
+        const now = Date.now();
+
+        // Reset failures after decay period (1 hour of no attempts)
+        if (now - subState.lastAttempt > this.FAILURE_DECAY_MS) {
+          this.subscriptionState.delete(tokenId);
+          console.log(`[WS] Asset ${tokenId.slice(0, 12)}... failure count reset after decay period`);
+        } else if (now < subState.backoffUntil) {
+          // Still in backoff period - skip but don't log spam
+          const remainingSec = Math.round((subState.backoffUntil - now) / 1000);
+          if (subState.failures <= 2) { // Only log first few backoffs
+            console.log(`[WS] Asset ${tokenId.slice(0, 12)}... in backoff, retry in ${remainingSec}s`);
+          }
+          continue;
+        }
       }
 
       // Store market mapping and metadata
@@ -670,12 +690,15 @@ export class OrderbookManager extends DurableObject<Env> {
       })
     );
 
-    // Get assets with failures (only truncate long IDs)
-    const failedAssets = Array.from(this.subscriptionFailures.entries())
-      .filter(([, count]) => count > 0)
-      .map(([assetId, count]) => ({
+    // Get assets with failures (includes backoff timing)
+    const now = Date.now();
+    const failedAssets = Array.from(this.subscriptionState.entries())
+      .filter(([, state]) => state.failures > 0)
+      .map(([assetId, state]) => ({
         assetId: assetId.length > 23 ? assetId.slice(0, 20) + "..." : assetId,
-        failures: count,
+        failures: state.failures,
+        inBackoff: now < state.backoffUntil,
+        backoffRemainingSec: now < state.backoffUntil ? Math.round((state.backoffUntil - now) / 1000) : 0,
       }));
 
     return Response.json({
@@ -1016,13 +1039,30 @@ export class OrderbookManager extends DurableObject<Env> {
         state.lastPing = Date.now();
 
         // ADAPTER-DRIVEN: Use connector's subscription message format
+        // Filter out assets still in backoff period to respect exponential backoff
         if (state.assets.size > 0 && !state.subscriptionSent) {
-          const assetList = Array.from(state.assets);
-          const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
-            ?? JSON.stringify({ assets_ids: assetList, type: "market" });
-          ws.send(subscriptionMsg);
-          state.subscriptionSent = true;
-          console.log(`[WS ${connId}] Subscription sent for ${state.assets.size} assets (market: ${state.marketSource})`);
+          const assetList = this.filterAssetsNotInBackoff(Array.from(state.assets));
+          // Sync pendingAssets with assets we're actually subscribing to:
+          // 1. Remove assets in backoff (not in assetList) - prevents undeserved failure blame
+          // 2. Add assets being subscribed (in assetList) - allows success to clear failure state
+          const assetSet = new Set(assetList);
+          for (const asset of state.pendingAssets) {
+            if (!assetSet.has(asset)) {
+              state.pendingAssets.delete(asset);
+            }
+          }
+          for (const asset of assetList) {
+            state.pendingAssets.add(asset);
+          }
+          if (assetList.length > 0) {
+            const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
+              ?? JSON.stringify({ assets_ids: assetList, type: "market" });
+            ws.send(subscriptionMsg);
+            state.subscriptionSent = true;
+            console.log(`[WS ${connId}] Subscription sent for ${assetList.length}/${state.assets.size} assets (market: ${state.marketSource})`);
+          } else {
+            console.log(`[WS ${connId}] All ${state.assets.size} assets in backoff, deferring subscription`);
+          }
         }
 
         // Schedule alarm for PING heartbeat
@@ -1144,10 +1184,10 @@ export class OrderbookManager extends DurableObject<Env> {
         return;
       }
 
-      // Mark asset as confirmed on any valid event
+      // Mark asset as confirmed on any valid event - clear failure state
       if (parsed.assetId && state.pendingAssets.has(parsed.assetId)) {
         state.pendingAssets.delete(parsed.assetId);
-        this.subscriptionFailures.delete(parsed.assetId);
+        this.subscriptionState.delete(parsed.assetId); // Clear backoff on success
       }
 
       // UNIFIED DISPATCH: All markets route through canonical handlers
@@ -1183,10 +1223,24 @@ export class OrderbookManager extends DurableObject<Env> {
         `Connection may not be properly initialized. Asset count: ${state.assets.size}`
       );
 
-      // Track failures for all assets on this broken connection
+      // Track failures for all assets on this broken connection using exponential backoff
+      const now = Date.now();
       for (const assetId of state.assets) {
-        const failures = (this.subscriptionFailures.get(assetId) || 0) + 1;
-        this.subscriptionFailures.set(assetId, failures);
+        const current = this.subscriptionState.get(assetId) || {
+          failures: 0,
+          lastAttempt: 0,
+          backoffUntil: 0
+        };
+        // Check if failures should decay (1 hour since last attempt)
+        const failures = (now - current.lastAttempt > this.FAILURE_DECAY_MS)
+          ? 1  // Reset to 1 (this failure)
+          : current.failures + 1;
+        const backoffMs = Math.min(1000 * Math.pow(2, failures), this.MAX_BACKOFF_MS);
+        this.subscriptionState.set(assetId, {
+          failures,
+          lastAttempt: now,
+          backoffUntil: now + backoffMs,
+        });
       }
 
       // Close the broken connection and trigger reconnection
@@ -1202,33 +1256,72 @@ export class OrderbookManager extends DurableObject<Env> {
 
   /**
    * Handle INVALID OPERATION response from market.
-   * Track failures and schedule retry with backoff.
+   * Uses exponential backoff instead of permanent removal.
+   *
+   * KEY FIX: Previously, all pending assets were blamed equally for a single
+   * INVALID OPERATION, leading to valid assets being permanently removed.
+   * Now we use exponential backoff with failure decay to allow recovery.
    */
   private handleInvalidOperation(connId: string, state: ConnectionState): void {
-    console.error(
+    const pendingCount = state.pendingAssets.size;
+    console.warn(
       `[WS ${connId}] INVALID OPERATION received (market: ${state.marketSource}). ` +
-      `This may indicate invalid asset IDs or rate limiting.`
+      `Pending assets: ${pendingCount}. This may indicate rate limiting or invalid asset IDs.`
     );
 
-    const pendingList = Array.from(state.pendingAssets);
-    console.error(`[WS ${connId}] Pending assets that may be invalid: ${pendingList.slice(0, 5).join(", ")}`);
-
-    // Increment failure count for all pending assets
-    for (const assetId of state.pendingAssets) {
-      const failures = (this.subscriptionFailures.get(assetId) || 0) + 1;
-      this.subscriptionFailures.set(assetId, failures);
-
-      if (failures >= this.MAX_SUBSCRIPTION_RETRIES) {
-        console.error(`[WS] Asset ${assetId} exceeded max retries, removing from subscriptions`);
-        this.removeAsset(assetId);
-      }
+    if (pendingCount > 0) {
+      const pendingList = Array.from(state.pendingAssets);
+      console.warn(`[WS ${connId}] Affected assets (first 5): ${pendingList.slice(0, 5).map(id => id.slice(0, 12) + '...').join(", ")}`);
     }
 
-    // Reset subscription state to allow retry
+    const now = Date.now();
+
+    // Apply exponential backoff to all pending assets
+    for (const assetId of state.pendingAssets) {
+      const current = this.subscriptionState.get(assetId) || {
+        failures: 0,
+        lastAttempt: 0,
+        backoffUntil: 0
+      };
+
+      // Check if failures should decay (1 hour since last attempt)
+      const effectiveFailures = (now - current.lastAttempt > this.FAILURE_DECAY_MS)
+        ? 1  // Reset to 1 (this failure)
+        : current.failures + 1;
+
+      // Exponential backoff: 2^failures seconds, capped at MAX_BACKOFF_MS (5 min)
+      const backoffMs = Math.min(1000 * Math.pow(2, effectiveFailures), this.MAX_BACKOFF_MS);
+
+      this.subscriptionState.set(assetId, {
+        failures: effectiveFailures,
+        lastAttempt: now,
+        backoffUntil: now + backoffMs,
+      });
+
+      // Log at different levels based on failure count
+      if (effectiveFailures >= this.MAX_SUBSCRIPTION_RETRIES) {
+        // High failure count - but DON'T permanently remove, just longer backoff
+        console.error(
+          `[WS] Asset ${assetId.slice(0, 12)}... has ${effectiveFailures} failures, ` +
+          `backoff ${Math.round(backoffMs / 1000)}s (will retry after backoff)`
+        );
+      } else if (effectiveFailures >= 3) {
+        console.warn(
+          `[WS] Asset ${assetId.slice(0, 12)}... failure #${effectiveFailures}, ` +
+          `backoff ${Math.round(backoffMs / 1000)}s`
+        );
+      }
+
+      // Remove from pending so we don't keep retrying immediately
+      state.pendingAssets.delete(assetId);
+    }
+
+    // Reset subscription state to allow retry after backoff
     state.subscriptionSent = false;
 
-    // Schedule a retry with backoff
-    this.ctx.storage.setAlarm(Date.now() + this.RECONNECT_BASE_DELAY_MS * 2);
+    // Schedule a retry - use minimum backoff time across all affected assets
+    const minBackoff = Math.max(this.RECONNECT_BASE_DELAY_MS * 2, 5000); // At least 5 seconds
+    this.scheduleAlarm(minBackoff);
   }
 
   /**
@@ -1259,10 +1352,10 @@ export class OrderbookManager extends DurableObject<Env> {
     try {
       const event = JSON.parse(data) as PolymarketWSEvent;
 
-      // Mark asset as confirmed on any valid event
+      // Mark asset as confirmed on any valid event - clear failure state
       if ("asset_id" in event && state.pendingAssets.has(event.asset_id)) {
         state.pendingAssets.delete(event.asset_id);
-        this.subscriptionFailures.delete(event.asset_id);
+        this.subscriptionState.delete(event.asset_id); // Clear backoff on success
       }
 
       switch (event.event_type) {
@@ -1948,6 +2041,36 @@ export class OrderbookManager extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Filters assets that are not currently in backoff period.
+   * Also handles decay period reset for stale failure states.
+   */
+  private filterAssetsNotInBackoff(assetIds: string[]): string[] {
+    const now = Date.now();
+    return assetIds.filter(assetId => {
+      const subState = this.subscriptionState.get(assetId);
+      if (!subState) return true; // No state = not in backoff
+
+      // Reset failures after decay period (1 hour of no attempts)
+      if (now - subState.lastAttempt > this.FAILURE_DECAY_MS) {
+        this.subscriptionState.delete(assetId);
+        return true;
+      }
+
+      // Check if still in backoff period
+      if (now < subState.backoffUntil) {
+        // Only log for assets with few failures to avoid spam
+        if (subState.failures <= 2) {
+          const remainingSec = Math.round((subState.backoffUntil - now) / 1000);
+          console.log(`[WS] Asset ${assetId.slice(0, 12)}... skipped (backoff ${remainingSec}s remaining)`);
+        }
+        return false;
+      }
+
+      return true;
+    });
+  }
+
   private async syncSubscriptions(): Promise<void> {
     for (const [connId, state] of this.connections) {
       // Only send if connection is open, has assets, and hasn't sent yet (or needs update)
@@ -1958,12 +2081,29 @@ export class OrderbookManager extends DurableObject<Env> {
       ) {
         try {
           // ADAPTER-DRIVEN: Use connector's subscription message format
-          const assetList = Array.from(state.assets);
+          // Filter out assets still in backoff period to respect exponential backoff
+          const assetList = this.filterAssetsNotInBackoff(Array.from(state.assets));
+          // Sync pendingAssets with assets we're actually subscribing to:
+          // 1. Remove assets in backoff (not in assetList) - prevents undeserved failure blame
+          // 2. Add assets being subscribed (in assetList) - allows success to clear failure state
+          const assetSet = new Set(assetList);
+          for (const asset of state.pendingAssets) {
+            if (!assetSet.has(asset)) {
+              state.pendingAssets.delete(asset);
+            }
+          }
+          for (const asset of assetList) {
+            state.pendingAssets.add(asset);
+          }
+          if (assetList.length === 0) {
+            console.log(`[WS ${connId}] All ${state.assets.size} assets in backoff, skipping subscription`);
+            continue;
+          }
           const subscriptionMsg = state.connector?.getSubscriptionMessage(assetList)
             ?? JSON.stringify({ assets_ids: assetList, type: "market" });
           state.ws.send(subscriptionMsg);
           state.subscriptionSent = true;
-          console.log(`[WS ${connId}] Subscription synced for ${state.assets.size} assets (market: ${state.marketSource})`);
+          console.log(`[WS ${connId}] Subscription synced for ${assetList.length}/${state.assets.size} assets (market: ${state.marketSource})`);
         } catch (error) {
           console.error(`[WS ${connId}] Failed to send subscription:`, error);
           state.subscriptionSent = false;
@@ -2340,16 +2480,33 @@ export class OrderbookManager extends DurableObject<Env> {
 
     try {
       const clickhouse = new ClickHouseOrderbookClient(this.env);
-      await clickhouse.insertSnapshots(batch);
-      this.snapshotBuffer.splice(0, batchSize); // Clear only after success
+      const result = await clickhouse.insertSnapshots(batch);
+
+      if (result.success) {
+        this.snapshotBuffer.splice(0, batchSize); // Clear only after success
+      } else {
+        // ClickHouse insert failed - check if we should retry via queue
+        console.error(`[DO ${this.shardId}] ClickHouse insert failed: ${result.error}`);
+        if (result.shouldRetry) {
+          // Transient failure - try queue fallback
+          const queued = await this.sendBatchToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, batch);
+          if (queued) {
+            this.snapshotBuffer.splice(0, batchSize); // Clear only after queue accepts
+          } else {
+            console.error(`[DO ${this.shardId}] CRITICAL: Both ClickHouse and queue failed, retaining ${batchSize} snapshots`);
+          }
+        } else {
+          // Permanent failure (client error) - log and drop to prevent infinite retry
+          console.error(`[DO ${this.shardId}] Permanent ClickHouse failure, dropping ${batchSize} snapshots`);
+          this.snapshotBuffer.splice(0, batchSize);
+        }
+      }
     } catch (error) {
-      // Fallback: send to queue for retry
-      console.error(`[DO ${this.shardId}] ClickHouse insert failed, falling back to queue:`, error);
+      // Defensive: handle unexpected exceptions (should not occur with current API)
+      console.error(`[DO ${this.shardId}] Unexpected error in flushSnapshotBuffer:`, error);
       const queued = await this.sendBatchToQueue("SNAPSHOT_QUEUE", this.env.SNAPSHOT_QUEUE, batch);
       if (queued) {
-        this.snapshotBuffer.splice(0, batchSize); // Clear only after queue accepts
-      } else {
-        console.error(`[DO ${this.shardId}] CRITICAL: Both ClickHouse and queue failed, retaining ${batchSize} snapshots`);
+        this.snapshotBuffer.splice(0, batchSize);
       }
     } finally {
       this.isFlushingSnapshots = false;
@@ -2451,7 +2608,7 @@ export class OrderbookManager extends DurableObject<Env> {
     this.localBooks.delete(assetId);
     this.lastQuotes.delete(assetId);
     this.lastFullL2SnapshotTs.delete(assetId);
-    this.subscriptionFailures.delete(assetId);
+    this.subscriptionState.delete(assetId);
     this.priceHistory.delete(assetId);
     this.latestBBO.delete(assetId);
     this.missingBookFirstSeen.delete(assetId);
@@ -4331,29 +4488,38 @@ export class OrderbookManager extends DurableObject<Env> {
    * Batch publish trigger events to ALL regional TriggerEventBuffers.
    * Fan-out ensures all regional SSE clients receive events simultaneously.
    *
-   * LATENCY OPTIMIZATION: Uses Promise.all (1-2ms faster than Promise.allSettled).
-   * For fire-and-forget operations, fail-fast is acceptable since errors are logged.
+   * KEY FIX: Uses Promise.allSettled to prevent one region's failure from
+   * affecting other regions. Previously used Promise.all which would fail-fast
+   * and potentially leave some regions without events.
    */
   private async publishEventsToBuffer(events: TriggerEvent[]): Promise<void> {
     if (events.length === 0) return;
 
     const stubs = this.getRegionalBufferStubs();
     const body = JSON.stringify(events);
+    const regionNames = getAllRegionalBufferNames();
 
-    // Fan-out to all regional buffers in parallel
-    try {
-      await Promise.all(
-        stubs.map(stub =>
-          stub.fetch("https://do/publish-batch", {
-            method: "POST",
-            headers: OrderbookManager.PUBLISH_HEADERS,
-            body,
-          })
-        )
-      );
-    } catch (error) {
-      // Log but don't block - this is fire-and-forget
-      console.error("[Trigger] Regional buffer publish error:", error);
+    // Fan-out to all regional buffers in parallel - use allSettled for resilience
+    const results = await Promise.allSettled(
+      stubs.map((stub, idx) =>
+        stub.fetch("https://do/publish-batch", {
+          method: "POST",
+          headers: OrderbookManager.PUBLISH_HEADERS,
+          body,
+        }).then(res => ({ region: regionNames[idx], ok: res.ok, status: res.status }))
+      )
+    );
+
+    // Log failures per-region for observability
+    const failures = results.filter(r => r.status === "rejected" || (r.status === "fulfilled" && !r.value.ok));
+    if (failures.length > 0) {
+      for (const result of failures) {
+        if (result.status === "rejected") {
+          console.error(`[Trigger] Regional buffer publish failed:`, result.reason);
+        } else if (result.status === "fulfilled" && !result.value.ok) {
+          console.error(`[Trigger] Regional buffer ${result.value.region} returned ${result.value.status}`);
+        }
+      }
     }
   }
 }
