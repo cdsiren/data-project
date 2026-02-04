@@ -83,6 +83,26 @@ max_batch_timeout = 5     # Reduced from 60s for low-latency writes
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 
+# Archive queue for data archival to R2
+[[queues.producers]]
+queue = "archive-queue"
+binding = "ARCHIVE_QUEUE"
+
+[[queues.consumers]]
+queue = "archive-queue"
+max_batch_size = 10       # Small batches for large data operations
+max_batch_timeout = 300   # 5 min timeout for archive operations
+max_retries = 3
+dead_letter_queue = "dead-letter-queue"
+
+# ============================================================
+# R2 BUCKET - Data Archive Storage
+# ============================================================
+
+[[r2_buckets]]
+binding = "ARCHIVE_BUCKET"
+bucket_name = "trading-data-archive"
+
 # ============================================================
 # DURABLE OBJECTS
 # ============================================================
@@ -113,10 +133,11 @@ id = "2d5f178dcab04f4697eb6f6a9a0946a5"
 # - Market lifecycle check every 5 minutes (resolutions & new markets)
 # - Full metadata refresh hourly (ensures stale data doesn't accumulate)
 #   Runs at minute 2 to avoid collision with 5-minute cron at :00
+# - Daily archive job at 2 AM UTC (archives aged data >90 days)
 # ============================================================
 
 [triggers]
-crons = ["*/5 * * * *", "2 * * * *"]
+crons = ["*/5 * * * *", "2 * * * *", "0 2 * * *"]
 
 # ============================================================
 # ENVIRONMENT VARIABLES

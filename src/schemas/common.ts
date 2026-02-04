@@ -159,3 +159,90 @@ export const Stats24hSchema = z.object({
 export const UserTierSchema = z.enum(["free", "pro", "enterprise"]);
 
 export type UserTier = z.infer<typeof UserTierSchema>;
+
+// ============================================================
+// Data Tier (for historical data access)
+// Independent from rate limit tiers - controls backtest access
+// ============================================================
+
+/**
+ * Data access tiers determine historical data access limits.
+ * - starter: 7 days, no backtest access
+ * - pro: 90 days, read-only backtest (JSON only)
+ * - team: 365 days, full backtest + export (CSV/Parquet)
+ * - business: unlimited, full access + bulk API
+ */
+export const DataTierSchema = z.enum(["starter", "pro", "team", "business"]);
+
+export type DataTier = z.infer<typeof DataTierSchema>;
+
+/**
+ * Tier limits for historical data access and backtest features.
+ * These are independent from rate limiting tiers.
+ */
+export const TIER_LIMITS = {
+  starter: {
+    historicalDays: 7,
+    backtestAccess: "none" as const,
+    exportFormats: [] as const,
+    overageRate: null, // No overage allowed
+  },
+  pro: {
+    historicalDays: 90,
+    backtestAccess: "read" as const,
+    exportFormats: ["json"] as const,
+    overageRate: 0.005, // $0.005 per 1000 rows
+  },
+  team: {
+    historicalDays: 365,
+    backtestAccess: "full" as const,
+    exportFormats: ["json", "csv", "parquet"] as const,
+    overageRate: 0.003, // $0.003 per 1000 rows
+  },
+  business: {
+    historicalDays: Infinity,
+    backtestAccess: "full" as const,
+    exportFormats: ["json", "csv", "parquet"] as const,
+    overageRate: 0.001, // $0.001 per 1000 rows
+  },
+} as const;
+
+export type TierLimits = typeof TIER_LIMITS;
+export type BacktestAccess = "none" | "read" | "full";
+export type ExportFormat = "json" | "csv" | "parquet";
+
+// ============================================================
+// Archive Schemas
+// ============================================================
+
+/**
+ * Archive job types
+ */
+export const ArchiveTypeSchema = z.enum(["resolved", "aged"]);
+export type ArchiveType = z.infer<typeof ArchiveTypeSchema>;
+
+/**
+ * Archive job message for queue processing
+ */
+export const ArchiveJobSchema = z.object({
+  type: ArchiveTypeSchema,
+  conditionId: z.string().optional(), // For resolved market archives
+  database: z.string().optional(),    // For aged data archives
+  table: z.string().optional(),       // For aged data archives
+  cutoffDate: z.string().optional(),  // ISO date string for aged cutoff
+  month: z.string().optional(),       // YYYY-MM for partitioning
+});
+
+export type ArchiveJob = z.infer<typeof ArchiveJobSchema>;
+
+/**
+ * Date range query parameters for backtest endpoints
+ */
+export const DateRangeQuerySchema = z.object({
+  start: z.string(),
+  end: z.string(),
+  asset_id: z.string().optional(),
+  condition_id: z.string().optional(),
+});
+
+export type DateRangeQuery = z.infer<typeof DateRangeQuerySchema>;

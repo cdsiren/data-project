@@ -1,6 +1,6 @@
 import { Hono, Context, Next } from "hono";
 import { cors } from "hono/cors";
-import { Env, DeadLetterMessage, PolymarketMarket } from "./types";
+import { Env, DeadLetterMessage, PolymarketMarket, ArchiveJob } from "./types";
 import type {
   BBOSnapshot,
   GapBackfillJob,
@@ -16,6 +16,7 @@ import { tradeTickConsumer } from "./consumers/trade-tick-consumer";
 import { levelChangeConsumer } from "./consumers/level-change-consumer";
 import { fullL2SnapshotConsumer } from "./consumers/full-l2-snapshot-consumer";
 import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
+import { archiveConsumer, queueDailyArchiveJobs } from "./consumers/archive-consumer";
 import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache, refreshAllMarketMetadata, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { MarketCacheService } from "./services/market-cache";
 import { TriggerValidator } from "./services/trigger-evaluator/trigger-validator";
@@ -2136,7 +2137,7 @@ app.route("/api/v1/backtest", backtest);
 // Export Durable Objects
 export { OrderbookManager, TriggerEventBuffer };
 
-async function queueHandler(batch: MessageBatch, env: Env) {
+async function queueHandler(batch: MessageBatch, env: Env, ctx: ExecutionContext) {
   const queueName = batch.queue;
 
   switch (queueName) {
@@ -2157,6 +2158,10 @@ async function queueHandler(batch: MessageBatch, env: Env) {
       break;
     case "dead-letter-queue":
       await deadLetterConsumer(batch as MessageBatch<DeadLetterMessage>, env);
+      break;
+    case "archive-queue":
+      // Pass ExecutionContext to ensure archive operations complete
+      await archiveConsumer(batch as MessageBatch<ArchiveJob>, env, ctx);
       break;
   }
 }
@@ -2275,6 +2280,30 @@ async function scheduledHandler(
       })
     );
     return; // Don't run other crons in same invocation
+  }
+
+  // ============================================================
+  // DAILY CRON: Data archival (cron: "0 2 * * *")
+  // Archives aged data >90 days old across all tables
+  // Runs at 2 AM UTC to minimize impact on live queries
+  // ============================================================
+  if (event.cron === "0 2 * * *") {
+    console.log("[Scheduled] Running daily data archival at", now);
+
+    ctx.waitUntil(
+      withCronErrorTracking(
+        env.MARKET_CACHE,
+        "0 2 * * *",
+        "daily-data-archival",
+        async () => {
+          const jobsQueued = await queueDailyArchiveJobs(env);
+          console.log(`[Scheduled] Daily archival queued ${jobsQueued} archive jobs`);
+        }
+      ).catch((error) => {
+        console.error("[Scheduled] CRON FAILED - Daily archival error:", error);
+      })
+    );
+    return;
   }
 
   // ============================================================

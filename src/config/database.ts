@@ -3,6 +3,7 @@
 // Follows Nautilus Trader (Venue + AssetClass) and CCXT (type) patterns
 
 import type { MarketSource, MarketType } from "../core/enums";
+import type { ArchiveType } from "../schemas/common";
 
 /**
  * Mapping from market source to market type.
@@ -130,4 +131,244 @@ export function getBatchMarketDefaults(): NormalizedMarketInfo {
     source: getDefaultMarketSource(),
     type: getDefaultMarketType(),
   };
+}
+
+// ============================================================
+// Archive Configuration
+// ============================================================
+
+/**
+ * Raw Polymarket database configuration (subgraph data)
+ */
+export const RAW_POLYMARKET_DB = {
+  DATABASE: "raw_polymarket",
+  TABLES: {
+    GLOBAL_OPEN_INTEREST: "global_open_interest",
+    MARKET_OPEN_INTEREST: "market_open_interest",
+    ORDER_FILLED: "order_filled",
+    ORDERS_MATCHED: "orders_matched",
+    USER_POSITIONS: "user_positions",
+  },
+} as const;
+
+/**
+ * Archive trigger types for each table
+ */
+export type ArchiveTrigger = "resolved" | "aged" | "block_range";
+
+/**
+ * Archive table configuration
+ */
+export interface ArchiveTableConfig {
+  database: string;
+  table: string;
+  trigger: ArchiveTrigger;
+  keyColumn: string; // Primary time/identifier column for archive queries
+  conditionIdColumn?: string; // For resolved market triggers
+}
+
+/**
+ * Registry of all tables to be archived with their configurations
+ */
+export const ARCHIVE_TABLE_REGISTRY: ArchiveTableConfig[] = [
+  // Trading data - market-specific tables (resolved OR aged)
+  {
+    database: "trading_data",
+    table: "ob_bbo",
+    trigger: "resolved",
+    keyColumn: "source_ts",
+    conditionIdColumn: "condition_id",
+  },
+  {
+    database: "trading_data",
+    table: "ob_snapshots",
+    trigger: "resolved",
+    keyColumn: "source_ts",
+    conditionIdColumn: "condition_id",
+  },
+  {
+    database: "trading_data",
+    table: "trade_ticks",
+    trigger: "resolved",
+    keyColumn: "source_ts",
+    conditionIdColumn: "condition_id",
+  },
+  {
+    database: "trading_data",
+    table: "ob_level_changes",
+    trigger: "resolved",
+    keyColumn: "source_ts",
+    conditionIdColumn: "condition_id",
+  },
+  // Trading data - operational tables (aged only)
+  {
+    database: "trading_data",
+    table: "trades",
+    trigger: "aged",
+    keyColumn: "timestamp",
+  },
+  {
+    database: "trading_data",
+    table: "makers",
+    trigger: "aged",
+    keyColumn: "timestamp",
+  },
+  {
+    database: "trading_data",
+    table: "takers",
+    trigger: "aged",
+    keyColumn: "timestamp",
+  },
+  {
+    database: "trading_data",
+    table: "markets",
+    trigger: "aged",
+    keyColumn: "timestamp",
+  },
+  {
+    database: "trading_data",
+    table: "ob_gap_events",
+    trigger: "aged",
+    keyColumn: "detected_at",
+  },
+  {
+    database: "trading_data",
+    table: "dead_letter_messages",
+    trigger: "aged",
+    keyColumn: "failed_at",
+  },
+  // Raw Polymarket - block_range tables
+  {
+    database: "raw_polymarket",
+    table: "global_open_interest",
+    trigger: "block_range",
+    keyColumn: "block_range",
+  },
+  {
+    database: "raw_polymarket",
+    table: "market_open_interest",
+    trigger: "block_range",
+    keyColumn: "block_range",
+  },
+  {
+    database: "raw_polymarket",
+    table: "user_positions",
+    trigger: "block_range",
+    keyColumn: "block_range",
+  },
+  // Raw Polymarket - timestamp tables
+  {
+    database: "raw_polymarket",
+    table: "order_filled",
+    trigger: "aged",
+    keyColumn: "timestamp",
+  },
+  {
+    database: "raw_polymarket",
+    table: "orders_matched",
+    trigger: "aged",
+    keyColumn: "timestamp",
+  },
+];
+
+/**
+ * Get tables for a specific archive trigger type
+ */
+export function getTablesForTrigger(trigger: ArchiveTrigger): ArchiveTableConfig[] {
+  return ARCHIVE_TABLE_REGISTRY.filter((t) => t.trigger === trigger);
+}
+
+/**
+ * Get tables that support resolved market archiving (have condition_id)
+ */
+export function getResolvedMarketTables(): ArchiveTableConfig[] {
+  return ARCHIVE_TABLE_REGISTRY.filter((t) => t.conditionIdColumn !== undefined);
+}
+
+// ============================================================
+// Block Range Utilities (for raw_polymarket tables)
+// ============================================================
+
+/**
+ * Parse a Graph Node block_range string
+ * Format: "[start,end)" or "[start,)" for open-ended ranges
+ */
+export function parseBlockRange(blockRange: string): { start: number; end: number | null } {
+  const match = blockRange.match(/\[(\d+),(\d*)\)/);
+  if (!match) {
+    return { start: 0, end: null };
+  }
+  return {
+    start: parseInt(match[1], 10),
+    end: match[2] ? parseInt(match[2], 10) : null,
+  };
+}
+
+/**
+ * Calculate block cutoff for 90-day archival
+ * Polygon produces ~1 block every 2 seconds
+ * 90 days = 90 * 24 * 60 * 60 / 2 = 3,888,000 blocks
+ */
+export function calculateBlockCutoff(currentBlock: number, days: number = 90): number {
+  const blocksPerSecond = 0.5; // ~1 block per 2 seconds on Polygon
+  const secondsPerDay = 24 * 60 * 60;
+  const blocksInPeriod = Math.floor(days * secondsPerDay * blocksPerSecond);
+  return currentBlock - blocksInPeriod;
+}
+
+// ============================================================
+// Archive Path Utilities
+// ============================================================
+
+/**
+ * R2 bucket structure constants
+ */
+export const R2_PATHS = {
+  TRADING_DATA_RESOLVED: "trading_data/resolved",
+  TRADING_DATA_AGED: "trading_data/aged",
+  TRADING_DATA_OPERATIONAL: "trading_data/operational",
+  RAW_POLYMARKET: "raw_polymarket",
+  MANIFESTS: "manifests",
+} as const;
+
+/**
+ * Generate R2 path for archived data
+ */
+export function getArchivePath(
+  database: string,
+  table: string,
+  archiveType: ArchiveType,
+  options: {
+    conditionId?: string;
+    month?: string; // YYYY-MM format
+  }
+): string {
+  const { conditionId, month } = options;
+
+  if (database === "trading_data") {
+    if (archiveType === "resolved" && conditionId) {
+      // trading_data/resolved/{condition_id}/{table}/{YYYY-MM}/data.parquet
+      return `${R2_PATHS.TRADING_DATA_RESOLVED}/${conditionId}/${table}/${month || "unknown"}/data.parquet`;
+    }
+    // Operational tables
+    if (["ob_gap_events", "dead_letter_messages"].includes(table)) {
+      return `${R2_PATHS.TRADING_DATA_OPERATIONAL}/${table}/${month || "unknown"}/data.parquet`;
+    }
+    // Aged data
+    return `${R2_PATHS.TRADING_DATA_AGED}/${table}/${month || "unknown"}/data.parquet`;
+  }
+
+  if (database === "raw_polymarket") {
+    return `${R2_PATHS.RAW_POLYMARKET}/${table}/${month || "unknown"}/data.parquet`;
+  }
+
+  // Fallback
+  return `${database}/${table}/${month || "unknown"}/data.parquet`;
+}
+
+/**
+ * Generate manifest path for a table
+ */
+export function getManifestPath(database: string, table: string): string {
+  return `${R2_PATHS.MANIFESTS}/${database}_${table}.json`;
 }

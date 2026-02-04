@@ -25,6 +25,10 @@ export interface Env {
   LEVEL_CHANGE_QUEUE: Queue<OrderbookLevelChange>;
   FULL_L2_QUEUE: Queue<FullL2Snapshot>;
   DEAD_LETTER_QUEUE: Queue<DeadLetterMessage>;
+  ARCHIVE_QUEUE: Queue<ArchiveJob>;
+
+  // R2 Buckets
+  ARCHIVE_BUCKET: R2Bucket;
 
   // Durable Objects
   ORDERBOOK_MANAGER: DurableObjectNamespace;
@@ -38,6 +42,16 @@ export interface Env {
   CLICKHOUSE_USER: string;
   CLICKHOUSE_TOKEN: string;
   VITE_DASHBOARD_API_KEY: string;  // Required key for dashboard API access
+}
+
+// Archive job for queue processing
+export interface ArchiveJob {
+  type: "resolved" | "aged";
+  conditionId?: string;
+  database?: string;
+  table?: string;
+  cutoffDate?: string;
+  month?: string;
 }
 
 // Database record types

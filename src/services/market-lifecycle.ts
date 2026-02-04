@@ -1,7 +1,8 @@
 // src/services/market-lifecycle.ts
 // Polls market lifecycle APIs for resolution and new market events
+// Also triggers data archival for resolved markets
 
-import type { Env, MarketMetadataRecord, MarketEventRecord } from "../types";
+import type { Env, MarketMetadataRecord, MarketEventRecord, ArchiveJob } from "../types";
 import { buildSyncInsertUrlWithColumns } from "./clickhouse-client";
 import { WebhookSigner } from "./webhook-signer";
 import { DB_CONFIG } from "../config/database";
@@ -94,6 +95,7 @@ export class MarketLifecycleService {
     resolutions: number;
     new_markets: number;
     metadata_synced: number;
+    archives_queued: number;
     resolutionEvents: MarketLifecycleEvent[];
     newMarketEvents: MarketLifecycleEvent[];
   }> {
@@ -122,13 +124,88 @@ export class MarketLifecycleService {
       }
     }
 
+    // Queue archive jobs for markets ready for archival (end_date > 7 days ago)
+    let archivesQueued = 0;
+    try {
+      archivesQueued = await this.queueArchivableMarkets();
+    } catch (error) {
+      console.error("[MarketLifecycle] Failed to queue archive jobs:", error);
+    }
+
     return {
       resolutions: resolutionEvents.length,
       new_markets: newMarketEvents.length,
       metadata_synced: metadataSynced,
+      archives_queued: archivesQueued,
       resolutionEvents,
       newMarketEvents,
     };
+  }
+
+  /**
+   * Find markets ready for archival and queue archive jobs.
+   * Markets are ready when their end_date is more than 7 days in the past
+   * and they haven't been archived yet.
+   */
+  async queueArchivableMarkets(): Promise<number> {
+    // Query for markets ready to archive
+    const query = `
+      SELECT DISTINCT mm.condition_id
+      FROM ${DB_CONFIG.DATABASE}.market_metadata mm
+      WHERE mm.end_date < NOW() - INTERVAL 7 DAY
+        AND mm.end_date != toDateTime64('1970-01-01 00:00:00', 3, 'UTC')
+        AND mm.condition_id NOT IN (
+          SELECT DISTINCT condition_id
+          FROM ${DB_CONFIG.DATABASE}.archive_log
+          WHERE archive_type = 'resolved'
+        )
+      LIMIT 50
+      FORMAT JSON
+    `;
+
+    const url = new URL(this.env.CLICKHOUSE_URL);
+    url.searchParams.set("query", query);
+
+    try {
+      const response = await fetch(url.toString(), {
+        method: "GET",
+        headers: {
+          "X-ClickHouse-User": this.env.CLICKHOUSE_USER,
+          "X-ClickHouse-Key": this.env.CLICKHOUSE_TOKEN,
+        },
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("[MarketLifecycle] Archive query failed:", errorText);
+        return 0;
+      }
+
+      const result = (await response.json()) as {
+        data: Array<{ condition_id: string }>;
+      };
+
+      if (result.data.length === 0) {
+        return 0;
+      }
+
+      // Queue archive jobs
+      const queue = this.env.ARCHIVE_QUEUE;
+      for (const { condition_id } of result.data) {
+        const job: ArchiveJob = {
+          type: "resolved",
+          conditionId: condition_id,
+        };
+        await queue.send(job);
+        console.log(`[MarketLifecycle] Queued archive job for market ${condition_id.slice(0, 20)}...`);
+      }
+
+      console.log(`[MarketLifecycle] Queued ${result.data.length} archive jobs`);
+      return result.data.length;
+    } catch (error) {
+      console.error("[MarketLifecycle] Failed to query archivable markets:", error);
+      return 0;
+    }
   }
 }
 

@@ -318,3 +318,143 @@ CREATE TABLE IF NOT EXISTS trading_data.market_events (
 )
 ENGINE = ReplacingMergeTree()
 ORDER BY (event_id, market_id);
+
+
+-- ============================================================
+-- ARCHIVE LOG - Tracks data archival operations to R2
+-- Records what data has been archived and where
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS trading_data.archive_log (
+    condition_id String,                      -- Market condition ID (empty for aged archives)
+    archive_type LowCardinality(String),      -- 'resolved' or 'aged'
+    table_name LowCardinality(String),        -- Source table name
+    r2_path String,                           -- Full R2 object path
+    rows_archived UInt64,                     -- Number of rows in archive
+    min_source_ts DateTime64(3, 'UTC'),       -- Earliest timestamp in archive
+    max_source_ts DateTime64(3, 'UTC'),       -- Latest timestamp in archive
+    archived_at DateTime64(3, 'UTC'),         -- When archival occurred
+    clickhouse_deleted UInt8 DEFAULT 0        -- 1 if data has been deleted from CH
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(archived_at)
+ORDER BY (condition_id, table_name, archived_at);
+
+-- Index for finding archives by type
+ALTER TABLE trading_data.archive_log ADD INDEX IF NOT EXISTS idx_archive_type archive_type TYPE set(2) GRANULARITY 4;
+
+
+-- ============================================================
+-- USAGE EVENTS - Tracks API usage for billing
+-- Records rows returned per request for tier-based billing
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS trading_data.usage_events (
+    api_key_hash String,                      -- Hashed API key (privacy)
+    tier LowCardinality(String),              -- Data tier: starter, pro, team, business
+    endpoint String,                          -- API endpoint path
+    rows_returned UInt64,                     -- Number of rows in response
+    timestamp DateTime64(3, 'UTC'),           -- Request timestamp
+    billing_cycle String                      -- YYYY-MM format for billing period
+)
+ENGINE = MergeTree()
+PARTITION BY billing_cycle
+ORDER BY (api_key_hash, timestamp)
+TTL timestamp + INTERVAL 365 DAY;
+
+-- Index for billing queries
+ALTER TABLE trading_data.usage_events ADD INDEX IF NOT EXISTS idx_billing_cycle billing_cycle TYPE set(100) GRANULARITY 4;
+
+
+-- ============================================================
+-- 1-MINUTE BBO MATERIALIZED VIEW - Aggregated tick data for backtesting
+-- Provides OHLC-style data at 1-minute granularity
+-- ============================================================
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS trading_data.mv_ob_bbo_1m
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(minute)
+ORDER BY (asset_id, minute)
+AS
+SELECT
+    asset_id,
+    toStartOfMinute(source_ts) AS minute,
+    -- Open/Close using argMin/argMax state functions
+    argMinState(best_bid, source_ts) AS open_bid_state,
+    argMaxState(best_bid, source_ts) AS close_bid_state,
+    argMinState(best_ask, source_ts) AS open_ask_state,
+    argMaxState(best_ask, source_ts) AS close_ask_state,
+    -- Spread statistics
+    avgState(spread_bps) AS avg_spread_bps_state,
+    maxState(spread_bps) AS max_spread_bps_state,
+    minState(spread_bps) AS min_spread_bps_state,
+    -- Volume and count
+    countState() AS tick_count_state,
+    -- Sequence tracking
+    minState(sequence_number) AS sequence_start_state,
+    maxState(sequence_number) AS sequence_end_state
+FROM trading_data.ob_bbo
+GROUP BY asset_id, minute;
+
+
+-- ============================================================
+-- 5-MINUTE BBO MATERIALIZED VIEW - Coarser aggregation
+-- ============================================================
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS trading_data.mv_ob_bbo_5m
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(minute)
+ORDER BY (asset_id, minute)
+AS
+SELECT
+    asset_id,
+    toStartOfFiveMinutes(source_ts) AS minute,
+    argMinState(best_bid, source_ts) AS open_bid_state,
+    argMaxState(best_bid, source_ts) AS close_bid_state,
+    argMinState(best_ask, source_ts) AS open_ask_state,
+    argMaxState(best_ask, source_ts) AS close_ask_state,
+    avgState(spread_bps) AS avg_spread_bps_state,
+    countState() AS tick_count_state,
+    minState(sequence_number) AS sequence_start_state,
+    maxState(sequence_number) AS sequence_end_state
+FROM trading_data.ob_bbo
+GROUP BY asset_id, minute;
+
+
+-- ============================================================
+-- TRADE TICKS - Execution-level trade data
+-- Stores individual trade executions for backtesting
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS trading_data.trade_ticks (
+    market_source LowCardinality(String) DEFAULT 'polymarket',
+    market_type LowCardinality(String) DEFAULT 'prediction',
+    asset_id String,
+    condition_id String,
+    source_ts DateTime64(3, 'UTC'),           -- Trade timestamp from exchange
+    ingestion_ts DateTime64(6, 'UTC'),        -- Our receipt timestamp
+
+    -- Trade details
+    trade_id String,
+    price Decimal128(18),
+    size Float64,
+    side LowCardinality(String),              -- 'BUY' or 'SELL'
+    maker_order_id String DEFAULT '',
+    taker_order_id String DEFAULT '',
+
+    -- Book state at trade time
+    book_hash String DEFAULT '',
+    sequence_number UInt64 DEFAULT 0,
+
+    -- Materialized fields
+    notional Float64 MATERIALIZED toFloat64(price) * size,
+    latency_ms Float64 MATERIALIZED dateDiff('millisecond', source_ts, ingestion_ts)
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(source_ts)
+ORDER BY (asset_id, source_ts, trade_id)
+TTL source_ts + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;
+
+-- Index for trade lookups
+ALTER TABLE trading_data.trade_ticks ADD INDEX IF NOT EXISTS idx_trade_id trade_id TYPE bloom_filter GRANULARITY 4;

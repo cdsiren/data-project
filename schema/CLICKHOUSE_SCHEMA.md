@@ -16,6 +16,10 @@ This document provides a complete reference for all ClickHouse tables used in th
   - [ob_level_changes](#ob_level_changes)
   - [ob_gap_events](#ob_gap_events)
   - [ob_latency](#ob_latency)
+- [Operational Tables](#operational-tables)
+  - [dead_letter_messages](#dead_letter_messages)
+  - [archive_log](#archive_log)
+  - [usage_events](#usage_events)
 - [Market Metadata Tables](#market-metadata-tables)
   - [market_metadata](#market_metadata)
   - [market_events](#market_events)
@@ -30,6 +34,7 @@ This document provides a complete reference for all ClickHouse tables used in th
   - [mv_ob_bbo_1m](#mv_ob_bbo_1m)
   - [mv_ob_bbo_5m](#mv_ob_bbo_5m)
   - [mv_ob_hourly_stats](#mv_ob_hourly_stats)
+  - [mv_ob_latency_hourly](#mv_ob_latency_hourly)
 - [Raw Polymarket Database Tables](#raw-polymarket-database-tables)
   - [global_open_interest](#global_open_interest)
   - [market_open_interest](#market_open_interest)
@@ -273,6 +278,110 @@ Ingestion latency metrics for monitoring.
 | event_type | LowCardinality(String) | | Event type |
 
 **TTL:** 7 days
+
+---
+
+## Operational Tables
+
+### dead_letter_messages
+
+Failed queue messages stored for debugging and retry analysis.
+
+| Column | Type | Default | Description |
+|--------|------|---------|-------------|
+| market_source | LowCardinality(String) | 'polymarket' | Source exchange |
+| market_type | LowCardinality(String) | 'prediction' | Market type |
+| original_queue | LowCardinality(String) | | Source queue name |
+| message_type | LowCardinality(String) | | Message type (bbo_snapshot, etc.) |
+| payload | String | | JSON serialized original message |
+| error | String | | Error message |
+| failed_at | DateTime64(3, 'UTC') | | Failure timestamp |
+| received_at | DateTime64(3, 'UTC') | | Original receipt timestamp |
+| retry_count | UInt8 | | Number of retry attempts |
+
+**Engine:** MergeTree
+**Partition:** toYYYYMM(failed_at)
+**Order:** (original_queue, message_type, failed_at)
+**TTL:** 30 days
+**Index:** idx_error (tokenbf_v1 on error column)
+
+---
+
+### archive_log
+
+Tracks data archival operations to R2 cold storage.
+
+| Column | Type | Default | Description |
+|--------|------|---------|-------------|
+| condition_id | String | | Market condition ID (empty for aged archives) |
+| archive_type | LowCardinality(String) | | 'resolved' or 'aged' |
+| table_name | LowCardinality(String) | | Source table name |
+| r2_path | String | | Full R2 object path |
+| rows_archived | UInt64 | | Number of rows in archive |
+| min_source_ts | DateTime64(3, 'UTC') | | Earliest timestamp in archive |
+| max_source_ts | DateTime64(3, 'UTC') | | Latest timestamp in archive |
+| archived_at | DateTime64(3, 'UTC') | | When archival occurred |
+| clickhouse_deleted | UInt8 | 0 | 1 if data deleted from ClickHouse |
+
+**Engine:** MergeTree
+**Partition:** toYYYYMM(archived_at)
+**Order:** (condition_id, table_name, archived_at)
+**Index:** idx_archive_type (set on archive_type)
+
+**Usage:**
+```sql
+-- Check archive status by table
+SELECT
+    archive_type,
+    table_name,
+    count() AS archives,
+    sum(rows_archived) AS total_rows
+FROM trading_data.archive_log
+GROUP BY archive_type, table_name;
+
+-- Find unarchived resolved markets
+SELECT DISTINCT mm.condition_id
+FROM trading_data.market_metadata mm
+WHERE mm.end_date < NOW() - INTERVAL 7 DAY
+  AND mm.condition_id NOT IN (
+    SELECT DISTINCT condition_id FROM trading_data.archive_log
+    WHERE archive_type = 'resolved'
+  );
+```
+
+---
+
+### usage_events
+
+Tracks API usage for tier-based billing and usage analytics.
+
+| Column | Type | Default | Description |
+|--------|------|---------|-------------|
+| api_key_hash | String | | Hashed API key (privacy) |
+| tier | LowCardinality(String) | | Data tier (starter, pro, team, business) |
+| endpoint | String | | API endpoint path |
+| rows_returned | UInt64 | | Number of rows in response |
+| timestamp | DateTime64(3, 'UTC') | | Request timestamp |
+| billing_cycle | String | | YYYY-MM format for billing period |
+
+**Engine:** MergeTree
+**Partition:** billing_cycle
+**Order:** (api_key_hash, timestamp)
+**TTL:** 365 days
+**Index:** idx_billing_cycle (set on billing_cycle)
+
+**Usage:**
+```sql
+-- Get usage summary for a billing cycle
+SELECT
+    api_key_hash,
+    tier,
+    sum(rows_returned) AS total_rows,
+    count() AS request_count
+FROM trading_data.usage_events
+WHERE billing_cycle = '2024-01'
+GROUP BY api_key_hash, tier;
+```
 
 ---
 
@@ -541,6 +650,41 @@ SELECT
     avgMerge(avg_spread_bps_state) as avg_spread_bps
 FROM mv_ob_hourly_stats
 GROUP BY asset_id, hour
+```
+
+---
+
+### mv_ob_latency_hourly
+
+Materialized view for hourly latency percentiles using AggregatingMergeTree.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| hour | DateTime('UTC') | Hour bucket |
+| p50_state | AggregateFunction(quantile(0.50), Float64) | P50 latency state |
+| p95_state | AggregateFunction(quantile(0.95), Float64) | P95 latency state |
+| p99_state | AggregateFunction(quantile(0.99), Float64) | P99 latency state |
+| max_state | AggregateFunction(max, Float64) | Max latency state |
+| count_state | AggregateFunction(count) | Sample count state |
+
+**Engine:** AggregatingMergeTree
+**Partition:** toYYYYMMDD(hour)
+**Order:** hour
+**TTL:** 7 days
+
+**Usage:**
+```sql
+SELECT
+    hour,
+    quantileMerge(0.50)(p50_state) as p50_ms,
+    quantileMerge(0.95)(p95_state) as p95_ms,
+    quantileMerge(0.99)(p99_state) as p99_ms,
+    maxMerge(max_state) as max_ms,
+    countMerge(count_state) as samples
+FROM trading_data.mv_ob_latency_hourly
+WHERE hour >= NOW() - INTERVAL 24 HOUR
+GROUP BY hour
+ORDER BY hour;
 ```
 
 ---
