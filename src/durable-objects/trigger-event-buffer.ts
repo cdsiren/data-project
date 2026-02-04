@@ -278,7 +278,8 @@ export class TriggerEventBuffer extends DurableObject<Env> {
     // Fire-and-forget to each connection
     for (const [id, conn] of this.connections) {
       conn.writer.write(messageBytes).catch((error) => {
-        console.error(`[SSE] Connection ${id.slice(0, 8)} write failed:`, error);
+        const connectionAge = Date.now() - conn.createdAt;
+        console.error(`[SSE] Connection ${id.slice(0, 8)} write failed after ${connectionAge}ms:`, error);
         this.connections.delete(id);
       });
     }
@@ -298,7 +299,8 @@ export class TriggerEventBuffer extends DurableObject<Env> {
     // Fire-and-forget to each connection
     for (const [id, conn] of this.connections) {
       conn.writer.write(messageBytes).catch((error) => {
-        console.error(`[SSE] Connection ${id.slice(0, 8)} batch write failed:`, error);
+        const connectionAge = Date.now() - conn.createdAt;
+        console.error(`[SSE] Connection ${id.slice(0, 8)} batch write failed after ${connectionAge}ms:`, error);
         this.connections.delete(id);
       });
     }

@@ -3158,7 +3158,11 @@ export class OrderbookManager extends DurableObject<Env> {
       // Pre-warm HMAC key cache if webhook has a secret (avoids 100-500μs on first fire)
       if (trigger.webhook_secret) {
         this.getOrCreateHmacKey(trigger.id, trigger.webhook_secret).catch((err) => {
-          console.error(`[Trigger] Failed to pre-warm HMAC key for ${trigger.id}:`, err);
+          console.error(
+            `[Trigger] Failed to pre-warm HMAC key for ${trigger.id} ` +
+            `(webhook: ${trigger.webhook_url?.slice(0, 50)}...):`,
+            err
+          );
         });
       }
 

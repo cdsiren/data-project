@@ -144,6 +144,11 @@ backtest.get("/export/backtest", async (c) => {
       end,
     });
   } catch (error) {
+    console.error(
+      `[Backtest] Export failed for asset ${assetId.slice(0, 20)}... ` +
+      `(${start} to ${end}, granularity: ${granularity}):`,
+      error
+    );
     return c.json({ error: "Export failed", details: String(error) }, 500);
   }
 });
@@ -211,6 +216,10 @@ backtest.get("/export/assets", async (c) => {
       min_ticks_filter: minTicks,
     });
   } catch (error) {
+    console.error(
+      `[Backtest] Assets query failed (min_ticks: ${minTicks}, limit: ${limit}):`,
+      error
+    );
     return c.json({ error: "Query failed", details: String(error) }, 500);
   }
 });
@@ -274,6 +283,10 @@ backtest.get("/export/quality/:asset_id", async (c) => {
       quality: result.data[0],
     });
   } catch (error) {
+    console.error(
+      `[Backtest] Quality query failed for asset ${assetId.slice(0, 20)}...:`,
+      error
+    );
     return c.json({ error: "Query failed", details: String(error) }, 500);
   }
 });

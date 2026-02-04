@@ -78,7 +78,10 @@ export class HashChainValidator {
           sequence: 1,
         } satisfies HashChainState),
         { expirationTtl: 86400 }
-      ).catch((err) => console.error(`[HashChain] KV put failed for ${assetId}:`, err));
+      ).catch((err) => console.error(
+        `[HashChain] KV put failed for ${assetId.slice(0, 20)}...: ${err}. ` +
+        `Hash: ${newHash.slice(0, 16)}..., Seq: 1, Source: ${marketSource || 'unknown'}`
+      ));
 
       return {
         valid: true,
@@ -129,7 +132,10 @@ export class HashChainValidator {
         last_known_hash: lastState.hash,
         gap_detected_at: Date.now(),
         retry_count: 0,
-      }).catch((err) => console.error(`[HashChain] Failed to queue gap backfill for ${assetId}:`, err));
+      }).catch((err) => console.error(
+        `[HashChain] Failed to queue gap backfill for ${assetId.slice(0, 20)}...: ${err}. ` +
+        `Gap duration: ${timeDelta}ms, Previous hash: ${lastState.hash.slice(0, 16)}...`
+      ));
     }
 
     const newSequence = lastState.sequence + 1;
@@ -143,7 +149,10 @@ export class HashChainValidator {
         sequence: newSequence,
       } satisfies HashChainState),
       { expirationTtl: 86400 }
-    ).catch((err) => console.error(`[HashChain] KV put failed for ${assetId}:`, err));
+    ).catch((err) => console.error(
+      `[HashChain] KV put failed for ${assetId.slice(0, 20)}...: ${err}. ` +
+      `Hash: ${newHash.slice(0, 16)}..., Seq: ${newSequence}, Source: ${marketSource || 'unknown'}`
+    ));
 
     return {
       valid: true,
