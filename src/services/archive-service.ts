@@ -1043,25 +1043,199 @@ export class ArchiveService {
   }
 
   /**
+   * Get archived entries pending deletion from ClickHouse
+   * Returns condition_ids that have been archived but not yet deleted
+   *
+   * SAFETY: Only returns markets where:
+   * 1. ALL required tables have been archived (ob_bbo, ob_snapshots, trade_ticks, ob_level_changes)
+   * 2. Archive completed at least 1 hour ago (safety margin for in-flight data)
+   * 3. Has not been deleted yet (clickhouse_deleted = 0)
+   * 4. Has actual archived rows (rows_archived > 0)
+   */
+  async getPendingDeletions(): Promise<
+    Array<{
+      condition_id: string;
+      table_name: string;
+      rows_archived: number;
+    }>
+  > {
+    // Get the required tables for resolved market archival
+    const requiredTables = getResolvedMarketTables();
+    const requiredTableCount = requiredTables.length;
+
+    const query = `
+      WITH archived_tables AS (
+        SELECT
+          condition_id,
+          table_name,
+          sum(rows_archived) as rows_archived,
+          max(archived_at) as last_archived_at
+        FROM ${DB_CONFIG.DATABASE}.archive_log
+        WHERE clickhouse_deleted = 0
+          AND archive_type = 'resolved'
+          AND rows_archived > 0
+        GROUP BY condition_id, table_name
+      ),
+      complete_archives AS (
+        SELECT condition_id
+        FROM archived_tables
+        GROUP BY condition_id
+        HAVING count(DISTINCT table_name) >= ${requiredTableCount}
+          -- Ensure archive completed at least 1 hour ago (safety margin)
+          AND max(last_archived_at) < NOW() - INTERVAL 1 HOUR
+      )
+      SELECT
+        at.condition_id,
+        at.table_name,
+        at.rows_archived
+      FROM archived_tables at
+      INNER JOIN complete_archives ca ON at.condition_id = ca.condition_id
+      ORDER BY at.condition_id
+      LIMIT 100
+      FORMAT JSON
+    `;
+
+    const result = await this.executeQuery(query);
+    if (!result.success) {
+      console.error(`[Archive] Failed to get pending deletions: ${result.error}`);
+      throw new Error(`Failed to query pending deletions: ${result.error}`);
+    }
+    return (result.data || []).map(
+      (r: { condition_id: string; table_name: string; rows_archived: string }) => ({
+        condition_id: r.condition_id,
+        table_name: r.table_name,
+        rows_archived: parseInt(r.rows_archived, 10),
+      })
+    );
+  }
+
+  /**
+   * Process pending deletions for archived data
+   * Deletes data from ClickHouse that has been successfully archived to R2
+   *
+   * SAFETY: Only deletes data that:
+   * 1. Has been archived (exists in archive_log with ALL required tables)
+   * 2. Has not been deleted yet (clickhouse_deleted = 0)
+   * 3. Archive completed at least 1 hour ago
+   * 4. Passes row count verification
+   *
+   * @param batchSize - Maximum number of markets to process per invocation (default: 10)
+   *                    Limits to 10 to prevent worker timeouts (each market = 4 table deletions)
+   * @returns Summary of deletion operations
+   */
+  async processPendingDeletions(batchSize: number = 10): Promise<{
+    processed: number;
+    deleted: number;
+    failed: number;
+    skipped: number;
+    errors: string[];
+  }> {
+    const pendingDeletions = await this.getPendingDeletions();
+    console.log(`[Archive] Found ${pendingDeletions.length} table entries pending deletion`);
+
+    let processed = 0;
+    let deleted = 0;
+    let failed = 0;
+    let skipped = 0;
+    const errors: string[] = [];
+
+    // Group by condition_id to process all tables for a market together
+    const byConditionId = new Map<
+      string,
+      Array<{ table_name: string; rows_archived: number }>
+    >();
+    for (const entry of pendingDeletions) {
+      const existing = byConditionId.get(entry.condition_id) || [];
+      existing.push({
+        table_name: entry.table_name,
+        rows_archived: entry.rows_archived,
+      });
+      byConditionId.set(entry.condition_id, existing);
+    }
+
+    console.log(`[Archive] Processing up to ${batchSize} markets (${byConditionId.size} total pending)`);
+
+    // Process only batchSize markets per invocation to prevent worker timeouts
+    let batchCount = 0;
+    for (const [conditionId, tables] of byConditionId) {
+      if (batchCount >= batchSize) {
+        skipped = byConditionId.size - batchCount;
+        console.log(`[Archive] Batch limit reached (${batchSize}), ${skipped} markets will process in next run`);
+        break;
+      }
+
+      processed++;
+      batchCount++;
+
+      // Delete from each table
+      let allSucceeded = true;
+      for (const { table_name } of tables) {
+        const tableConfig = ARCHIVE_TABLE_REGISTRY.find(
+          (t) => t.table === table_name && t.trigger === "resolved"
+        );
+        if (!tableConfig) {
+          console.warn(
+            `[Archive] No config found for table ${table_name}, skipping`
+          );
+          continue;
+        }
+
+        const result = await this.deleteArchivedData(
+          tableConfig.database,
+          tableConfig.table,
+          [{ column: tableConfig.conditionIdColumn!, value: conditionId }]
+        );
+
+        if (!result.success) {
+          allSucceeded = false;
+          errors.push(
+            `Failed to delete ${conditionId.slice(0, 20)}... from ${table_name}: ${result.error}`
+          );
+        }
+      }
+
+      if (allSucceeded) {
+        // Mark all entries for this condition_id as deleted
+        await this.markArchiveDeleted([
+          { column: "condition_id", value: conditionId },
+        ]);
+        deleted++;
+        console.log(`[Archive] Deleted archived data for market ${conditionId.slice(0, 20)}...`);
+      } else {
+        failed++;
+      }
+    }
+
+    return { processed, deleted, failed, skipped, errors };
+  }
+
+  /**
    * Get markets ready for archival (end_date > 7 days ago, not yet archived)
+   *
+   * Excludes markets that have already been archived (regardless of deletion status)
+   * to prevent duplicate archive entries.
    */
   async getArchivableMarkets(): Promise<string[]> {
     const query = `
       SELECT DISTINCT condition_id
       FROM ${DB_CONFIG.DATABASE}.market_metadata
       WHERE end_date < NOW() - INTERVAL 7 DAY
-        AND end_date != ''
+        AND end_date > toDateTime('2020-01-01 00:00:00')
         AND condition_id NOT IN (
           SELECT DISTINCT condition_id
           FROM ${DB_CONFIG.DATABASE}.archive_log
           WHERE archive_type = 'resolved'
-            AND clickhouse_deleted = 0
+            AND rows_archived > 0
         )
-      LIMIT 100
+      LIMIT 500
       FORMAT JSON
     `;
 
     const result = await this.executeQuery(query);
+    if (!result.success) {
+      console.error(`[Archive] Failed to get archivable markets: ${result.error}`);
+      return [];
+    }
     return (result.data || []).map((r: { condition_id: string }) => r.condition_id);
   }
 

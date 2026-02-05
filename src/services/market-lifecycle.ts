@@ -146,6 +146,9 @@ export class MarketLifecycleService {
    * Find markets ready for archival and queue archive jobs.
    * Markets are ready when their end_date is more than 7 days in the past
    * and they haven't been archived yet.
+   *
+   * Excludes markets that have already been archived (regardless of deletion status)
+   * to prevent duplicate archive entries.
    */
   async queueArchivableMarkets(): Promise<number> {
     // Query for markets ready to archive
@@ -153,11 +156,12 @@ export class MarketLifecycleService {
       SELECT DISTINCT mm.condition_id
       FROM ${DB_CONFIG.DATABASE}.market_metadata mm
       WHERE mm.end_date < NOW() - INTERVAL 7 DAY
-        AND mm.end_date != toDateTime64('1970-01-01 00:00:00', 3, 'UTC')
+        AND mm.end_date > toDateTime('2020-01-01 00:00:00')
         AND mm.condition_id NOT IN (
           SELECT DISTINCT condition_id
           FROM ${DB_CONFIG.DATABASE}.archive_log
           WHERE archive_type = 'resolved'
+            AND rows_archived > 0
         )
       LIMIT 50
       FORMAT JSON

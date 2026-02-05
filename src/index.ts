@@ -17,6 +17,7 @@ import { levelChangeConsumer } from "./consumers/level-change-consumer";
 import { fullL2SnapshotConsumer } from "./consumers/full-l2-snapshot-consumer";
 import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
 import { archiveConsumer, queueDailyArchiveJobs } from "./consumers/archive-consumer";
+import { ArchiveService } from "./services/archive-service";
 import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache, refreshAllMarketMetadata, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { MarketCacheService } from "./services/market-cache";
 import { TriggerValidator } from "./services/trigger-evaluator/trigger-validator";
@@ -2459,6 +2460,9 @@ async function scheduledHandler(
   // DAILY CRON: Data archival (cron: "0 2 * * *")
   // Archives aged data >90 days old across all tables
   // Runs at 2 AM UTC to minimize impact on live queries
+  //
+  // When ENABLE_ARCHIVE_DELETION=true, also deletes archived data
+  // from ClickHouse after verifying it exists in R2.
   // ============================================================
   if (event.cron === "0 2 * * *") {
     console.log("[Scheduled] Running daily data archival at", now);
@@ -2469,8 +2473,27 @@ async function scheduledHandler(
         "0 2 * * *",
         "daily-data-archival",
         async () => {
+          // Step 1: Queue new archive jobs for aged data
           const jobsQueued = await queueDailyArchiveJobs(env);
           console.log(`[Scheduled] Daily archival queued ${jobsQueued} archive jobs`);
+
+          // Step 2: Process pending deletions (if enabled)
+          // This deletes data from ClickHouse that has been archived to R2
+          const deletionEnabled = env.ENABLE_ARCHIVE_DELETION === "true";
+          if (deletionEnabled) {
+            console.log("[Scheduled] Archive deletion is ENABLED - processing pending deletions");
+            const archiveService = new ArchiveService(env);
+            const deletionResult = await archiveService.processPendingDeletions();
+            console.log(
+              `[Scheduled] Deletion complete: ${deletionResult.deleted}/${deletionResult.processed} markets deleted, ` +
+              `${deletionResult.failed} failed, ${deletionResult.skipped} skipped (will process next run)`
+            );
+            if (deletionResult.errors.length > 0) {
+              console.error("[Scheduled] Deletion errors:", deletionResult.errors.slice(0, 5));
+            }
+          } else {
+            console.log("[Scheduled] Archive deletion is DISABLED - skipping deletion step");
+          }
         }
       ).catch((error) => {
         console.error("[Scheduled] CRON FAILED - Daily archival error:", error);

@@ -148,6 +148,11 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 SNAPSHOT_INTERVAL_MS = "60000"
 
+# Feature Flags
+# Set to "true" to enable deletion of archived data from ClickHouse during daily cron
+# Keep "false" during initial backfill, set to "true" after backfill completes
+ENABLE_ARCHIVE_DELETION = "false"
+
 # Multi-market configuration
 # Each market defines its adapter, connection settings, and market-specific config
 # To add a new market: add an entry here and implement the adapter in /src/adapters/{market}/
