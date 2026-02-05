@@ -236,6 +236,29 @@ export const ArchiveJobSchema = z.object({
 export type ArchiveJob = z.infer<typeof ArchiveJobSchema>;
 
 /**
+ * Manifest entry for R2 archive tracking
+ */
+export interface ManifestEntry {
+  path: string;
+  rows: number;
+  minTs: string;
+  maxTs: string;
+  archivedAt: string;
+  sizeBytes?: number;
+}
+
+/**
+ * Table manifest for R2 archive index
+ */
+export interface TableManifest {
+  database: string;
+  table: string;
+  lastUpdated: string;
+  totalRows: number;
+  entries: ManifestEntry[];
+}
+
+/**
  * Date range query parameters for backtest endpoints
  */
 export const DateRangeQuerySchema = z.object({

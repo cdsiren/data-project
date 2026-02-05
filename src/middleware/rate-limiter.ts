@@ -64,7 +64,7 @@ function getRateLimitKey(apiKeyHash: string, endpointType: EndpointType): string
 /**
  * Hash API key for privacy (don't store raw keys in KV)
  */
-async function hashApiKey(apiKey: string): Promise<string> {
+export async function hashApiKey(apiKey: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(apiKey);
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
@@ -472,35 +472,6 @@ export async function trackUsage(
     // Fire-and-forget - log but don't throw
     console.error("[UsageTracker] Failed to track usage:", error);
   }
-}
-
-/**
- * Usage tracking middleware factory
- * Tracks rows returned per request for billing
- */
-export function usageTracker(options?: {
-  /** Custom tier resolver */
-  tierResolver?: (c: Context<{ Bindings: Env }>) => Promise<DataTier>;
-}) {
-  return async (c: Context<{ Bindings: Env }>, next: Next) => {
-    // Get API key hash
-    const apiKey = c.req.header("X-API-Key");
-    if (!apiKey) {
-      return next();
-    }
-
-    const apiKeyHash = await hashApiKey(apiKey);
-    const tier = options?.tierResolver
-      ? await options.tierResolver(c)
-      : await getDataTier(c.env.MARKET_CACHE, apiKeyHash);
-
-    // Execute the handler
-    await next();
-
-    // Note: Usage tracking is handled directly in route handlers
-    // via trackUsage() calls since Hono context doesn't support
-    // dynamic variables without app-level typing
-  };
 }
 
 /**

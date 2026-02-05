@@ -2,7 +2,7 @@
 // Core archival service for exporting data to R2 in Parquet format
 
 import type { Env } from "../types";
-import type { ArchiveJob, ArchiveType } from "../schemas/common";
+import type { ArchiveJob, ArchiveType, ManifestEntry, TableManifest } from "../schemas/common";
 import {
   DB_CONFIG,
   ARCHIVE_TABLE_REGISTRY,
@@ -13,37 +13,7 @@ import {
   calculateBlockCutoff,
   type ArchiveTableConfig,
 } from "../config/database";
-
-// ============================================================
-// SQL Injection Protection
-// ============================================================
-
-/**
- * Escape a string value for safe use in ClickHouse SQL queries.
- * Prevents SQL injection by escaping single quotes and backslashes.
- */
-function escapeString(value: string): string {
-  // ClickHouse uses backslash escaping for single quotes
-  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-}
-
-/**
- * Validate that a value is a safe identifier (table name, column name, database name).
- * Only allows alphanumeric characters and underscores.
- */
-function isValidIdentifier(value: string): boolean {
-  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(value);
-}
-
-/**
- * Validate and return a safe identifier, throwing if invalid.
- */
-function safeIdentifier(value: string, type: string): string {
-  if (!isValidIdentifier(value)) {
-    throw new Error(`Invalid ${type}: ${value}`);
-  }
-  return value;
-}
+import { escapeString, safeIdentifier } from "../utils/sql-sanitization";
 
 // ============================================================
 // Types
@@ -59,23 +29,6 @@ export interface ArchiveResult {
   minTs?: string;
   maxTs?: string;
   error?: string;
-}
-
-export interface ManifestEntry {
-  path: string;
-  rows: number;
-  minTs: string;
-  maxTs: string;
-  archivedAt: string;
-  sizeBytes?: number;
-}
-
-export interface TableManifest {
-  database: string;
-  table: string;
-  lastUpdated: string;
-  totalRows: number;
-  entries: ManifestEntry[];
 }
 
 // Maximum retries for manifest updates (optimistic locking)
@@ -197,7 +150,22 @@ export class ArchiveService {
         `;
 
       const rangeResult = await this.executeQuery(rangeQuery);
-      if (!rangeResult.success || !rangeResult.data?.[0]) {
+
+      // Distinguish query failure from empty results
+      if (!rangeResult.success) {
+        console.error(`[Archive] Query failed for ${database}.${table}: ${rangeResult.error}`);
+        return {
+          success: false,
+          database,
+          table,
+          archiveType: "aged",
+          rowsArchived: 0,
+          r2Path: "",
+          error: rangeResult.error || "Query failed",
+        };
+      }
+
+      if (!rangeResult.data?.[0]) {
         console.log(`[Archive] No archivable data found in ${database}.${table}`);
         return {
           success: true,
@@ -582,9 +550,27 @@ export class ArchiveService {
     `;
 
     const rangeResult = await this.executeQuery(rangeQuery);
-    if (!rangeResult.success || !rangeResult.data?.[0]) {
+
+    // Distinguish query failure from empty results
+    if (!rangeResult.success) {
+      console.error(
+        `[Archive] Query failed for ${database}.${table} (condition_id: ${conditionId.slice(0, 20)}...): ${rangeResult.error}`
+      );
       return {
-        success: true, // No data to archive is not an error
+        success: false,
+        database,
+        table,
+        archiveType: "resolved",
+        rowsArchived: 0,
+        r2Path: "",
+        error: rangeResult.error || "Query failed",
+      };
+    }
+
+    if (!rangeResult.data?.[0]) {
+      // No data to archive is not an error
+      return {
+        success: true,
         database,
         table,
         archiveType: "resolved",
@@ -769,11 +755,10 @@ export class ArchiveService {
         };
       }
 
-      // Check for duplicate entry (idempotency)
-      const isDuplicate = manifest.entries.some(
-        (e) => e.path === entry.path && e.archivedAt === entry.archivedAt
-      );
-      if (isDuplicate) {
+      // Check for duplicate entry by path only (idempotency)
+      // Don't include archivedAt in check - retried jobs have different timestamps
+      const existingEntryIndex = manifest.entries.findIndex((e) => e.path === entry.path);
+      if (existingEntryIndex >= 0) {
         console.log(`[Archive] Manifest entry already exists for ${entry.path}, skipping`);
         return;
       }
@@ -907,8 +892,11 @@ export class ArchiveService {
 
     if (conditionIdCondition) {
       // Sum up all archived rows for this condition_id
+      // Use path segment match to avoid substring false positives
+      // Path format: trading_data/resolved/{condition_id}/{table}/{month}/data.parquet
+      const conditionIdSegment = `/${conditionIdCondition.value}/`;
       archivedRowCount = manifest.entries
-        .filter((e) => e.path.includes(conditionIdCondition.value))
+        .filter((e) => e.path.includes(conditionIdSegment))
         .reduce((sum, e) => sum + e.rows, 0);
     } else {
       // For non-condition_id deletions, sum all entries

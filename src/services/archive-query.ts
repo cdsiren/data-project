@@ -2,58 +2,10 @@
 // Query routing service for hot (ClickHouse) and cold (R2) data access
 
 import type { Env } from "../types";
-import type { DataTier, ExportFormat } from "../schemas/common";
+import type { DataTier, ExportFormat, ManifestEntry, TableManifest } from "../schemas/common";
 import { TIER_LIMITS } from "../schemas/common";
 import { DB_CONFIG, getManifestPath } from "../config/database";
-
-// ============================================================
-// SQL Injection Protection
-// ============================================================
-
-/**
- * Escape a string value for safe use in ClickHouse SQL queries.
- */
-function escapeString(value: string): string {
-  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-}
-
-/**
- * Validate that a value is a safe identifier.
- */
-function isValidIdentifier(value: string): boolean {
-  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(value);
-}
-
-/**
- * Validate and return a safe identifier, throwing if invalid.
- */
-function safeIdentifier(value: string, type: string): string {
-  if (!isValidIdentifier(value)) {
-    throw new Error(`Invalid ${type}: ${value}`);
-  }
-  return value;
-}
-
-// ============================================================
-// Manifest Types (for R2 archive tracking)
-// ============================================================
-
-export interface ManifestEntry {
-  path: string;
-  rows: number;
-  minTs: string;
-  maxTs: string;
-  archivedAt: string;
-  sizeBytes?: number;
-}
-
-export interface TableManifest {
-  database: string;
-  table: string;
-  lastUpdated: string;
-  totalRows: number;
-  entries: ManifestEntry[];
-}
+import { escapeString, safeIdentifier } from "../utils/sql-sanitization";
 
 // ============================================================
 // Types

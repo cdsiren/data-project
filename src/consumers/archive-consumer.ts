@@ -28,19 +28,60 @@ export async function archiveConsumer(
 
       // Check results for any failures
       const failures = results.filter((r) => !r.success);
+      const successes = results.filter((r) => r.success);
+
       if (failures.length > 0) {
+        const failedTables = failures.map((f) => `${f.database}.${f.table}: ${f.error || "unknown"}`);
         console.error(
           `[ArchiveConsumer] ${failures.length}/${results.length} archives failed for job:`,
-          job
+          job,
+          "\nFailed tables:",
+          failedTables
         );
-        // Retry failures (attempts counts from 1)
+
+        // Retry if we haven't exceeded max attempts
         if (message.attempts < 3) {
           message.retry();
           return;
         }
+
+        // Max retries exceeded with failures - send failed tables to DLQ
+        // DO NOT ack - this would silently lose data
+        console.error(
+          `[ArchiveConsumer] CRITICAL: Max retries exceeded with ${failures.length} failed tables. ` +
+          `Sending to dead letter queue for manual intervention.`,
+          {
+            job,
+            attempts: message.attempts,
+            failedTables,
+            succeededTables: successes.map((s) => `${s.database}.${s.table}`),
+          }
+        );
+
+        // Queue individual jobs for failed tables to DLQ for visibility
+        // This ensures we have a record of exactly what failed
+        try {
+          const dlqMessages = failures.map((failure) => ({
+            body: {
+              originalJob: job,
+              failedTable: `${failure.database}.${failure.table}`,
+              error: failure.error,
+              attempts: message.attempts,
+              failedAt: new Date().toISOString(),
+            },
+          }));
+          await env.DEAD_LETTER_QUEUE.sendBatch(dlqMessages);
+        } catch (dlqError) {
+          console.error("[ArchiveConsumer] Failed to send to DLQ:", dlqError);
+        }
+
+        // Now ack the original message since we've recorded the failures
+        // The DLQ entries provide audit trail for manual retry
+        message.ack();
+        return;
       }
 
-      // Log success summary
+      // All tables succeeded - log summary and ack
       const totalRows = results.reduce((sum, r) => sum + r.rowsArchived, 0);
       if (totalRows > 0) {
         console.log(
@@ -52,22 +93,39 @@ export async function archiveConsumer(
 
       message.ack();
     } catch (error) {
-      console.error("[ArchiveConsumer] Job failed:", error, job);
+      console.error("[ArchiveConsumer] Job failed with exception:", error, job);
 
       // Retry up to 3 times (attempts counts from 1)
       if (message.attempts < 3) {
         message.retry();
       } else {
-        // Give up and ack (will be in dead letter queue)
-        console.error("[ArchiveConsumer] Max retries exceeded, giving up on job:", job);
+        // Max retries exceeded - send to DLQ for manual intervention
+        console.error(
+          "[ArchiveConsumer] CRITICAL: Max retries exceeded. Sending to dead letter queue.",
+          { job, attempts: message.attempts, error: String(error) }
+        );
+
+        try {
+          await env.DEAD_LETTER_QUEUE.send({
+            originalJob: job,
+            error: String(error),
+            attempts: message.attempts,
+            failedAt: new Date().toISOString(),
+          });
+        } catch (dlqError) {
+          console.error("[ArchiveConsumer] Failed to send to DLQ:", dlqError);
+        }
+
+        // Ack after recording to DLQ
         message.ack();
       }
     }
   });
 
-  // CRITICAL: Use waitUntil to ensure all archive work completes
-  // This prevents data loss if the worker terminates early
-  ctx.waitUntil(Promise.all(processingPromises));
+  // CRITICAL: Await all processing before returning
+  // Queue consumers must complete all message.ack()/retry() calls
+  // before the handler returns, otherwise acknowledgments may be lost
+  await Promise.all(processingPromises);
 }
 
 /**
@@ -115,31 +173,6 @@ export async function queueDailyArchiveJobs(env: Env): Promise<number> {
   }
 
   console.log(`[ArchiveConsumer] Queued ${jobsQueued} daily archive jobs`);
-  return jobsQueued;
-}
-
-/**
- * Queue resolved market archive jobs
- * Called by market lifecycle service when markets are resolved
- */
-export async function queueResolvedMarketArchive(
-  env: Env,
-  conditionIds: string[]
-): Promise<number> {
-  const queue = env.ARCHIVE_QUEUE;
-  let jobsQueued = 0;
-
-  for (const conditionId of conditionIds) {
-    const job: ArchiveJob = {
-      type: "resolved",
-      conditionId,
-    };
-
-    await queue.send(job);
-    jobsQueued++;
-    console.log(`[ArchiveConsumer] Queued resolved market archive for ${conditionId.slice(0, 20)}...`);
-  }
-
   return jobsQueued;
 }
 

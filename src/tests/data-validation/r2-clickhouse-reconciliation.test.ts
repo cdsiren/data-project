@@ -23,6 +23,7 @@ import {
   R2_PATHS,
   type ArchiveTableConfig,
 } from "../../config/database";
+import type { ManifestEntry, TableManifest } from "../../schemas/common";
 
 // Test configuration
 const RECONCILIATION_CONFIG = {
@@ -39,23 +40,6 @@ const RECONCILIATION_CONFIG = {
 const RECONCILABLE_TABLES: ArchiveTableConfig[] = ARCHIVE_TABLE_REGISTRY.filter(
   (t) => t.trigger === "resolved" || t.trigger === "aged"
 );
-
-interface ManifestEntry {
-  path: string;
-  rows: number;
-  minTs: string;
-  maxTs: string;
-  archivedAt: string;
-  sizeBytes?: number;
-}
-
-interface TableManifest {
-  database: string;
-  table: string;
-  lastUpdated: string;
-  totalRows: number;
-  entries: ManifestEntry[];
-}
 
 interface ReconciliationResult {
   database: string;
