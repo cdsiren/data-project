@@ -6,12 +6,17 @@ import type {
   FullL2Snapshot,
 } from "./types/orderbook";
 import type { MarketSource, MarketType } from "./core/enums";
+// Import ArchiveJob for use in this file (Zod schema is canonical source)
+import type { ArchiveJob } from "./schemas/common";
 
 // Re-export Polymarket types from their canonical location (avoid duplication)
 export type {
   PolymarketEvent,
   PolymarketMarket,
 } from "./adapters/polymarket/types";
+
+// Re-export ArchiveJob (Zod schema provides runtime validation)
+export type { ArchiveJob };
 
 export interface Env {
   // KV Namespaces
@@ -49,16 +54,6 @@ export interface Env {
   R2_ACCESS_KEY_ID?: string;
   R2_SECRET_ACCESS_KEY?: string;
   R2_ACCOUNT_ID?: string;
-}
-
-// Archive job for queue processing
-export interface ArchiveJob {
-  type: "resolved" | "aged";
-  conditionId?: string;
-  database?: string;
-  table?: string;
-  cutoffDate?: string;
-  month?: string;
 }
 
 // Database record types

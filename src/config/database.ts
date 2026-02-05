@@ -250,12 +250,8 @@ export const ARCHIVE_TABLE_REGISTRY: ArchiveTableConfig[] = [
     trigger: "aged",
     keyColumn: "created_at",
   },
-  {
-    database: "trading_data",
-    table: "market_events",
-    trigger: "aged",
-    keyColumn: "inserted_at",
-  },
+  // NOTE: market_events is excluded from archival - it's small reference data
+  // with no timestamp column, needed for lookups across all markets
   // Raw Polymarket - block_range tables
   {
     database: "raw_polymarket",

@@ -257,15 +257,3 @@ export interface TableManifest {
   totalRows: number;
   entries: ManifestEntry[];
 }
-
-/**
- * Date range query parameters for backtest endpoints
- */
-export const DateRangeQuerySchema = z.object({
-  start: z.string(),
-  end: z.string(),
-  asset_id: z.string().optional(),
-  condition_id: z.string().optional(),
-});
-
-export type DateRangeQuery = z.infer<typeof DateRangeQuerySchema>;

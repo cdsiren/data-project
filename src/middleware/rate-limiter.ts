@@ -266,18 +266,6 @@ export async function getDataTier(kv: KVNamespace, apiKeyHash: string): Promise<
   return "starter"; // Default tier
 }
 
-/**
- * Set data tier for a user (admin operation)
- */
-export async function setDataTier(
-  kv: KVNamespace,
-  apiKey: string,
-  tier: DataTier
-): Promise<void> {
-  const apiKeyHash = await hashApiKey(apiKey);
-  await kv.put(`data_tier:${apiKeyHash}`, tier, { expirationTtl: 86400 * 365 }); // 1 year
-}
-
 // ============================================================
 // Date Range Validation Middleware
 // ============================================================

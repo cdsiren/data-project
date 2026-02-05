@@ -392,26 +392,52 @@ export class ArchiveQueryService {
       });
     }
 
-    // Generate presigned URLs
-    const bucket = this.env.ARCHIVE_BUCKET as R2Bucket;
+    // Generate S3-compatible URLs for direct access
+    // Requires R2 S3 API credentials to be configured
+    const r2AccessKeyId = this.env.R2_ACCESS_KEY_ID;
+    const r2SecretAccessKey = this.env.R2_SECRET_ACCESS_KEY;
+    const r2AccountId = this.env.R2_ACCOUNT_ID;
+
+    if (!r2AccessKeyId || !r2SecretAccessKey || !r2AccountId) {
+      throw new Error(
+        "Bulk export requires R2 S3 credentials. " +
+        "Configure R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_ACCOUNT_ID environment variables. " +
+        "Generate R2 API tokens at: https://dash.cloudflare.com/?to=/:account/r2/api-tokens"
+      );
+    }
+
+    const r2Endpoint = `https://${r2AccountId}.r2.cloudflarestorage.com`;
+    const bucketName = "trading-data-archive";
     const files: Array<{ path: string; url: string; rows?: number }> = [];
 
     for (const range of filteredRanges) {
-      // R2 doesn't support presigned URLs directly in Workers
-      // In production, you'd use a signed URL service or custom domain
-      // For now, return the paths with a placeholder URL pattern
+      // Generate S3-compatible URL for direct access
+      // Users can use these URLs with any S3-compatible client or ClickHouse s3() function
       files.push({
         path: range.path,
-        url: `https://archive.example.com/${range.path}?token=SIGNED_TOKEN`,
+        url: `${r2Endpoint}/${bucketName}/${range.path}`,
         rows: range.rows,
       });
     }
 
+    // Build query example with credentials placeholder (user must supply their own)
     const queryExample = `
--- DuckDB-WASM query example
-SELECT * FROM read_parquet([${files.map((f) => `'${f.url}'`).join(", ")}])
+-- ClickHouse S3 query example (requires R2 credentials)
+SELECT * FROM s3(
+  '${r2Endpoint}/${bucketName}/trading_data/resolved/${conditionId}/ob_bbo/*/*.parquet',
+  '${r2AccessKeyId}',
+  '[YOUR_SECRET_KEY]',
+  'Parquet'
+)
 WHERE source_ts BETWEEN '${startDate?.toISOString() || "START"}' AND '${endDate?.toISOString() || "END"}'
 ORDER BY source_ts
+
+-- Or use DuckDB with httpfs extension:
+-- INSTALL httpfs; LOAD httpfs;
+-- SET s3_endpoint='${r2AccountId}.r2.cloudflarestorage.com';
+-- SET s3_access_key_id='${r2AccessKeyId}';
+-- SET s3_secret_access_key='[YOUR_SECRET_KEY]';
+-- SELECT * FROM read_parquet(['${files[0]?.url || "path/to/file.parquet"}']);
     `.trim();
 
     return {
@@ -503,14 +529,6 @@ ORDER BY source_ts
       return { error: String(error) };
     }
   }
-}
-
-/**
- * Check if a date range requires cold data access
- */
-export function requiresColdData(startDate: Date, hotDataDays: number = 90): boolean {
-  const hotBoundary = new Date(Date.now() - hotDataDays * 24 * 60 * 60 * 1000);
-  return startDate < hotBoundary;
 }
 
 /**

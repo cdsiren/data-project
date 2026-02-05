@@ -280,6 +280,23 @@ export class ArchiveService {
       `;
 
     const countResult = await this.executeQuery(countQuery);
+
+    // Check for query failure before using data
+    if (!countResult.success) {
+      console.error(
+        `[Archive] Count query failed for ${database}.${table} (month: ${month}): ${countResult.error}`
+      );
+      return {
+        success: false,
+        database,
+        table,
+        archiveType: "aged",
+        rowsArchived: 0,
+        r2Path: "",
+        error: countResult.error || "Count query failed",
+      };
+    }
+
     const rowCount = countResult.data?.[0]?.cnt || 0;
     const numRows = typeof rowCount === "string" ? parseInt(rowCount, 10) : rowCount;
 
@@ -333,6 +350,8 @@ export class ArchiveService {
     let firstMinTs: string | undefined;
     let lastMaxTs: string | undefined;
     let chunkIndex = 0;
+    let failedChunks = 0;
+    const failedErrors: string[] = [];
 
     const current = new Date(monthStart);
     while (current < monthEnd && current < cutoffDate) {
@@ -358,14 +377,36 @@ export class ArchiveService {
         chunkPath
       );
 
-      if (result.success && result.rowsArchived > 0) {
-        totalArchived += result.rowsArchived;
-        lastPath = result.r2Path;
-        if (!firstMinTs) firstMinTs = result.minTs;
-        lastMaxTs = result.maxTs;
+      if (result.success) {
+        if (result.rowsArchived > 0) {
+          totalArchived += result.rowsArchived;
+          lastPath = result.r2Path;
+          if (!firstMinTs) firstMinTs = result.minTs;
+          lastMaxTs = result.maxTs;
+        }
+      } else {
+        failedChunks++;
+        failedErrors.push(`chunk-${chunkIndex}: ${result.error || "unknown error"}`);
+        console.error(`[Archive] Chunk ${chunkIndex} failed for ${database}.${table}: ${result.error}`);
       }
 
       chunkIndex++;
+    }
+
+    // Report failure if any chunks failed
+    if (failedChunks > 0) {
+      console.error(`[Archive] ${month}: ${failedChunks}/${chunkIndex} chunks failed`);
+      return {
+        success: false,
+        database,
+        table,
+        archiveType: "aged",
+        rowsArchived: totalArchived,
+        r2Path: lastPath,
+        minTs: firstMinTs,
+        maxTs: lastMaxTs,
+        error: `${failedChunks}/${chunkIndex} chunks failed: ${failedErrors.slice(0, 3).join("; ")}`,
+      };
     }
 
     console.log(`[Archive] Completed ${month}: ${totalArchived} rows in ${chunkIndex} chunks`);
