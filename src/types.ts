@@ -43,6 +43,12 @@ export interface Env {
   CLICKHOUSE_TOKEN: string;
   VITE_DASHBOARD_API_KEY: string;  // Required key for dashboard API access
   ADMIN_API_KEY: string;           // Required key for admin endpoints
+
+  // R2 S3 API credentials (optional - required for cold data queries via ClickHouse)
+  // Generate at: https://dash.cloudflare.com/?to=/:account/r2/api-tokens
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_ACCOUNT_ID?: string;
 }
 
 // Archive job for queue processing

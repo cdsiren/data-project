@@ -134,6 +134,7 @@ export class ArchiveService {
 
   /**
    * Archive aged data for a specific table (>90 days old)
+   * Archives data in monthly chunks to avoid worker timeouts
    */
   async archiveAgedTable(
     database: string,
@@ -165,70 +166,96 @@ export class ArchiveService {
       const safeTable = safeIdentifier(table, "table");
       const safeKeyCol = safeIdentifier(tableConfig.keyColumn, "column");
 
-      // Build the appropriate query based on trigger type
-      let query: string;
-
+      // Handle block_range tables differently (no monthly chunking)
       if (tableConfig.trigger === "block_range") {
-        // For block_range tables, we need to extract the start block
-        const cutoffBlock = await this.getCurrentBlockCutoff();
-        // cutoffBlock is a number, safe to interpolate
-        query = `
-          SELECT *
-          FROM ${safeDatabase}.${safeTable}
-          WHERE toUInt64(extractAllGroups(${safeKeyCol}, '\\\\[(\\\\d+),')[1][1]) < ${cutoffBlock}
-        `;
-      } else {
-        // Standard timestamp-based query
-        // Use ISO string format which is safe (no user input)
-        const safeCutoffDate = cutoffDate.toISOString();
-        query = `
-          SELECT *
-          FROM ${safeDatabase}.${safeTable}
-          WHERE ${safeKeyCol} < '${safeCutoffDate}'
-        `;
+        return this.archiveBlockRangeTable(tableConfig, cutoffDate, month);
       }
 
-      // Get month for path
-      const archiveMonth = month || this.getMonthFromDate(cutoffDate);
-      const r2Path = getArchivePath(database, table, "aged", { month: archiveMonth });
+      // For timestamp-based tables, archive in monthly chunks
+      // First, get the date range of archivable data
+      const cutoffUnix = Math.floor(cutoffDate.getTime() / 1000);
+      const cutoffStr = cutoffDate.toISOString();
 
-      // Export and upload
-      const result = await this.exportAndUpload(query, r2Path);
+      const rangeQuery = tableConfig.keyColumnType === "string"
+        ? `
+          SELECT
+            toDateTime(min(toUInt64(${safeKeyCol}))) AS min_ts,
+            toDateTime(max(toUInt64(${safeKeyCol}))) AS max_ts,
+            count() AS row_count
+          FROM ${safeDatabase}.${safeTable}
+          WHERE toUInt64(${safeKeyCol}) < ${cutoffUnix}
+          FORMAT JSON
+        `
+        : `
+          SELECT
+            min(${safeKeyCol}) AS min_ts,
+            max(${safeKeyCol}) AS max_ts,
+            count() AS row_count
+          FROM ${safeDatabase}.${safeTable}
+          WHERE ${safeKeyCol} < '${cutoffStr}'
+          FORMAT JSON
+        `;
 
-      if (result.success && result.rowsArchived > 0) {
-        // Update manifest
-        await this.updateManifest(database, table, {
-          path: r2Path,
-          rows: result.rowsArchived,
-          minTs: result.minTs || cutoffDate.toISOString(),
-          maxTs: result.maxTs || cutoffDate.toISOString(),
-          archivedAt: new Date().toISOString(),
-        });
-
-        // Log to archive_log
-        const archiveResult: ArchiveResult = {
-          success: result.success,
+      const rangeResult = await this.executeQuery(rangeQuery);
+      if (!rangeResult.success || !rangeResult.data?.[0]) {
+        console.log(`[Archive] No archivable data found in ${database}.${table}`);
+        return {
+          success: true,
           database,
           table,
           archiveType: "aged",
-          rowsArchived: result.rowsArchived,
-          r2Path,
-          minTs: result.minTs,
-          maxTs: result.maxTs,
+          rowsArchived: 0,
+          r2Path: "",
         };
-        await this.logArchive(null, "aged", table, archiveResult);
+      }
+
+      const { min_ts, max_ts, row_count } = rangeResult.data[0];
+      if (row_count === 0 || row_count === "0") {
+        console.log(`[Archive] No rows to archive in ${database}.${table}`);
+        return {
+          success: true,
+          database,
+          table,
+          archiveType: "aged",
+          rowsArchived: 0,
+          r2Path: "",
+        };
+      }
+
+      console.log(`[Archive] Found ${row_count} rows to archive in ${database}.${table} (${min_ts} to ${max_ts})`);
+
+      // If a specific month was requested, only archive that month
+      if (month) {
+        return this.archiveAgedTableMonth(tableConfig, cutoffDate, month);
+      }
+
+      // Archive each month separately
+      const months = this.getMonthsBetween(new Date(min_ts), new Date(max_ts));
+      let totalArchived = 0;
+      let lastPath = "";
+      let firstMinTs: string | undefined;
+      let lastMaxTs: string | undefined;
+
+      for (const archiveMonth of months) {
+        const monthResult = await this.archiveAgedTableMonth(tableConfig, cutoffDate, archiveMonth);
+
+        if (monthResult.success && monthResult.rowsArchived > 0) {
+          totalArchived += monthResult.rowsArchived;
+          lastPath = monthResult.r2Path;
+          if (!firstMinTs) firstMinTs = monthResult.minTs;
+          lastMaxTs = monthResult.maxTs;
+        }
       }
 
       return {
-        success: result.success,
+        success: true,
         database,
         table,
         archiveType: "aged",
-        rowsArchived: result.rowsArchived,
-        r2Path,
-        minTs: result.minTs,
-        maxTs: result.maxTs,
-        error: result.error,
+        rowsArchived: totalArchived,
+        r2Path: lastPath,
+        minTs: firstMinTs,
+        maxTs: lastMaxTs,
       };
     } catch (error) {
       console.error(`[Archive] Failed to archive aged data from ${database}.${table}:`, error);
@@ -242,6 +269,287 @@ export class ArchiveService {
         error: String(error),
       };
     }
+  }
+
+  // Maximum rows per archive chunk to avoid worker timeouts
+  // 500K rows typically produces ~50-100MB Parquet files
+  private static readonly MAX_ROWS_PER_CHUNK = 500000;
+
+  /**
+   * Archive a single month of aged data for a table
+   * Automatically splits into weeks or days if the month has too many rows
+   */
+  private async archiveAgedTableMonth(
+    tableConfig: ArchiveTableConfig,
+    cutoffDate: Date,
+    month: string
+  ): Promise<ArchiveResult> {
+    const { database, table, keyColumn, keyColumnType } = tableConfig;
+    const safeDatabase = safeIdentifier(database, "database");
+    const safeTable = safeIdentifier(table, "table");
+    const safeKeyCol = safeIdentifier(keyColumn, "column");
+
+    const monthStart = `${month}-01`;
+    const monthEnd = this.getMonthEnd(month);
+    const cutoffStr = cutoffDate.toISOString();
+    const cutoffUnix = Math.floor(cutoffDate.getTime() / 1000);
+
+    // First, check how many rows are in this month
+    const countQuery = keyColumnType === "string"
+      ? `
+        SELECT count() as cnt
+        FROM ${safeDatabase}.${safeTable}
+        WHERE toUInt64(${safeKeyCol}) >= ${Math.floor(new Date(monthStart).getTime() / 1000)}
+          AND toUInt64(${safeKeyCol}) < ${Math.min(Math.floor(new Date(monthEnd).getTime() / 1000), cutoffUnix)}
+        FORMAT JSON
+      `
+      : `
+        SELECT count() as cnt
+        FROM ${safeDatabase}.${safeTable}
+        WHERE ${safeKeyCol} >= '${monthStart}'
+          AND ${safeKeyCol} < least('${monthEnd}', '${cutoffStr}')
+        FORMAT JSON
+      `;
+
+    const countResult = await this.executeQuery(countQuery);
+    const rowCount = countResult.data?.[0]?.cnt || 0;
+    const numRows = typeof rowCount === "string" ? parseInt(rowCount, 10) : rowCount;
+
+    if (numRows === 0) {
+      return {
+        success: true,
+        database,
+        table,
+        archiveType: "aged",
+        rowsArchived: 0,
+        r2Path: "",
+      };
+    }
+
+    // If month has too many rows, split into smaller chunks
+    if (numRows > ArchiveService.MAX_ROWS_PER_CHUNK) {
+      console.log(`[Archive] Month ${month} has ${numRows} rows, splitting into smaller chunks`);
+      return this.archiveAgedTableChunked(tableConfig, cutoffDate, month, numRows);
+    }
+
+    // Month is small enough, archive directly
+    return this.archiveAgedTableChunk(tableConfig, cutoffDate, monthStart, monthEnd, month);
+  }
+
+  /**
+   * Archive a month in weekly or daily chunks when it has too many rows
+   */
+  private async archiveAgedTableChunked(
+    tableConfig: ArchiveTableConfig,
+    cutoffDate: Date,
+    month: string,
+    totalRows: number
+  ): Promise<ArchiveResult> {
+    const { database, table } = tableConfig;
+    const monthStart = new Date(`${month}-01T00:00:00Z`);
+    const monthEnd = new Date(this.getMonthEnd(month) + "T00:00:00Z");
+
+    // Estimate rows per day
+    const daysInMonth = Math.ceil((monthEnd.getTime() - monthStart.getTime()) / (24 * 60 * 60 * 1000));
+    const avgRowsPerDay = totalRows / daysInMonth;
+
+    // Determine chunk size: weekly if avg daily rows fit in a week, otherwise daily
+    const useWeeklyChunks = avgRowsPerDay * 7 <= ArchiveService.MAX_ROWS_PER_CHUNK;
+    const chunkDays = useWeeklyChunks ? 7 : 1;
+    const chunkType = useWeeklyChunks ? "week" : "day";
+
+    console.log(`[Archive] Splitting ${month} into ${chunkType}ly chunks (~${Math.round(avgRowsPerDay * chunkDays)} rows per chunk)`);
+
+    let totalArchived = 0;
+    let lastPath = "";
+    let firstMinTs: string | undefined;
+    let lastMaxTs: string | undefined;
+    let chunkIndex = 0;
+
+    const current = new Date(monthStart);
+    while (current < monthEnd && current < cutoffDate) {
+      const chunkStart = current.toISOString().split("T")[0];
+
+      // Advance by chunk size
+      current.setUTCDate(current.getUTCDate() + chunkDays);
+
+      // Don't go past month end or cutoff
+      const chunkEndDate = new Date(Math.min(current.getTime(), monthEnd.getTime(), cutoffDate.getTime()));
+      const chunkEnd = chunkEndDate.toISOString().split("T")[0];
+
+      if (chunkStart >= chunkEnd) continue;
+
+      // Create a unique path for this chunk: YYYY-MM/chunk-NN
+      const chunkPath = `${month}/chunk-${String(chunkIndex).padStart(2, "0")}`;
+
+      const result = await this.archiveAgedTableChunk(
+        tableConfig,
+        cutoffDate,
+        chunkStart,
+        chunkEnd,
+        chunkPath
+      );
+
+      if (result.success && result.rowsArchived > 0) {
+        totalArchived += result.rowsArchived;
+        lastPath = result.r2Path;
+        if (!firstMinTs) firstMinTs = result.minTs;
+        lastMaxTs = result.maxTs;
+      }
+
+      chunkIndex++;
+    }
+
+    console.log(`[Archive] Completed ${month}: ${totalArchived} rows in ${chunkIndex} chunks`);
+
+    return {
+      success: true,
+      database,
+      table,
+      archiveType: "aged",
+      rowsArchived: totalArchived,
+      r2Path: lastPath,
+      minTs: firstMinTs,
+      maxTs: lastMaxTs,
+    };
+  }
+
+  /**
+   * Archive a specific date range chunk
+   */
+  private async archiveAgedTableChunk(
+    tableConfig: ArchiveTableConfig,
+    cutoffDate: Date,
+    startDate: string,
+    endDate: string,
+    pathSuffix: string
+  ): Promise<ArchiveResult> {
+    const { database, table, keyColumn, keyColumnType } = tableConfig;
+    const safeDatabase = safeIdentifier(database, "database");
+    const safeTable = safeIdentifier(table, "table");
+    const safeKeyCol = safeIdentifier(keyColumn, "column");
+
+    const cutoffStr = cutoffDate.toISOString();
+    const cutoffUnix = Math.floor(cutoffDate.getTime() / 1000);
+
+    // Build query for this chunk
+    let query: string;
+    if (keyColumnType === "string") {
+      const startUnix = Math.floor(new Date(startDate).getTime() / 1000);
+      const endUnix = Math.floor(new Date(endDate).getTime() / 1000);
+      query = `
+        SELECT *
+        FROM ${safeDatabase}.${safeTable}
+        WHERE toUInt64(${safeKeyCol}) >= ${startUnix}
+          AND toUInt64(${safeKeyCol}) < ${Math.min(endUnix, cutoffUnix)}
+      `;
+    } else {
+      query = `
+        SELECT *
+        FROM ${safeDatabase}.${safeTable}
+        WHERE ${safeKeyCol} >= '${startDate}'
+          AND ${safeKeyCol} < least('${endDate}', '${cutoffStr}')
+      `;
+    }
+
+    const r2Path = getArchivePath(database, table, "aged", { month: pathSuffix });
+    const result = await this.exportAndUpload(query, r2Path);
+
+    if (result.success && result.rowsArchived > 0) {
+      // Update manifest
+      await this.updateManifest(database, table, {
+        path: r2Path,
+        rows: result.rowsArchived,
+        minTs: startDate,
+        maxTs: endDate,
+        archivedAt: new Date().toISOString(),
+      });
+
+      // Log to archive_log
+      const archiveResult: ArchiveResult = {
+        success: result.success,
+        database,
+        table,
+        archiveType: "aged",
+        rowsArchived: result.rowsArchived,
+        r2Path,
+        minTs: startDate,
+        maxTs: endDate,
+      };
+      await this.logArchive(null, "aged", table, archiveResult);
+
+      console.log(`[Archive] Archived ${result.rowsArchived} rows from ${database}.${table} for ${pathSuffix}`);
+    }
+
+    return {
+      success: result.success,
+      database,
+      table,
+      archiveType: "aged",
+      rowsArchived: result.rowsArchived,
+      r2Path,
+      minTs: startDate,
+      maxTs: endDate,
+      error: result.error,
+    };
+  }
+
+  /**
+   * Archive block_range tables (no monthly chunking, uses block numbers)
+   */
+  private async archiveBlockRangeTable(
+    tableConfig: ArchiveTableConfig,
+    cutoffDate: Date,
+    month?: string
+  ): Promise<ArchiveResult> {
+    const { database, table, keyColumn } = tableConfig;
+    const safeDatabase = safeIdentifier(database, "database");
+    const safeTable = safeIdentifier(table, "table");
+    const safeKeyCol = safeIdentifier(keyColumn, "column");
+
+    const cutoffBlock = await this.getCurrentBlockCutoff();
+    const query = `
+      SELECT *
+      FROM ${safeDatabase}.${safeTable}
+      WHERE toUInt64(extractAllGroups(${safeKeyCol}, '\\\\[(\\\\d+),')[1][1]) < ${cutoffBlock}
+    `;
+
+    const archiveMonth = month || this.getMonthFromDate(cutoffDate);
+    const r2Path = getArchivePath(database, table, "aged", { month: archiveMonth });
+    const result = await this.exportAndUpload(query, r2Path);
+
+    if (result.success && result.rowsArchived > 0) {
+      await this.updateManifest(database, table, {
+        path: r2Path,
+        rows: result.rowsArchived,
+        minTs: result.minTs || cutoffDate.toISOString(),
+        maxTs: result.maxTs || cutoffDate.toISOString(),
+        archivedAt: new Date().toISOString(),
+      });
+
+      await this.logArchive(null, "aged", table, {
+        success: result.success,
+        database,
+        table,
+        archiveType: "aged",
+        rowsArchived: result.rowsArchived,
+        r2Path,
+        minTs: result.minTs,
+        maxTs: result.maxTs,
+      });
+    }
+
+    return {
+      success: result.success,
+      database,
+      table,
+      archiveType: "aged",
+      rowsArchived: result.rowsArchived,
+      r2Path,
+      minTs: result.minTs,
+      maxTs: result.maxTs,
+      error: result.error,
+    };
   }
 
   /**

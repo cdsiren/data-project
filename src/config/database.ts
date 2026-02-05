@@ -164,6 +164,7 @@ export interface ArchiveTableConfig {
   table: string;
   trigger: ArchiveTrigger;
   keyColumn: string; // Primary time/identifier column for archive queries
+  keyColumnType?: "datetime" | "string"; // Column type for proper comparison (default: datetime)
   conditionIdColumn?: string; // For resolved market triggers
 }
 
@@ -237,6 +238,24 @@ export const ARCHIVE_TABLE_REGISTRY: ArchiveTableConfig[] = [
     trigger: "aged",
     keyColumn: "failed_at",
   },
+  {
+    database: "trading_data",
+    table: "ob_latency",
+    trigger: "aged",
+    keyColumn: "source_ts",
+  },
+  {
+    database: "trading_data",
+    table: "market_metadata",
+    trigger: "aged",
+    keyColumn: "created_at",
+  },
+  {
+    database: "trading_data",
+    table: "market_events",
+    trigger: "aged",
+    keyColumn: "inserted_at",
+  },
   // Raw Polymarket - block_range tables
   {
     database: "raw_polymarket",
@@ -256,18 +275,20 @@ export const ARCHIVE_TABLE_REGISTRY: ArchiveTableConfig[] = [
     trigger: "block_range",
     keyColumn: "block_range",
   },
-  // Raw Polymarket - timestamp tables
+  // Raw Polymarket - timestamp tables (String type timestamps from subgraph)
   {
     database: "raw_polymarket",
     table: "order_filled",
     trigger: "aged",
     keyColumn: "timestamp",
+    keyColumnType: "string", // Subgraph stores timestamps as Unix epoch strings
   },
   {
     database: "raw_polymarket",
     table: "orders_matched",
     trigger: "aged",
     keyColumn: "timestamp",
+    keyColumnType: "string", // Subgraph stores timestamps as Unix epoch strings
   },
 ];
 

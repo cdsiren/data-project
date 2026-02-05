@@ -91,7 +91,7 @@ binding = "ARCHIVE_QUEUE"
 [[queues.consumers]]
 queue = "archive-queue"
 max_batch_size = 10       # Small batches for large data operations
-max_batch_timeout = 300   # 5 min timeout for archive operations
+max_batch_timeout = 60    # Max allowed timeout (60s)
 max_retries = 3
 dead_letter_queue = "dead-letter-queue"
 

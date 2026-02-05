@@ -1661,6 +1661,179 @@ app.post("/admin/init-triggers", authMiddleware, async (c) => {
   });
 });
 
+// ============================================================
+// Archive Manifest Admin Endpoints (for reconciliation testing)
+// ============================================================
+
+/**
+ * Get a single table manifest from R2
+ * GET /admin/manifest/:database/:table
+ */
+app.get("/admin/manifest/:database/:table", authMiddleware, async (c) => {
+  const { database, table } = c.req.param();
+  const bucket = c.env.ARCHIVE_BUCKET as R2Bucket;
+
+  // Validate identifiers to prevent path traversal
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(database) || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
+    return c.json({ error: "Invalid database or table name" }, 400);
+  }
+
+  const manifestPath = `manifests/${database}_${table}.json`;
+
+  try {
+    const obj = await bucket.get(manifestPath);
+    if (!obj) {
+      return c.json({ error: "Manifest not found" }, 404);
+    }
+
+    const manifest = await obj.json();
+    return c.json(manifest);
+  } catch (error) {
+    console.error(`Failed to fetch manifest ${manifestPath}:`, error);
+    return c.json({ error: "Failed to fetch manifest" }, 500);
+  }
+});
+
+/**
+ * Get all table manifests from R2
+ * GET /admin/manifests
+ */
+app.get("/admin/manifests", authMiddleware, async (c) => {
+  const bucket = c.env.ARCHIVE_BUCKET as R2Bucket;
+  const manifests: Array<Record<string, unknown>> = [];
+
+  try {
+    // List all manifest files
+    const listed = await bucket.list({ prefix: "manifests/" });
+
+    for (const obj of listed.objects) {
+      if (obj.key.endsWith(".json")) {
+        try {
+          const manifestObj = await bucket.get(obj.key);
+          if (manifestObj) {
+            const manifest = await manifestObj.json();
+            manifests.push(manifest as Record<string, unknown>);
+          }
+        } catch (error) {
+          console.warn(`Failed to read manifest ${obj.key}:`, error);
+        }
+      }
+    }
+
+    return c.json({
+      count: manifests.length,
+      manifests,
+    });
+  } catch (error) {
+    console.error("Failed to list manifests:", error);
+    return c.json({ error: "Failed to list manifests" }, 500);
+  }
+});
+
+/**
+ * Get reconciliation summary comparing R2 manifests to ClickHouse row counts
+ * GET /admin/reconciliation
+ */
+app.get("/admin/reconciliation", authMiddleware, async (c) => {
+  const bucket = c.env.ARCHIVE_BUCKET as R2Bucket;
+  const results: Array<{
+    database: string;
+    table: string;
+    manifestRows: number;
+    clickhouseRows: number;
+    difference: number;
+    percentDiff: number;
+    status: string;
+  }> = [];
+
+  try {
+    // Get all manifests
+    const listed = await bucket.list({ prefix: "manifests/" });
+
+    for (const obj of listed.objects) {
+      if (!obj.key.endsWith(".json")) continue;
+
+      try {
+        const manifestObj = await bucket.get(obj.key);
+        if (!manifestObj) continue;
+
+        const manifest = (await manifestObj.json()) as {
+          database: string;
+          table: string;
+          totalRows: number;
+          entries: Array<{ minTs: string; maxTs: string; rows: number }>;
+        };
+
+        // Query ClickHouse for total rows in this table
+        const countQuery = `SELECT count() AS cnt FROM ${manifest.database}.${manifest.table} FORMAT JSON`;
+        const url = new URL(c.env.CLICKHOUSE_URL);
+        url.searchParams.set("query", countQuery);
+
+        const chResponse = await fetch(url.toString(), {
+          headers: {
+            "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
+            "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
+          },
+        });
+
+        if (!chResponse.ok) {
+          results.push({
+            database: manifest.database,
+            table: manifest.table,
+            manifestRows: manifest.totalRows,
+            clickhouseRows: -1,
+            difference: -1,
+            percentDiff: -1,
+            status: "clickhouse_error",
+          });
+          continue;
+        }
+
+        const chData = (await chResponse.json()) as { data: Array<{ cnt: string }> };
+        const clickhouseRows = parseInt(chData.data[0]?.cnt || "0", 10);
+        const difference = Math.abs(clickhouseRows - manifest.totalRows);
+        const percentDiff = manifest.totalRows > 0 ? (difference / manifest.totalRows) * 100 : 0;
+
+        results.push({
+          database: manifest.database,
+          table: manifest.table,
+          manifestRows: manifest.totalRows,
+          clickhouseRows,
+          difference,
+          percentDiff,
+          status: percentDiff <= 1 ? "ok" : "mismatch",
+        });
+      } catch (error) {
+        console.warn(`Failed to process manifest ${obj.key}:`, error);
+      }
+    }
+
+    // Calculate totals
+    const totalManifest = results.reduce((sum, r) => sum + (r.manifestRows > 0 ? r.manifestRows : 0), 0);
+    const totalClickhouse = results.reduce((sum, r) => sum + (r.clickhouseRows > 0 ? r.clickhouseRows : 0), 0);
+    const totalDiff = Math.abs(totalClickhouse - totalManifest);
+    const totalPercentDiff = totalManifest > 0 ? (totalDiff / totalManifest) * 100 : 0;
+
+    return c.json({
+      summary: {
+        tablesChecked: results.length,
+        tablesOk: results.filter((r) => r.status === "ok").length,
+        tablesMismatch: results.filter((r) => r.status === "mismatch").length,
+        tablesError: results.filter((r) => r.status === "clickhouse_error").length,
+        totalManifestRows: totalManifest,
+        totalClickhouseRows: totalClickhouse,
+        totalDifference: totalDiff,
+        totalPercentDiff,
+        overallStatus: totalPercentDiff <= 1 ? "ok" : "mismatch",
+      },
+      tables: results,
+    });
+  } catch (error) {
+    console.error("Failed to run reconciliation:", error);
+    return c.json({ error: "Failed to run reconciliation" }, 500);
+  }
+});
+
 app.get("/test/all", async (c) => {
   const results = {
     timestamp: new Date().toISOString(),

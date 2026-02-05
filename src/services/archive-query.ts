@@ -240,7 +240,15 @@ export class ArchiveQueryService {
   }
 
   /**
-   * Query cold data from R2 via ClickHouse S3() function
+   * Query cold data from R2 via ClickHouse S3() function.
+   *
+   * This uses ClickHouse's native S3 function to query Parquet files directly from R2.
+   * Requires R2 S3 API credentials to be configured in environment:
+   * - R2_ACCESS_KEY_ID: R2 API token access key
+   * - R2_SECRET_ACCESS_KEY: R2 API token secret
+   * - R2_ACCOUNT_ID: Cloudflare account ID (for R2 endpoint URL)
+   *
+   * Generate R2 API tokens at: https://dash.cloudflare.com/?to=/:account/r2/api-tokens
    */
   private async queryCold(
     options: QueryOptions,
@@ -252,35 +260,97 @@ export class ArchiveQueryService {
 
     const { assetId, conditionId, startDate, endDate, limit = 100000 } = options;
 
-    // Build ClickHouse query using s3() function
-    // Note: This requires ClickHouse to have R2 credentials configured
-    const bucket = this.env.ARCHIVE_BUCKET as R2Bucket;
+    // Check for R2 S3 credentials
+    const r2AccessKeyId = this.env.R2_ACCESS_KEY_ID;
+    const r2SecretAccessKey = this.env.R2_SECRET_ACCESS_KEY;
+    const r2AccountId = this.env.R2_ACCOUNT_ID;
 
-    // For now, we'll read directly from R2 and parse Parquet
-    // In production, you'd configure ClickHouse external tables
-    const allData: any[] = [];
-
-    for (const path of paths) {
-      try {
-        const obj = await bucket.get(path);
-        if (!obj) continue;
-
-        // For Parquet files, we need a parser
-        // In a real implementation, you'd use a Parquet library or ClickHouse S3() function
-        // For now, we'll return a reference to the cold files
-
-        console.log(`[ArchiveQuery] Would read cold data from: ${path}`);
-      } catch (error) {
-        console.error(`[ArchiveQuery] Failed to read cold data from ${path}:`, error);
-      }
+    if (!r2AccessKeyId || !r2SecretAccessKey || !r2AccountId) {
+      console.warn(
+        "[ArchiveQuery] Cold data query requires R2 S3 credentials. " +
+        "Set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_ACCOUNT_ID environment variables."
+      );
+      // Return empty with metadata about what files would be queried
+      return {
+        data: [],
+        rowCount: 0,
+        source: "cold",
+        coldFilesUsed: paths,
+      };
     }
 
-    return {
-      data: allData,
-      rowCount: allData.length,
-      source: "cold",
-      coldFilesUsed: paths,
-    };
+    // Build WHERE clause for filtering within Parquet files
+    let whereClause = `source_ts BETWEEN '${startDate.toISOString()}' AND '${endDate.toISOString()}'`;
+    if (assetId) {
+      whereClause += ` AND asset_id = '${escapeString(assetId)}'`;
+    }
+    if (conditionId) {
+      whereClause += ` AND condition_id = '${escapeString(conditionId)}'`;
+    }
+
+    // Ensure limit is safe
+    const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 1000000);
+
+    // R2 S3-compatible endpoint
+    const r2Endpoint = `https://${r2AccountId}.r2.cloudflarestorage.com`;
+    const bucketName = "trading-data-archive";
+
+    // Build UNION ALL query for multiple Parquet files
+    // ClickHouse's s3() function can query Parquet files directly
+    const s3Queries = paths.map((path) => {
+      const s3Url = `${r2Endpoint}/${bucketName}/${path}`;
+      // Escape the URL and credentials for SQL
+      const safeUrl = escapeString(s3Url);
+      const safeAccessKey = escapeString(r2AccessKeyId);
+      const safeSecretKey = escapeString(r2SecretAccessKey);
+
+      return `SELECT * FROM s3('${safeUrl}', '${safeAccessKey}', '${safeSecretKey}', 'Parquet')`;
+    });
+
+    // Combine into single query with filtering
+    const query = `
+      SELECT *
+      FROM (
+        ${s3Queries.join(" UNION ALL ")}
+      )
+      WHERE ${whereClause}
+      ORDER BY source_ts ASC
+      LIMIT ${safeLimit}
+      FORMAT JSON
+    `;
+
+    try {
+      const result = await this.executeClickHouseQuery(query);
+
+      if (result.error) {
+        console.error(`[ArchiveQuery] Cold data query failed: ${result.error}`);
+        return {
+          data: [],
+          rowCount: 0,
+          source: "cold",
+          coldFilesUsed: paths,
+        };
+      }
+
+      console.log(
+        `[ArchiveQuery] Retrieved ${result.data?.length || 0} rows from ${paths.length} cold files`
+      );
+
+      return {
+        data: result.data || [],
+        rowCount: result.data?.length || 0,
+        source: "cold",
+        coldFilesUsed: paths,
+      };
+    } catch (error) {
+      console.error(`[ArchiveQuery] Cold data query error:`, error);
+      return {
+        data: [],
+        rowCount: 0,
+        source: "cold",
+        coldFilesUsed: paths,
+      };
+    }
   }
 
   /**

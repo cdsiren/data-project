@@ -329,6 +329,245 @@ const manifest = await bucket.get("manifests/trading_data_ob_bbo.json");
 // Compare row counts with archive_log
 ```
 
+## Data Reconciliation
+
+Before deleting any data from ClickHouse, you **must** verify that all archived data in R2 matches the source data. The reconciliation system provides multiple ways to validate data integrity.
+
+### Overview
+
+The reconciliation process compares:
+1. **R2 Manifests**: JSON files tracking all archived Parquet files with row counts
+2. **ClickHouse Data**: The source data that was archived
+3. **Archive Log**: The `trading_data.archive_log` table tracking archive operations
+
+All three should be consistent within a 1% tolerance (to account for in-flight data during archival).
+
+### Admin Endpoints
+
+Three endpoints are available for reconciliation checks:
+
+#### GET /admin/manifest/:database/:table
+
+Fetch a single table's manifest from R2.
+
+```bash
+curl "https://polymarket-enrichment.cd-durbin14.workers.dev/admin/manifest/trading_data/ob_bbo" \
+  -H "X-API-Key: YOUR_API_KEY"
+```
+
+**Response:**
+```json
+{
+  "database": "trading_data",
+  "table": "ob_bbo",
+  "lastUpdated": "2024-01-15T10:30:00Z",
+  "totalRows": 15000000,
+  "entries": [
+    {
+      "path": "trading_data/resolved/0x.../ob_bbo/2024-01/data.parquet",
+      "rows": 50000,
+      "minTs": "2024-01-01T00:00:00Z",
+      "maxTs": "2024-01-31T23:59:59Z",
+      "archivedAt": "2024-02-01T02:00:00Z",
+      "sizeBytes": 2500000
+    }
+  ]
+}
+```
+
+#### GET /admin/manifests
+
+Fetch all table manifests from R2.
+
+```bash
+curl "https://polymarket-enrichment.cd-durbin14.workers.dev/admin/manifests" \
+  -H "X-API-Key: YOUR_API_KEY"
+```
+
+**Response:**
+```json
+{
+  "count": 4,
+  "manifests": [
+    { "database": "trading_data", "table": "ob_bbo", "totalRows": 15000000, ... },
+    { "database": "trading_data", "table": "trade_ticks", "totalRows": 8000000, ... },
+    { "database": "trading_data", "table": "ob_snapshots", "totalRows": 2000000, ... },
+    { "database": "trading_data", "table": "ob_level_changes", "totalRows": 12000000, ... }
+  ]
+}
+```
+
+#### GET /admin/reconciliation
+
+Run a full reconciliation comparing R2 manifests to ClickHouse row counts.
+
+```bash
+curl "https://polymarket-enrichment.cd-durbin14.workers.dev/admin/reconciliation" \
+  -H "X-API-Key: YOUR_API_KEY"
+```
+
+**Response:**
+```json
+{
+  "summary": {
+    "tablesChecked": 4,
+    "tablesOk": 4,
+    "tablesMismatch": 0,
+    "tablesError": 0,
+    "totalManifestRows": 37000000,
+    "totalClickhouseRows": 37150000,
+    "totalDifference": 150000,
+    "totalPercentDiff": 0.4,
+    "overallStatus": "ok"
+  },
+  "tables": [
+    {
+      "database": "trading_data",
+      "table": "ob_bbo",
+      "manifestRows": 15000000,
+      "clickhouseRows": 15050000,
+      "difference": 50000,
+      "percentDiff": 0.33,
+      "status": "ok"
+    }
+  ]
+}
+```
+
+**Status values:**
+- `ok`: Difference is within 1% tolerance
+- `mismatch`: Difference exceeds 1% tolerance
+- `clickhouse_error`: Could not query ClickHouse
+
+### Quick Reconciliation Check
+
+Use the provided shell script for a quick command-line check:
+
+```bash
+# Set your API key
+export VITE_DASHBOARD_API_KEY=your-api-key
+
+# Run the reconciliation check
+./scripts/check-r2-clickhouse-reconciliation.sh
+```
+
+**Example output:**
+```
+=== R2 to ClickHouse Data Reconciliation ===
+Worker URL: https://polymarket-enrichment.cd-durbin14.workers.dev
+
+Fetching reconciliation data...
+
+=== Summary ===
+{
+  "tablesChecked": 4,
+  "tablesOk": 4,
+  "overallStatus": "ok"
+}
+
+=== Table Details ===
+✓ trading_data.ob_bbo: R2=15,000,000 CH=15,050,000 diff=0.33%
+✓ trading_data.trade_ticks: R2=8,000,000 CH=8,020,000 diff=0.25%
+✓ trading_data.ob_snapshots: R2=2,000,000 CH=2,005,000 diff=0.25%
+✓ trading_data.ob_level_changes: R2=12,000,000 CH=12,075,000 diff=0.63%
+
+✓ All tables reconciled successfully. Safe to proceed with deletion.
+```
+
+### Automated Test Suite
+
+For comprehensive validation, run the test suite:
+
+```bash
+# Set environment variables
+export CLICKHOUSE_URL=https://your-clickhouse-host:8443
+export CLICKHOUSE_TOKEN=your-token
+export CLICKHOUSE_USER=default
+export API_KEY=your-api-key
+export WORKER_URL=https://polymarket-enrichment.cd-durbin14.workers.dev
+
+# Run reconciliation tests
+pnpm test src/tests/data-validation/r2-clickhouse-reconciliation.test.ts
+```
+
+**Test coverage:**
+- `should have at least one manifest to reconcile` - Verifies manifests exist
+- `should reconcile ob_bbo table` - Validates BBO data
+- `should reconcile trade_ticks table` - Validates trade data
+- `should reconcile ob_snapshots table` - Validates snapshot data
+- `should reconcile ob_level_changes table` - Validates level change data
+- `should reconcile all archived tables` - Full cross-table validation
+- `should verify archive_log matches manifests` - Cross-checks archive log
+
+### Reconciliation Workflow
+
+**Before deleting ClickHouse data:**
+
+1. **Run quick check** (1 minute):
+   ```bash
+   ./scripts/check-r2-clickhouse-reconciliation.sh
+   ```
+
+2. **If quick check passes**, run full test suite (5-10 minutes):
+   ```bash
+   pnpm test src/tests/data-validation/r2-clickhouse-reconciliation.test.ts
+   ```
+
+3. **Verify archive_log** shows no pending deletions:
+   ```sql
+   SELECT count(*) AS pending_deletions
+   FROM trading_data.archive_log
+   WHERE clickhouse_deleted = 0
+     AND archived_at < NOW() - INTERVAL 1 DAY
+   ```
+
+4. **Only proceed with deletion** if all checks pass
+
+### Troubleshooting Mismatches
+
+**Common causes of row count differences:**
+
+| Cause | Resolution |
+|-------|------------|
+| In-flight data during archival | Wait 24 hours, re-run check |
+| Failed archive job | Check dead_letter_messages, re-queue job |
+| Partial archive (timeout) | Re-run archive for affected month |
+| Manifest corruption | Re-archive table, regenerate manifest |
+
+**Investigating mismatches:**
+
+```sql
+-- Find specific time ranges with differences
+SELECT
+  toStartOfDay(source_ts) AS day,
+  count() AS ch_rows
+FROM trading_data.ob_bbo
+WHERE source_ts BETWEEN '2024-01-01' AND '2024-01-31'
+GROUP BY day
+ORDER BY day;
+
+-- Compare with manifest entry
+-- Check manifest.entries where minTs/maxTs covers this range
+```
+
+**Re-archiving a specific time range:**
+
+```typescript
+// Queue a re-archive job for a specific market
+await env.ARCHIVE_QUEUE.send({
+  type: "resolved",
+  conditionId: "0x...",
+});
+
+// Or for aged data
+await env.ARCHIVE_QUEUE.send({
+  type: "aged",
+  database: "trading_data",
+  table: "ob_bbo",
+  month: "2024-01",
+});
+```
+
 ## Configuration
 
 ### wrangler.toml
@@ -383,7 +622,10 @@ wrangler r2 bucket list
 | `src/services/archive-service.ts` | Core archival logic |
 | `src/services/archive-query.ts` | Hot/cold query routing |
 | `src/consumers/archive-consumer.ts` | Queue consumer for archive jobs |
-| `src/config/database.ts` | ARCHIVE_TABLE_REGISTRY |
+| `src/config/database.ts` | ARCHIVE_TABLE_REGISTRY, R2_PATHS |
 | `src/routes/backtest.ts` | Tier-enforced backtest endpoints |
 | `src/services/market-lifecycle.ts` | Archive trigger on market resolution |
 | `schema/orderbook_tables.sql` | archive_log, usage_events tables |
+| `src/tests/data-validation/r2-clickhouse-reconciliation.test.ts` | Reconciliation test suite |
+| `scripts/check-r2-clickhouse-reconciliation.sh` | Quick reconciliation CLI script |
+| `src/index.ts` | Admin endpoints: `/admin/manifest/*`, `/admin/reconciliation` |
