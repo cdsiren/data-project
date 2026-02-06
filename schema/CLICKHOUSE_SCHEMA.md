@@ -19,16 +19,11 @@ This document provides a complete reference for all ClickHouse tables used in th
 - [Market Metadata Tables](#market-metadata-tables)
   - [market_metadata](#market_metadata)
   - [market_events](#market_events)
-- [Views](#views)
-  - [v_ob_bbo_1m](#v_ob_bbo_1m)
-  - [v_ob_bbo_5m](#v_ob_bbo_5m)
 - [Materialized Views](#materialized-views)
   - [trades_mv](#trades_mv)
   - [makers_mv](#makers_mv)
   - [takers_mv](#takers_mv)
   - [markets_mv](#markets_mv)
-  - [mv_ob_bbo_1m](#mv_ob_bbo_1m)
-  - [mv_ob_bbo_5m](#mv_ob_bbo_5m)
   - [mv_ob_hourly_stats](#mv_ob_hourly_stats)
 - [Raw Polymarket Database Tables](#raw-polymarket-database-tables)
   - [global_open_interest](#global_open_interest)
@@ -174,7 +169,7 @@ Best Bid/Offer (top-of-book) tick data. Lightweight alternative to full L2 snaps
 | spread | Decimal(38, 18) | MATERIALIZED | `best_ask - best_bid` |
 | latency_ms | Float64 | MATERIALIZED | `dateDiff('millisecond', source_ts, ingestion_ts)` |
 
-**TTL:** 90 days
+**TTL:** 365 days (backtesting retention)
 
 ---
 
@@ -211,7 +206,7 @@ Full L2 orderbook snapshots with depth arrays.
 | ask_levels | UInt16 | MATERIALIZED | Number of ask levels |
 | book_imbalance | Float64 | MATERIALIZED | `(bid_depth - ask_depth) / (bid_depth + ask_depth)` |
 
-**TTL:** 90 days
+**TTL:** 365 days (backtesting retention)
 
 ---
 
@@ -237,7 +232,7 @@ Order book level changes tracking placements and cancellations at each price lev
 | sequence_number | UInt64 | | Sequence for ordering |
 | latency_ms | Float64 | MATERIALIZED | `dateDiff('millisecond', source_ts, ingestion_ts)` |
 
-**TTL:** 30 days
+**TTL:** 14 days (operational)
 
 ---
 
@@ -327,72 +322,6 @@ Events associated with markets.
 
 ---
 
-## Views
-
-### v_ob_bbo_1m
-
-1-minute OHLC aggregation of BBO data.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| asset_id | String | Asset identifier |
-| condition_id | String | Market condition ID |
-| interval_1m | DateTime('UTC') | 1-minute interval start |
-| open_bid | Decimal(38, 18) | Opening bid price |
-| high_bid | Decimal(38, 18) | Highest bid price |
-| low_bid | Decimal(38, 18) | Lowest bid price |
-| close_bid | Decimal(38, 18) | Closing bid price |
-| open_ask | Decimal(38, 18) | Opening ask price |
-| high_ask | Decimal(38, 18) | Highest ask price |
-| low_ask | Decimal(38, 18) | Lowest ask price |
-| close_ask | Decimal(38, 18) | Closing ask price |
-| open_mid | Decimal(38, 18) | Opening mid price |
-| close_mid | Decimal(38, 18) | Closing mid price |
-| vwap_mid | Decimal(38, 18) | Volume-weighted avg mid |
-| avg_spread_bps | Float64 | Average spread (bps) |
-| min_spread_bps | Float64 | Minimum spread (bps) |
-| max_spread_bps | Float64 | Maximum spread (bps) |
-| avg_bid_size | Float64 | Average bid size |
-| avg_ask_size | Float64 | Average ask size |
-| avg_imbalance | Float64 | Average book imbalance |
-| tick_count | UInt64 | Number of ticks |
-| first_ts | DateTime64(3, 'UTC') | First tick timestamp |
-| last_ts | DateTime64(3, 'UTC') | Last tick timestamp |
-
----
-
-### v_ob_bbo_5m
-
-5-minute OHLC aggregation of BBO data. Same schema as v_ob_bbo_1m with `interval_5m` instead of `interval_1m`.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| asset_id | String | Asset identifier |
-| condition_id | String | Market condition ID |
-| interval_5m | DateTime('UTC') | 5-minute interval start |
-| open_bid | Decimal(38, 18) | Opening bid price |
-| high_bid | Decimal(38, 18) | Highest bid price |
-| low_bid | Decimal(38, 18) | Lowest bid price |
-| close_bid | Decimal(38, 18) | Closing bid price |
-| open_ask | Decimal(38, 18) | Opening ask price |
-| high_ask | Decimal(38, 18) | Highest ask price |
-| low_ask | Decimal(38, 18) | Lowest ask price |
-| close_ask | Decimal(38, 18) | Closing ask price |
-| open_mid | Decimal(38, 18) | Opening mid price |
-| close_mid | Decimal(38, 18) | Closing mid price |
-| vwap_mid | Decimal(38, 18) | Volume-weighted avg mid |
-| avg_spread_bps | Float64 | Average spread (bps) |
-| min_spread_bps | Float64 | Minimum spread (bps) |
-| max_spread_bps | Float64 | Maximum spread (bps) |
-| avg_bid_size | Float64 | Average bid size |
-| avg_ask_size | Float64 | Average ask size |
-| avg_imbalance | Float64 | Average book imbalance |
-| tick_count | UInt64 | Number of ticks |
-| first_ts | DateTime64(3, 'UTC') | First tick timestamp |
-| last_ts | DateTime64(3, 'UTC') | Last tick timestamp |
-
----
-
 ## Materialized Views
 
 ### trades_mv
@@ -475,44 +404,6 @@ Materialized view for market-level aggregations.
 | usdc_volume | Float64 | Normalized volume |
 | shares_volume_raw | UInt64 | Raw shares volume |
 | fees_raw | UInt64 | Raw fees |
-
----
-
-### mv_ob_bbo_1m
-
-Materialized view for 1-minute BBO aggregations. Populates the `v_ob_bbo_1m` view.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| asset_id | String | Asset identifier |
-| condition_id | String | Market condition ID |
-| interval_1m | DateTime('UTC') | 1-minute interval |
-| open_bid | Decimal(38, 18) | Opening bid |
-| high_bid | Decimal(38, 18) | High bid |
-| low_bid | Decimal(38, 18) | Low bid |
-| close_bid | Decimal(38, 18) | Closing bid |
-| open_ask | Decimal(38, 18) | Opening ask |
-| high_ask | Decimal(38, 18) | High ask |
-| low_ask | Decimal(38, 18) | Low ask |
-| close_ask | Decimal(38, 18) | Closing ask |
-| open_mid | Decimal(38, 18) | Opening mid |
-| close_mid | Decimal(38, 18) | Closing mid |
-| vwap_mid | Decimal(38, 18) | VWAP mid |
-| avg_spread_bps | Float64 | Avg spread (bps) |
-| min_spread_bps | Float64 | Min spread (bps) |
-| max_spread_bps | Float64 | Max spread (bps) |
-| avg_bid_size | Float64 | Avg bid size |
-| avg_ask_size | Float64 | Avg ask size |
-| avg_imbalance | Float64 | Avg imbalance |
-| tick_count | UInt64 | Tick count |
-| first_ts | DateTime64(3, 'UTC') | First timestamp |
-| last_ts | DateTime64(3, 'UTC') | Last timestamp |
-
----
-
-### mv_ob_bbo_5m
-
-Materialized view for 5-minute BBO aggregations. Same schema as mv_ob_bbo_1m with `interval_5m`.
 
 ---
 

@@ -1,4 +1,4 @@
-import type { OHLCResponse, TopActivityResponse } from "@/types";
+import type { TopActivityResponse } from "@/types";
 import type { MetricsResponse } from "@/types/metrics";
 import { config } from "./config";
 import { logger } from "./logger";
@@ -16,24 +16,6 @@ export async function fetchTopActivity(): Promise<TopActivityResponse> {
   const response = await fetch(`${API_BASE}/api/v1/markets/top-activity`);
   if (!response.ok) {
     throw new Error(`Failed to fetch top activity: ${response.status}`);
-  }
-  return response.json();
-}
-
-/**
- * Fetch OHLC data for a specific asset
- */
-export async function fetchOHLC(
-  assetId: string,
-  interval: string = "1m",
-  hours: number = 24
-): Promise<OHLCResponse> {
-  const params = new URLSearchParams({ interval, hours: hours.toString() });
-  const response = await fetch(
-    `${API_BASE}/api/v1/ohlc/${encodeURIComponent(assetId)}?${params}`
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to fetch OHLC: ${response.status}`);
   }
   return response.json();
 }

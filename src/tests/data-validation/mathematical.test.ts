@@ -573,72 +573,9 @@ describe("P0: Mathematical Consistency", () => {
     });
   });
 
-  describe("Materialized View Consistency", () => {
-    it("should have 1-min bars with tick_count matching raw data", async () => {
-      if (!config) return;
-
-      // Sample a few minute windows and compare tick counts
-      const query = `
-        WITH raw_counts AS (
-          SELECT
-            asset_id,
-            toStartOfMinute(source_ts) as minute,
-            count() as raw_count
-          FROM ${getTable("OB_BBO")}
-          WHERE source_ts >= now() - INTERVAL 1 HOUR
-            AND source_ts < now() - INTERVAL 5 MINUTE
-          GROUP BY asset_id, minute
-          LIMIT 100
-        ),
-        mv_counts AS (
-          SELECT
-            asset_id,
-            minute,
-            finalizeAggregation(tick_count_state) as mv_count
-          FROM trading_data.mv_ob_bbo_1m
-          WHERE minute >= now() - INTERVAL 1 HOUR
-            AND minute < now() - INTERVAL 5 MINUTE
-        )
-        SELECT
-          count() as total_minutes,
-          countIf(r.raw_count != m.mv_count) as mismatches
-        FROM raw_counts r
-        JOIN mv_counts m ON r.asset_id = m.asset_id AND r.minute = m.minute
-      `;
-
-      try {
-        const result = await executeQuery<{
-          total_minutes: string;
-          mismatches: string;
-        }>(config, query);
-
-        const total = Number(result.data[0].total_minutes);
-        const mismatches = Number(result.data[0].mismatches);
-
-        validationResults.push({
-          passed: mismatches === 0,
-          test: "MV tick_count matches raw data",
-          message:
-            mismatches === 0
-              ? `All ${total} minute windows have correct tick_count`
-              : `${mismatches}/${total} windows have tick_count mismatch`,
-          sampleSize: total,
-        });
-
-        if (mismatches > 0) {
-          console.log(`\nMaterialized view tick_count mismatches found: ${mismatches}`);
-        }
-      } catch (error) {
-        // MV may not exist or may have different structure
-        console.log(`\nSkipping MV test: ${(error as Error).message}`);
-        validationResults.push({
-          passed: true,
-          test: "MV tick_count matches raw data",
-          message: "Skipped - MV may not be available",
-        });
-      }
-    });
-  });
+  // Note: Materialized View Consistency tests removed
+  // OHLC MVs (mv_ob_bbo_1m, mv_ob_bbo_5m) were removed for cost reduction
+  // Raw ob_bbo data is retained for 365 days and can be used for on-demand OHLC computation
 
   describe("Temporal Consistency", () => {
     it("should have ingestion_ts >= source_ts (minimal time travel)", async () => {

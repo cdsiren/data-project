@@ -83,18 +83,6 @@ export interface TriggerEvent {
 }
 
 /**
- * OHLC candle data for chart
- */
-export interface OHLCData {
-  time: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume?: number;
-}
-
-/**
  * Top activity market response
  */
 export interface TopMarket {
@@ -102,16 +90,6 @@ export interface TopMarket {
   condition_id: string;
   tick_count: number;
   question?: string;
-}
-
-/**
- * OHLC API response
- */
-export interface OHLCResponse {
-  data: OHLCData[];
-  asset_id: string;
-  interval: string;
-  hours: number;
 }
 
 /**

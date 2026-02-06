@@ -987,137 +987,10 @@ app.post("/admin/migrate", authMiddleware, async (c) => {
     ) ENGINE = ReplacingMergeTree() ORDER BY (event_id, market_id)`,
   ];
 
-  // Materialized views for OHLC aggregation (run after base tables)
-  const materializedViews = [
-    // 1-minute OHLC bars - primary for strategy backtesting (180-day retention)
-    `CREATE MATERIALIZED VIEW IF NOT EXISTS ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
-    ENGINE = AggregatingMergeTree()
-    PARTITION BY toYYYYMM(minute)
-    ORDER BY (asset_id, minute)
-    TTL minute + INTERVAL 180 DAY DELETE
-    SETTINGS index_granularity = 8192
-    AS SELECT
-      asset_id,
-      condition_id,
-      toStartOfMinute(source_ts) AS minute,
-      argMinState(best_bid, source_ts) AS open_bid_state,
-      maxState(best_bid) AS high_bid_state,
-      minState(best_bid) AS low_bid_state,
-      argMaxState(best_bid, source_ts) AS close_bid_state,
-      argMinState(best_ask, source_ts) AS open_ask_state,
-      maxState(best_ask) AS high_ask_state,
-      minState(best_ask) AS low_ask_state,
-      argMaxState(best_ask, source_ts) AS close_ask_state,
-      sumState(mid_price * (bid_size + ask_size)) AS sum_price_volume_state,
-      sumState(bid_size + ask_size) AS sum_volume_state,
-      avgState(spread_bps) AS avg_spread_bps_state,
-      minState(spread_bps) AS min_spread_bps_state,
-      maxState(spread_bps) AS max_spread_bps_state,
-      avgState(bid_size) AS avg_bid_size_state,
-      avgState(ask_size) AS avg_ask_size_state,
-      sumState(bid_size) AS total_bid_size_state,
-      sumState(ask_size) AS total_ask_size_state,
-      avgState(if(bid_size + ask_size > 0, (bid_size - ask_size) / (bid_size + ask_size), 0)) AS avg_imbalance_state,
-      countState() AS tick_count_state,
-      minState(source_ts) AS first_ts_state,
-      maxState(source_ts) AS last_ts_state,
-      argMinState(book_hash, source_ts) AS first_hash_state,
-      argMaxState(book_hash, source_ts) AS last_hash_state,
-      minState(sequence_number) AS sequence_start_state,
-      maxState(sequence_number) AS sequence_end_state
-    FROM ${DB_CONFIG.DATABASE}.ob_bbo
-    WHERE best_bid > 0 AND best_ask > 0
-    GROUP BY asset_id, condition_id, minute`,
-
-    // 5-minute OHLC bars - longer-term analysis (365-day retention)
-    `CREATE MATERIALIZED VIEW IF NOT EXISTS ${DB_CONFIG.DATABASE}.mv_ob_bbo_5m
-    ENGINE = AggregatingMergeTree()
-    PARTITION BY toYYYYMM(interval_5m)
-    ORDER BY (asset_id, interval_5m)
-    TTL interval_5m + INTERVAL 365 DAY DELETE
-    SETTINGS index_granularity = 8192
-    AS SELECT
-      asset_id,
-      condition_id,
-      toStartOfFiveMinutes(source_ts) AS interval_5m,
-      argMinState(best_bid, source_ts) AS open_bid_state,
-      maxState(best_bid) AS high_bid_state,
-      minState(best_bid) AS low_bid_state,
-      argMaxState(best_bid, source_ts) AS close_bid_state,
-      argMinState(best_ask, source_ts) AS open_ask_state,
-      maxState(best_ask) AS high_ask_state,
-      minState(best_ask) AS low_ask_state,
-      argMaxState(best_ask, source_ts) AS close_ask_state,
-      sumState(mid_price * (bid_size + ask_size)) AS sum_price_volume_state,
-      sumState(bid_size + ask_size) AS sum_volume_state,
-      avgState(spread_bps) AS avg_spread_bps_state,
-      minState(spread_bps) AS min_spread_bps_state,
-      maxState(spread_bps) AS max_spread_bps_state,
-      avgState(bid_size) AS avg_bid_size_state,
-      avgState(ask_size) AS avg_ask_size_state,
-      avgState(if(bid_size + ask_size > 0, (bid_size - ask_size) / (bid_size + ask_size), 0)) AS avg_imbalance_state,
-      countState() AS tick_count_state,
-      minState(source_ts) AS first_ts_state,
-      maxState(source_ts) AS last_ts_state,
-      argMinState(book_hash, source_ts) AS first_hash_state,
-      argMaxState(book_hash, source_ts) AS last_hash_state
-    FROM ${DB_CONFIG.DATABASE}.ob_bbo
-    WHERE best_bid > 0 AND best_ask > 0
-    GROUP BY asset_id, condition_id, interval_5m`,
-  ];
-
-  // Helper views for easy querying (apply Merge functions automatically)
-  const helperViews = [
-    `CREATE VIEW IF NOT EXISTS ${DB_CONFIG.DATABASE}.v_ob_bbo_1m AS
-    SELECT
-      asset_id, condition_id, minute,
-      argMinMerge(open_bid_state) AS open_bid,
-      maxMerge(high_bid_state) AS high_bid,
-      minMerge(low_bid_state) AS low_bid,
-      argMaxMerge(close_bid_state) AS close_bid,
-      argMinMerge(open_ask_state) AS open_ask,
-      maxMerge(high_ask_state) AS high_ask,
-      minMerge(low_ask_state) AS low_ask,
-      argMaxMerge(close_ask_state) AS close_ask,
-      (argMinMerge(open_bid_state) + argMinMerge(open_ask_state)) / 2 AS open_mid,
-      (argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2 AS close_mid,
-      if(sumMerge(sum_volume_state) > 0, sumMerge(sum_price_volume_state) / sumMerge(sum_volume_state), (argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2) AS vwap_mid,
-      avgMerge(avg_spread_bps_state) AS avg_spread_bps,
-      minMerge(min_spread_bps_state) AS min_spread_bps,
-      maxMerge(max_spread_bps_state) AS max_spread_bps,
-      avgMerge(avg_bid_size_state) AS avg_bid_size,
-      avgMerge(avg_ask_size_state) AS avg_ask_size,
-      sumMerge(total_bid_size_state) AS total_bid_volume,
-      sumMerge(total_ask_size_state) AS total_ask_volume,
-      avgMerge(avg_imbalance_state) AS avg_imbalance,
-      countMerge(tick_count_state) AS tick_count,
-      minMerge(first_ts_state) AS first_ts,
-      maxMerge(last_ts_state) AS last_ts
-    FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
-    GROUP BY asset_id, condition_id, minute`,
-
-    `CREATE VIEW IF NOT EXISTS ${DB_CONFIG.DATABASE}.v_ob_bbo_5m AS
-    SELECT
-      asset_id, condition_id, interval_5m,
-      argMinMerge(open_bid_state) AS open_bid,
-      maxMerge(high_bid_state) AS high_bid,
-      minMerge(low_bid_state) AS low_bid,
-      argMaxMerge(close_bid_state) AS close_bid,
-      argMinMerge(open_ask_state) AS open_ask,
-      maxMerge(high_ask_state) AS high_ask,
-      minMerge(low_ask_state) AS low_ask,
-      argMaxMerge(close_ask_state) AS close_ask,
-      (argMinMerge(open_bid_state) + argMinMerge(open_ask_state)) / 2 AS open_mid,
-      (argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2 AS close_mid,
-      if(sumMerge(sum_volume_state) > 0, sumMerge(sum_price_volume_state) / sumMerge(sum_volume_state), (argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2) AS vwap_mid,
-      avgMerge(avg_spread_bps_state) AS avg_spread_bps,
-      avgMerge(avg_bid_size_state) AS avg_bid_size,
-      avgMerge(avg_ask_size_state) AS avg_ask_size,
-      avgMerge(avg_imbalance_state) AS avg_imbalance,
-      countMerge(tick_count_state) AS tick_count
-    FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_5m
-    GROUP BY asset_id, condition_id, interval_5m`,
-  ];
+  // Note: OHLC materialized views (mv_ob_bbo_1m, mv_ob_bbo_5m) removed for cost reduction
+  // Raw ob_bbo data is retained for 365 days and can be used for on-demand OHLC computation
+  const materializedViews: string[] = [];
+  const helperViews: string[] = [];
 
   const results: Array<{ statement: string; status: string; error?: string }> =
     [];
@@ -1857,10 +1730,10 @@ legacyDashboardApi.get("/markets", async (c) => {
         asset_id,
         market_source,
         market_type,
-        countMerge(tick_count_state) as tick_count,
-        maxMerge(last_ts_state) as last_tick
-      FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
-      WHERE minute >= now() - INTERVAL 24 HOUR
+        count() as tick_count,
+        max(source_ts) as last_tick
+      FROM ${DB_CONFIG.DATABASE}.ob_bbo
+      WHERE source_ts >= now() - INTERVAL 24 HOUR
       GROUP BY asset_id, market_source, market_type
     ),
     tokens AS (
@@ -1964,82 +1837,6 @@ legacyDashboardApi.get("/markets", async (c) => {
   } catch (error) {
     console.error("[markets] Error:", error);
     return c.json({ error: "Failed to query markets", details: String(error) }, 500);
-  }
-});
-
-// OHLC Endpoint - Candlestick data for charting
-legacyDashboardApi.get("/ohlc/:asset_id", async (c) => {
-  const assetId = c.req.param("asset_id");
-  const interval = c.req.query("interval") || "1m";
-  const hours = parseInt(c.req.query("hours") || "24");
-
-  if (!c.env.CLICKHOUSE_URL) {
-    return c.json({ error: "CLICKHOUSE_URL not configured" }, 503);
-  }
-
-  const headers = {
-    "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
-    "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
-  };
-
-  // For 1-minute intervals, use the 1m materialized view
-  // For larger intervals, we'd aggregate from 1m bars
-  // Filter by the hours parameter to only return recent data
-  const query = interval === "1m"
-    ? `
-      SELECT
-        toUnixTimestamp(minute) * 1000 as time,
-        toFloat64((argMinMerge(open_bid_state) + argMinMerge(open_ask_state)) / 2) as open,
-        toFloat64(greatest(maxMerge(high_bid_state), maxMerge(high_ask_state))) as high,
-        toFloat64(least(minMerge(low_bid_state), minMerge(low_ask_state))) as low,
-        toFloat64((argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2) as close,
-        toUInt64(countMerge(tick_count_state)) as volume
-      FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
-      WHERE asset_id = '${assetId}'
-        AND minute >= now() - INTERVAL ${hours} HOUR
-      GROUP BY minute
-      ORDER BY minute ASC
-      FORMAT JSON
-    `
-    : `
-      SELECT
-        toUnixTimestamp(toStartOfFiveMinutes(minute)) * 1000 as time,
-        toFloat64(argMin((argMinMerge(open_bid_state) + argMinMerge(open_ask_state)) / 2, minute)) as open,
-        toFloat64(max(greatest(maxMerge(high_bid_state), maxMerge(high_ask_state)))) as high,
-        toFloat64(min(least(minMerge(low_bid_state), minMerge(low_ask_state)))) as low,
-        toFloat64(argMax((argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2, minute)) as close,
-        toUInt64(sum(countMerge(tick_count_state))) as volume
-      FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
-      WHERE asset_id = '${assetId}'
-        AND minute >= now() - INTERVAL ${hours} HOUR
-      GROUP BY toStartOfFiveMinutes(minute)
-      ORDER BY time ASC
-      FORMAT JSON
-    `;
-
-  try {
-    const response = await fetch(
-      `${c.env.CLICKHOUSE_URL}/?query=${encodeURIComponent(query)}`,
-      { headers }
-    );
-
-    if (!response.ok) {
-      const error = await response.text();
-      return c.json({ error: "ClickHouse query failed", details: error }, 500);
-    }
-
-    const result = await response.json() as {
-      data: Array<{ time: number; open: number; high: number; low: number; close: number; volume: number }>
-    };
-
-    return c.json({
-      data: result.data,
-      asset_id: assetId,
-      interval,
-      hours,
-    });
-  } catch (error) {
-    return c.json({ error: "Failed to query OHLC", details: String(error) }, 500);
   }
 });
 

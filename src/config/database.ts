@@ -27,14 +27,9 @@ export const DB_CONFIG = {
     OB_BBO: "ob_bbo",
     OB_LEVEL_CHANGES: "ob_level_changes",
     DEAD_LETTER: "dead_letter_messages",
-    // Materialized views
-    MV_BBO_1M: "mv_ob_bbo_1m",
-    MV_BBO_5M: "mv_ob_bbo_5m",
+    // Materialized views (operational)
     MV_HOURLY_STATS: "mv_ob_hourly_stats",
     MV_LATENCY_HOURLY: "mv_ob_latency_hourly",
-    // Helper views
-    V_BBO_1M: "v_ob_bbo_1m",
-    V_BBO_5M: "v_ob_bbo_5m",
   },
 } as const;
 

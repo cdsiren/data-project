@@ -71,25 +71,26 @@ backtest.get("/export/backtest", async (c) => {
   };
 
   // Build query based on granularity
+  // Note: OHLC aggregation is now computed on-demand from raw ob_bbo data
   const query = granularity === "ohlc"
     ? `
       SELECT
-        toUnixTimestamp(minute) * 1000 AS time,
-        toFloat64(argMinMerge(open_bid_state)) AS open_bid,
-        toFloat64(argMaxMerge(close_bid_state)) AS close_bid,
-        toFloat64(argMinMerge(open_ask_state)) AS open_ask,
-        toFloat64(argMaxMerge(close_ask_state)) AS close_ask,
-        toFloat64((argMinMerge(open_bid_state) + argMinMerge(open_ask_state)) / 2) AS open_mid,
-        toFloat64((argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2) AS close_mid,
-        toFloat64(avgMerge(avg_spread_bps_state)) AS avg_spread_bps,
-        toUInt64(countMerge(tick_count_state)) AS tick_count,
-        minMerge(sequence_start_state) AS sequence_start,
-        maxMerge(sequence_end_state) AS sequence_end
-      FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
+        toUnixTimestamp(toStartOfMinute(source_ts)) * 1000 AS time,
+        toFloat64(argMin(best_bid, source_ts)) AS open_bid,
+        toFloat64(argMax(best_bid, source_ts)) AS close_bid,
+        toFloat64(argMin(best_ask, source_ts)) AS open_ask,
+        toFloat64(argMax(best_ask, source_ts)) AS close_ask,
+        toFloat64((argMin(best_bid, source_ts) + argMin(best_ask, source_ts)) / 2) AS open_mid,
+        toFloat64((argMax(best_bid, source_ts) + argMax(best_ask, source_ts)) / 2) AS close_mid,
+        toFloat64(avg(spread_bps)) AS avg_spread_bps,
+        toUInt64(count()) AS tick_count,
+        min(sequence_number) AS sequence_start,
+        max(sequence_number) AS sequence_end
+      FROM ${DB_CONFIG.DATABASE}.ob_bbo
       WHERE asset_id = {asset_id:String}
-        AND minute BETWEEN parseDateTimeBestEffort({start:String}) AND parseDateTimeBestEffort({end:String})
-      GROUP BY minute
-      ORDER BY minute ASC
+        AND source_ts BETWEEN parseDateTimeBestEffort({start:String}) AND parseDateTimeBestEffort({end:String})
+      GROUP BY toStartOfMinute(source_ts)
+      ORDER BY time ASC
       LIMIT ${limit}
       FORMAT JSON
     `

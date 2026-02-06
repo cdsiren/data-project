@@ -12,7 +12,6 @@ import {
   MarketSearchQuerySchema,
   AssetIdParamSchema,
 } from "../schemas/markets";
-import { OHLCQuerySchema } from "../schemas/ohlc";
 import {
   ClickHouseError,
   MarketNotFoundError,
@@ -109,7 +108,6 @@ All endpoints require an API key via the \`X-API-Key\` header.
   tags: [
     { name: "Markets", description: "Market metadata and search" },
     { name: "Orderbook", description: "Real-time orderbook data" },
-    { name: "OHLC", description: "Candlestick/chart data" },
     { name: "Triggers", description: "Price alert triggers" },
     { name: "Backtest", description: "Historical data export" },
   ],
@@ -247,40 +245,6 @@ All endpoints require an API key via the \`X-API-Key\` header.
         },
       },
     },
-    "/ohlc/{asset_id}": {
-      get: {
-        tags: ["OHLC"],
-        summary: "Get OHLC candlestick data",
-        parameters: [
-          {
-            name: "asset_id",
-            in: "path",
-            required: true,
-            schema: { type: "string" },
-          },
-          {
-            name: "interval",
-            in: "query",
-            schema: { type: "string", enum: ["1m", "5m"], default: "1m" },
-          },
-          {
-            name: "hours",
-            in: "query",
-            schema: { type: "integer", default: 24, maximum: 720 },
-          },
-        ],
-        responses: {
-          "200": {
-            description: "OHLC data",
-            content: {
-              "application/json": {
-                schema: { $ref: "#/components/schemas/OHLCResponse" },
-              },
-            },
-          },
-        },
-      },
-    },
   },
   components: {
     schemas: {
@@ -354,26 +318,6 @@ All endpoints require an API key via the \`X-API-Key\` header.
         properties: {
           price: { type: "number" },
           size: { type: "number" },
-        },
-      },
-      OHLCResponse: {
-        type: "object",
-        properties: {
-          data: { type: "array", items: { $ref: "#/components/schemas/OHLCCandle" } },
-          asset_id: { type: "string" },
-          interval: { type: "string" },
-          hours: { type: "integer" },
-        },
-      },
-      OHLCCandle: {
-        type: "object",
-        properties: {
-          time: { type: "integer", description: "Unix timestamp in milliseconds" },
-          open: { type: "number" },
-          high: { type: "number" },
-          low: { type: "number" },
-          close: { type: "number" },
-          volume: { type: "integer" },
         },
       },
       Pagination: {
@@ -498,10 +442,10 @@ apiV1.get(
           asset_id,
           market_source,
           market_type,
-          countMerge(tick_count_state) as tick_count,
-          maxMerge(last_ts_state) as last_tick
-        FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
-        WHERE minute >= now() - INTERVAL 24 HOUR
+          count() as tick_count,
+          max(source_ts) as last_tick
+        FROM ${DB_CONFIG.DATABASE}.ob_bbo
+        WHERE source_ts >= now() - INTERVAL 24 HOUR
         GROUP BY asset_id, market_source, market_type
       ),
       tokens AS (
@@ -706,10 +650,10 @@ apiV1.get("/markets/top-activity", async (c) => {
       t.question,
       replaceAll(t.token, '"', '') as asset_id,
       b.condition_id,
-      countMerge(b.tick_count_state) as tick_count
+      count() as tick_count
     FROM tokens t
-    INNER JOIN ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m b ON replaceAll(t.token, '"', '') = b.asset_id
-    WHERE b.minute >= now() - INTERVAL 10 MINUTE
+    INNER JOIN ${DB_CONFIG.DATABASE}.ob_bbo b ON replaceAll(t.token, '"', '') = b.asset_id
+    WHERE b.source_ts >= now() - INTERVAL 10 MINUTE
     GROUP BY t.question, asset_id, b.condition_id
     ORDER BY tick_count DESC
     LIMIT 1
@@ -812,12 +756,12 @@ apiV1.get(
     // Get 24h stats
     const statsQuery = `
       SELECT
-        countMerge(tick_count_state) as tick_count,
-        max(maxMerge(high_bid_state)) as high,
-        min(minMerge(low_bid_state)) as low
-      FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
+        count() as tick_count,
+        max(best_bid) as high,
+        min(best_bid) as low
+      FROM ${DB_CONFIG.DATABASE}.ob_bbo
       WHERE asset_id = '${escapedAssetId}'
-        AND minute >= now() - INTERVAL 24 HOUR
+        AND source_ts >= now() - INTERVAL 24 HOUR
       FORMAT JSON
     `;
 
@@ -977,104 +921,6 @@ apiV1.get(
       asks: data.asks,
       spread_bps: Math.round(spreadBps),
       mid_price: midPrice,
-    });
-  }
-);
-
-// ============================================================
-// OHLC Routes
-// ============================================================
-
-apiV1.get(
-  "/ohlc/:asset_id",
-  zValidator("param", AssetIdParamSchema, (result, c) => {
-    if (!result.success) {
-      throw new InvalidFieldError("asset_id", result.error.issues, "valid asset ID");
-    }
-  }),
-  zValidator("query", OHLCQuerySchema, (result, c) => {
-    if (!result.success) {
-      throw new InvalidFieldError("query", result.error.issues, "valid query parameters");
-    }
-  }),
-  async (c) => {
-    requireClickHouse(c.env);
-
-    const { asset_id } = c.req.valid("param");
-    const { interval, hours } = c.req.valid("query");
-    const headers = getClickHouseHeaders(c.env);
-
-    // Validate asset ID format
-    if (!isValidAssetId(asset_id)) {
-      throw new InvalidFieldError(
-        "asset_id",
-        asset_id,
-        "hexadecimal string (16-128 characters)"
-      );
-    }
-
-    const escapedAssetId = escapeClickHouseString(asset_id);
-
-    const query =
-      interval === "1m"
-        ? `
-        SELECT
-          toUnixTimestamp(minute) * 1000 as time,
-          toFloat64((argMinMerge(open_bid_state) + argMinMerge(open_ask_state)) / 2) as open,
-          toFloat64(greatest(maxMerge(high_bid_state), maxMerge(high_ask_state))) as high,
-          toFloat64(least(minMerge(low_bid_state), minMerge(low_ask_state))) as low,
-          toFloat64((argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2) as close,
-          toUInt64(countMerge(tick_count_state)) as volume
-        FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
-        WHERE asset_id = '${escapedAssetId}'
-          AND minute >= now() - INTERVAL ${hours} HOUR
-        GROUP BY minute
-        ORDER BY minute ASC
-        FORMAT JSON
-      `
-        : `
-        SELECT
-          toUnixTimestamp(toStartOfFiveMinutes(minute)) * 1000 as time,
-          toFloat64(argMin((argMinMerge(open_bid_state) + argMinMerge(open_ask_state)) / 2, minute)) as open,
-          toFloat64(max(greatest(maxMerge(high_bid_state), maxMerge(high_ask_state)))) as high,
-          toFloat64(min(least(minMerge(low_bid_state), minMerge(low_ask_state)))) as low,
-          toFloat64(argMax((argMaxMerge(close_bid_state) + argMaxMerge(close_ask_state)) / 2, minute)) as close,
-          toUInt64(sum(countMerge(tick_count_state))) as volume
-        FROM ${DB_CONFIG.DATABASE}.mv_ob_bbo_1m
-        WHERE asset_id = '${escapedAssetId}'
-          AND minute >= now() - INTERVAL ${hours} HOUR
-        GROUP BY toStartOfFiveMinutes(minute)
-        ORDER BY time ASC
-        FORMAT JSON
-      `;
-
-    const response = await fetchWithTimeout(
-      `${c.env.CLICKHOUSE_URL}/?query=${encodeURIComponent(query)}`,
-      { headers },
-      QUERY_TIMEOUT_MS
-    );
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new ClickHouseError("OHLC query failed", query, error);
-    }
-
-    const result = (await response.json()) as {
-      data: Array<{
-        time: number;
-        open: number;
-        high: number;
-        low: number;
-        close: number;
-        volume: number;
-      }>;
-    };
-
-    return c.json({
-      data: result.data,
-      asset_id,
-      interval,
-      hours,
     });
   }
 );
