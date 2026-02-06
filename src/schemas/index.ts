@@ -55,16 +55,6 @@ export {
   TriggerEventSchema,
 } from "./triggers";
 
-// OHLC schemas
-export {
-  OHLCIntervalSchema,
-  OHLCQuerySchema,
-  OHLCCandleSchema,
-  OHLCResponseSchema,
-  OHLCExtendedCandleSchema,
-  OHLCExtendedResponseSchema,
-} from "./ohlc";
-
 // Backtest schemas
 export {
   BacktestGranularitySchema,

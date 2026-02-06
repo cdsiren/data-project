@@ -8,15 +8,15 @@ import { DB_CONFIG } from "../config/database";
  * Adjust these values to tune latency vs throughput trade-offs.
  */
 export const ASYNC_INSERT_CONFIG = {
-  /** Low-latency profile: flush quickly for data freshness */
+  /** Low-latency profile: larger batches reduce part creation and merge overhead */
   LOW_LATENCY: {
-    busy_timeout_ms: 10000,    // 10s - flush frequently
-    stale_timeout_ms: 10000,   // 10s - don't wait for full buffer
+    busy_timeout_ms: 30000,    // 30s - balance latency vs merge reduction
+    stale_timeout_ms: 30000,   // 30s - accumulate larger batches
   },
-  /** Batch-optimized profile: accumulate larger batches for efficiency */
+  /** Batch-optimized profile: maximize batching for bulk operations */
   BATCH_OPTIMIZED: {
-    busy_timeout_ms: 30000,    // 30s - larger batches
-    stale_timeout_ms: 30000,   // 30s - balance freshness vs throughput
+    busy_timeout_ms: 60000,    // 60s - larger batches for efficiency
+    stale_timeout_ms: 60000,   // 60s - reduce part creation
   },
   /** Maximum data size per async insert batch */
   max_data_size: 52428800,     // 50MB - reduce merge operations
