@@ -141,12 +141,3 @@ const REGIONAL_BUFFER_NAMES = ["buffer-enam", "buffer-wnam", "buffer-weur", "buf
 export function getAllRegionalBufferNames(): readonly string[] {
   return REGIONAL_BUFFER_NAMES;
 }
-
-/**
- * Get the buffer name for a specific region
- * @param region The regional location
- * @returns The buffer identifier string
- */
-export function getRegionalBufferName(region: RegionalBufferLocation): string {
-  return `buffer-${region}`;
-}

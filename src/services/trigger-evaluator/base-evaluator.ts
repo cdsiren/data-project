@@ -78,7 +78,6 @@ export abstract class BaseTriggerEvaluator implements ITriggerEvaluator {
       best_ask: snapshot.best_ask,
       bid_size: snapshot.bid_size,
       ask_size: snapshot.ask_size,
-      mid_price: snapshot.mid_price,
       spread_bps: snapshot.spread_bps,
       threshold: trigger.condition.threshold,
       actual_value: actualValue,
@@ -276,7 +275,8 @@ export class GenericTriggerEvaluator extends BaseTriggerEvaluator {
     window_ms: number | undefined,
     context: TriggerContext
   ): TriggerEvaluationResult {
-    if (snapshot.mid_price === null || !window_ms) {
+    // Use best_bid as reference price since mid_price was removed
+    if (snapshot.best_bid === null || !window_ms) {
       return this.notFired();
     }
 
@@ -298,9 +298,9 @@ export class GenericTriggerEvaluator extends BaseTriggerEvaluator {
       }
     }
 
-    if (baselineEntry && baselineEntry.mid_price > 0) {
+    if (baselineEntry && baselineEntry.price > 0) {
       const pctChange =
-        Math.abs((snapshot.mid_price - baselineEntry.mid_price) / baselineEntry.mid_price) * 100;
+        Math.abs((snapshot.best_bid - baselineEntry.price) / baselineEntry.price) * 100;
       if (pctChange >= threshold) {
         return this.fired(this.createTriggerEvent(trigger, snapshot, pctChange));
       }
@@ -366,12 +366,13 @@ export function updatePriceHistory(
   maxAgeMs: number = 60000,
   maxEntries: number = 1000
 ): PriceHistoryEntry[] {
-  if (snapshot.mid_price === null) {
+  // Use best_bid as reference price since mid_price was removed
+  if (snapshot.best_bid === null) {
     return history;
   }
 
   // Add new entry (mutates in place for better performance)
-  history.push({ ts: snapshot.source_ts, mid_price: snapshot.mid_price });
+  history.push({ ts: snapshot.source_ts, price: snapshot.best_bid });
 
   // Calculate cutoff once, reuse below
   const cutoffUs = snapshot.source_ts - (maxAgeMs * 1000);

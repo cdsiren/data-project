@@ -32,13 +32,6 @@ export type ConditionId = Brand<string, "ConditionId">;
 export type TriggerId = Brand<string, "TriggerId">;
 
 /**
- * Instrument Key - scoped identifier combining market source and asset ID
- * Format: "{market_source}:{asset_id}"
- * Example: "polymarket:217426331..."
- */
-export type InstrumentKey = Brand<string, "InstrumentKey">;
-
-/**
  * Helper functions to create branded IDs
  */
 export function asAssetId(id: string): AssetId {
@@ -51,17 +44,6 @@ export function asConditionId(id: string): ConditionId {
 
 export function asTriggerId(id: string): TriggerId {
   return id as TriggerId;
-}
-
-export function asInstrumentKey(key: string): InstrumentKey {
-  return key as InstrumentKey;
-}
-
-/**
- * Type guard to check if a string is a valid instrument key format
- */
-export function isInstrumentKey(key: string): key is InstrumentKey {
-  return key.includes(":");
 }
 
 // ============================================================
@@ -80,11 +62,6 @@ export type MarketSource = "polymarket";
  * Future categories may include: "dex", "spot", "futures"
  */
 export type MarketType = "prediction";
-
-/**
- * Instrument types
- */
-export type InstrumentType = "BINARY_OPTION";
 
 /**
  * Order side (consistent across all markets)

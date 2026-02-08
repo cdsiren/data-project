@@ -38,79 +38,24 @@ describe("P0: Mathematical Consistency", () => {
   });
 
   describe("BBO Calculated Fields", () => {
-    it("should have mid_price = (best_bid + best_ask) / 2", async () => {
+    it("should have spread_bps = (best_ask - best_bid) / ((best_bid + best_ask) / 2) * 10000", async () => {
       if (!config) return;
 
-      // Check for mid_price calculation errors
-      // Allow for floating point tolerance
+      // Check spread_bps calculation
+      // spread_bps = (ask - bid) / mid * 10000, where mid = (bid + ask) / 2
       const query = `
         SELECT
           count() as total,
           countIf(
             best_bid > 0 AND best_ask > 0
-            AND abs(mid_price - (best_bid + best_ask) / 2) > 0.0001
-          ) as mismatches
-        FROM ${getTable("OB_BBO")}
-        WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
-          AND best_bid > 0
-          AND best_ask > 0
-      `;
-
-      const result = await executeQuery<{
-        total: string;
-        mismatches: string;
-      }>(config, query);
-
-      const total = Number(result.data[0].total);
-      const mismatches = Number(result.data[0].mismatches);
-
-      validationResults.push({
-        passed: mismatches === 0,
-        test: "mid_price = (best_bid + best_ask) / 2",
-        message:
-          mismatches === 0
-            ? `All ${total} records have correct mid_price`
-            : `${mismatches}/${total} records have incorrect mid_price`,
-        sampleSize: total,
-      });
-
-      if (mismatches > 0) {
-        // Get sample of mismatches
-        const sampleQuery = `
-          SELECT asset_id, best_bid, best_ask, mid_price,
-                 (best_bid + best_ask) / 2 as expected_mid
-          FROM ${getTable("OB_BBO")}
-          WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
-            AND best_bid > 0 AND best_ask > 0
-            AND abs(mid_price - (best_bid + best_ask) / 2) > 0.0001
-          LIMIT 5
-        `;
-        const sampleResult = await executeQuery(config, sampleQuery);
-        console.log(`\nMid-price mismatches:`, sampleResult.data);
-      }
-
-      expect(mismatches).toBe(0);
-    });
-
-    it("should have spread_bps = (best_ask - best_bid) / mid_price * 10000", async () => {
-      if (!config) return;
-
-      // Check spread_bps calculation
-      // spread_bps = (ask - bid) / mid * 10000
-      const query = `
-        SELECT
-          count() as total,
-          countIf(
-            best_bid > 0 AND best_ask > 0 AND mid_price > 0
             AND abs(
-              spread_bps - ((best_ask - best_bid) / mid_price * 10000)
+              spread_bps - ((best_ask - best_bid) / ((best_bid + best_ask) / 2) * 10000)
             ) > ${TEST_CONFIG.SPREAD_BPS_TOLERANCE}
           ) as mismatches
         FROM ${getTable("OB_BBO")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
           AND best_bid > 0
           AND best_ask > 0
-          AND mid_price > 0
       `;
 
       const result = await executeQuery<{
@@ -133,12 +78,12 @@ describe("P0: Mathematical Consistency", () => {
 
       if (mismatches > 0) {
         const sampleQuery = `
-          SELECT asset_id, best_bid, best_ask, mid_price, spread_bps,
-                 ((best_ask - best_bid) / mid_price * 10000) as expected_spread_bps
+          SELECT asset_id, best_bid, best_ask, spread_bps,
+                 ((best_ask - best_bid) / ((best_bid + best_ask) / 2) * 10000) as expected_spread_bps
           FROM ${getTable("OB_BBO")}
           WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
-            AND best_bid > 0 AND best_ask > 0 AND mid_price > 0
-            AND abs(spread_bps - ((best_ask - best_bid) / mid_price * 10000)) > ${TEST_CONFIG.SPREAD_BPS_TOLERANCE}
+            AND best_bid > 0 AND best_ask > 0
+            AND abs(spread_bps - ((best_ask - best_bid) / ((best_bid + best_ask) / 2) * 10000)) > ${TEST_CONFIG.SPREAD_BPS_TOLERANCE}
           LIMIT 5
         `;
         const sampleResult = await executeQuery(config, sampleQuery);
@@ -221,8 +166,7 @@ describe("P0: Mathematical Consistency", () => {
         SELECT
           count() as total,
           countIf(best_bid < 0 OR best_bid > 1) as invalid_bid,
-          countIf(best_ask < 0 OR best_ask > 1) as invalid_ask,
-          countIf(mid_price < 0 OR mid_price > 1) as invalid_mid
+          countIf(best_ask < 0 OR best_ask > 1) as invalid_ask
         FROM ${getTable("OB_BBO")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
           AND (best_bid != 0 OR best_ask != 0)
@@ -232,19 +176,16 @@ describe("P0: Mathematical Consistency", () => {
         total: string;
         invalid_bid: string;
         invalid_ask: string;
-        invalid_mid: string;
       }>(config, query);
 
       const total = Number(result.data[0].total);
       const invalidBid = Number(result.data[0].invalid_bid);
       const invalidAsk = Number(result.data[0].invalid_ask);
-      const invalidMid = Number(result.data[0].invalid_mid);
-      const totalInvalid = invalidBid + invalidAsk + invalidMid;
+      const totalInvalid = invalidBid + invalidAsk;
 
       console.log(`\nPrice range validation (n=${total}):`);
       console.log(`  Invalid bids (< 0 or > 1): ${invalidBid}`);
       console.log(`  Invalid asks (< 0 or > 1): ${invalidAsk}`);
-      console.log(`  Invalid mids (< 0 or > 1): ${invalidMid}`);
 
       validationResults.push({
         passed: totalInvalid === 0,
@@ -253,7 +194,7 @@ describe("P0: Mathematical Consistency", () => {
           totalInvalid === 0
             ? `All ${total} records have valid prices`
             : `${totalInvalid} records have out-of-range prices`,
-        actual: { invalidBid, invalidAsk, invalidMid },
+        actual: { invalidBid, invalidAsk },
         sampleSize: total,
       });
 

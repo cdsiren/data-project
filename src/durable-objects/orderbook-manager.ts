@@ -2300,9 +2300,6 @@ export class OrderbookManager extends DurableObject<Env> {
             best_ask: latestBBO?.best_ask ?? null,
             bid_size: null,
             ask_size: null,
-            mid_price: latestBBO?.best_bid && latestBBO?.best_ask
-              ? (latestBBO.best_bid + latestBBO.best_ask) / 2
-              : null,
             spread_bps: null,
 
             threshold: trigger.condition.threshold,
@@ -2935,7 +2932,6 @@ export class OrderbookManager extends DurableObject<Env> {
       best_ask: bestAsk,
       bid_size: bidSize,
       ask_size: askSize,
-      mid_price: midPrice,
       spread_bps: spreadBps,
       tick_size: tickSize,
       is_resync: false,
@@ -3347,13 +3343,14 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // Update price history for PRICE_MOVE triggers and VOLATILITY_SPIKE global trigger
     // Always track since global triggers need this data for volatility calculations
-    if (snapshot.mid_price !== null) {
+    // Uses best_bid as reference price since mid_price was removed
+    if (snapshot.best_bid !== null) {
       let history = this.priceHistory.get(snapshot.asset_id);
       if (!history) {
         history = [];
         this.priceHistory.set(snapshot.asset_id, history);
       }
-      history.push({ ts: snapshot.source_ts, mid_price: snapshot.mid_price });
+      history.push({ ts: snapshot.source_ts, price: snapshot.best_bid });
 
       // CRITICAL: Prune on EVERY update to prevent unbounded growth
       // Time-based (60s) + count-based (1000 entries) limits
@@ -3385,11 +3382,11 @@ export class OrderbookManager extends DurableObject<Env> {
       this.updateCounts.set(snapshot.asset_id, { count: 1, windowStartUs: snapshot.source_ts });
     }
 
-    // MID_PRICE_TREND: Track consecutive price moves
-    if (snapshot.mid_price !== null) {
+    // MID_PRICE_TREND: Track consecutive price moves (uses best_bid since mid_price was removed)
+    if (snapshot.best_bid !== null) {
       const trend = this.trendTracker.get(snapshot.asset_id);
       if (trend) {
-        if (snapshot.mid_price > trend.lastMid) {
+        if (snapshot.best_bid > trend.lastMid) {
           // Price went up
           if (trend.direction === "UP") {
             trend.consecutiveMoves++;
@@ -3397,7 +3394,7 @@ export class OrderbookManager extends DurableObject<Env> {
             trend.direction = "UP";
             trend.consecutiveMoves = 1;
           }
-        } else if (snapshot.mid_price < trend.lastMid) {
+        } else if (snapshot.best_bid < trend.lastMid) {
           // Price went down
           if (trend.direction === "DOWN") {
             trend.consecutiveMoves++;
@@ -3407,10 +3404,10 @@ export class OrderbookManager extends DurableObject<Env> {
           }
         }
         // If equal, keep current state
-        trend.lastMid = snapshot.mid_price;
+        trend.lastMid = snapshot.best_bid;
       } else {
         this.trendTracker.set(snapshot.asset_id, {
-          lastMid: snapshot.mid_price,
+          lastMid: snapshot.best_bid,
           consecutiveMoves: 0,
           direction: "UP", // Initial direction doesn't matter until we see movement
         });
@@ -3487,7 +3484,6 @@ export class OrderbookManager extends DurableObject<Env> {
             best_ask: snapshot.best_ask,
             bid_size: snapshot.bid_size,
             ask_size: snapshot.ask_size,
-            mid_price: snapshot.mid_price,
             spread_bps: snapshot.spread_bps,
 
             threshold: trigger.condition.threshold,
@@ -3682,7 +3678,8 @@ export class OrderbookManager extends DurableObject<Env> {
 
       case "PRICE_MOVE": {
         // Check if price moved threshold% within window_ms
-        if (snapshot.mid_price === null || !window_ms) break;
+        // Uses best_bid as reference price since mid_price was removed
+        if (snapshot.best_bid === null || !window_ms) break;
 
         const history = this.priceHistory.get(snapshot.asset_id);
         if (!history || history.length === 0) break;
@@ -3711,9 +3708,9 @@ export class OrderbookManager extends DurableObject<Env> {
           baselineEntry = history[firstValidIdx];
         }
 
-        if (baselineEntry && baselineEntry.mid_price > 0) {
+        if (baselineEntry && baselineEntry.price > 0) {
           const pctChange =
-            Math.abs((snapshot.mid_price - baselineEntry.mid_price) / baselineEntry.mid_price) * 100;
+            Math.abs((snapshot.best_bid - baselineEntry.price) / baselineEntry.price) * 100;
           if (pctChange >= threshold) {
             return { fired: true, actualValue: pctChange };
           }
@@ -3837,9 +3834,10 @@ export class OrderbookManager extends DurableObject<Env> {
       // ============================================================
 
       case "VOLATILITY_SPIKE": {
-        // Calculate rolling std dev of mid_price returns over window_ms
+        // Calculate rolling std dev of price returns over window_ms
         // AS model spread = 2/γ + γσ²(T-t) — when σ spikes, spreads should widen
-        if (snapshot.mid_price === null || !window_ms) break;
+        // Uses best_bid as reference price since mid_price was removed
+        if (snapshot.best_bid === null || !window_ms) break;
 
         const history = this.priceHistory.get(snapshot.asset_id);
         if (!history || history.length < 2) break;
@@ -3873,9 +3871,9 @@ export class OrderbookManager extends DurableObject<Env> {
         let m2 = 0; // Sum of squared differences from mean
 
         for (let i = startIdx + 1; i < history.length; i++) {
-          const prevPrice = history[i - 1].mid_price;
+          const prevPrice = history[i - 1].price;
           if (prevPrice > 0) {
-            const ret = (history[i].mid_price - prevPrice) / prevPrice;
+            const ret = (history[i].price - prevPrice) / prevPrice;
             count++;
             const delta = ret - mean;
             mean += delta / count;
@@ -3905,14 +3903,15 @@ export class OrderbookManager extends DurableObject<Env> {
         // Microprice = (best_bid × ask_size + best_ask × bid_size) / (bid_size + ask_size)
         // Better short-term price predictor than mid. Divergence signals directional momentum.
         if (snapshot.best_bid === null || snapshot.best_ask === null ||
-            snapshot.bid_size === null || snapshot.ask_size === null ||
-            snapshot.mid_price === null) break;
+            snapshot.bid_size === null || snapshot.ask_size === null) break;
 
         const totalSize = snapshot.bid_size + snapshot.ask_size;
         if (totalSize === 0) break;
 
         const microprice = (snapshot.best_bid * snapshot.ask_size + snapshot.best_ask * snapshot.bid_size) / totalSize;
-        const divergenceBps = Math.abs((microprice - snapshot.mid_price) / snapshot.mid_price) * 10000;
+        const midPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
+        if (midPrice === 0) break;
+        const divergenceBps = Math.abs((microprice - midPrice) / midPrice) * 10000;
 
         if (divergenceBps > threshold) {
           return {
@@ -4181,7 +4180,6 @@ export class OrderbookManager extends DurableObject<Env> {
         best_ask: snapshot.best_ask,
         bid_size: snapshot.bid_size,
         ask_size: snapshot.ask_size,
-        mid_price: snapshot.mid_price,
         spread_bps: snapshot.spread_bps,
 
         threshold,
@@ -4236,17 +4234,19 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // MICROPRICE_DIVERGENCE: Fire when divergence > 50 bps
     if (snapshot.best_bid !== null && snapshot.best_ask !== null &&
-        snapshot.bid_size !== null && snapshot.ask_size !== null &&
-        snapshot.mid_price !== null) {
+        snapshot.bid_size !== null && snapshot.ask_size !== null) {
       const totalSize = snapshot.bid_size + snapshot.ask_size;
       if (totalSize > 0) {
         const microprice = (snapshot.best_bid * snapshot.ask_size + snapshot.best_ask * snapshot.bid_size) / totalSize;
-        const divergenceBps = Math.abs((microprice - snapshot.mid_price) / snapshot.mid_price) * 10000;
-        if (divergenceBps > 50) {
-          maybeFireGlobal("MICROPRICE_DIVERGENCE", 50, divergenceBps, {
-            microprice,
-            microprice_divergence_bps: divergenceBps,
-          });
+        const midPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
+        if (midPrice > 0) {
+          const divergenceBps = Math.abs((microprice - midPrice) / midPrice) * 10000;
+          if (divergenceBps > 50) {
+            maybeFireGlobal("MICROPRICE_DIVERGENCE", 50, divergenceBps, {
+              microprice,
+              microprice_divergence_bps: divergenceBps,
+            });
+          }
         }
       }
     }
@@ -4302,7 +4302,8 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // VOLATILITY_SPIKE: Fire when volatility > 2% (checked with 10s window)
     // OPTIMIZED: Uses binary search + in-place variance calculation to avoid allocations
-    if (snapshot.mid_price !== null) {
+    // Uses best_bid as reference price since mid_price was removed
+    if (snapshot.best_bid !== null) {
       const history = this.priceHistory.get(assetId);
       if (history && history.length >= 5) {
         const windowStartUs = snapshot.source_ts - 10000000; // 10 second window
@@ -4329,9 +4330,9 @@ export class OrderbookManager extends DurableObject<Env> {
           let m2 = 0; // Sum of squared differences from mean
 
           for (let i = startIdx + 1; i < history.length; i++) {
-            const prevPrice = history[i - 1].mid_price;
+            const prevPrice = history[i - 1].price;
             if (prevPrice > 0) {
-              const ret = (history[i].mid_price - prevPrice) / prevPrice;
+              const ret = (history[i].price - prevPrice) / prevPrice;
               count++;
               const delta = ret - mean;
               mean += delta / count;

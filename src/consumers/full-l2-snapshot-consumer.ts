@@ -1,7 +1,7 @@
 // src/consumers/full-l2-snapshot-consumer.ts
 import type { Env } from "../types";
 import type { FullL2Snapshot } from "../types/orderbook";
-import { toClickHouseDateTime64, toClickHouseDateTime64Micro } from "../utils/datetime";
+import { toClickHouseDateTime64 } from "../utils/datetime";
 import { getFullTableName, getBatchMarketDefaults, normalizeMarketInfo } from "../config/database";
 import { insertRows, handleBatchResult } from "../services/clickhouse-utils";
 
@@ -26,7 +26,7 @@ export async function fullL2SnapshotConsumer(
       asset_id: m.body.asset_id,
       condition_id: m.body.condition_id,
       source_ts: toClickHouseDateTime64(m.body.source_ts),
-      ingestion_ts: toClickHouseDateTime64Micro(m.body.ingestion_ts),
+      ingestion_ts: toClickHouseDateTime64(m.body.ingestion_ts),
       book_hash: m.body.book_hash,
       bid_prices: m.body.bids.map(b => b.price),
       bid_sizes: m.body.bids.map(b => b.size),

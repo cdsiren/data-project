@@ -5,6 +5,96 @@ import type { Context, Next } from "hono";
 import type { Env } from "../types";
 import type { UserTier } from "../schemas/common";
 import { RateLimitError } from "../errors";
+import { getFullTableName } from "../config/database";
+import { toClickHouseDateTime64 } from "../utils/datetime";
+import { buildAsyncInsertUrl, buildClickHouseHeaders } from "../services/clickhouse-client";
+
+// ============================================================
+// Usage Event Logging
+// ============================================================
+
+/** Usage event row for ClickHouse */
+interface UsageEventRow {
+  api_key_hash: string;
+  tier: string;
+  endpoint: string;
+  rows_returned: number;
+  timestamp: string;
+  billing_cycle: string;
+}
+
+/** Buffer for batched usage event inserts */
+let usageEventBuffer: UsageEventRow[] = [];
+let usageFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Get current billing cycle (YYYY-MM format)
+ */
+function getBillingCycle(): string {
+  const now = new Date();
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+/**
+ * Log a usage event to the buffer (will be flushed to ClickHouse)
+ */
+export function logUsageEvent(
+  apiKeyHash: string,
+  tier: UserTier,
+  endpoint: string,
+  rowsReturned: number = 0
+): void {
+  usageEventBuffer.push({
+    api_key_hash: apiKeyHash,
+    tier,
+    endpoint,
+    rows_returned: rowsReturned,
+    timestamp: toClickHouseDateTime64(Date.now()),
+    billing_cycle: getBillingCycle(),
+  });
+
+  // Schedule flush if not already set (flush every 5 seconds)
+  if (!usageFlushTimer) {
+    usageFlushTimer = setTimeout(() => {
+      flushUsageEvents();
+    }, 5000);
+  }
+
+  // Flush immediately if buffer is large
+  if (usageEventBuffer.length >= 100) {
+    flushUsageEvents();
+  }
+}
+
+/**
+ * Flush usage events to ClickHouse
+ */
+async function flushUsageEvents(env?: Env): Promise<void> {
+  if (usageFlushTimer) {
+    clearTimeout(usageFlushTimer);
+    usageFlushTimer = null;
+  }
+
+  const buffer = usageEventBuffer;
+  if (buffer.length === 0) return;
+  usageEventBuffer = [];
+
+  // Need env to flush - store it from middleware context
+  if (!cachedEnv) return;
+
+  try {
+    const body = buffer.map((r) => JSON.stringify(r)).join("\n");
+    const url = buildAsyncInsertUrl(cachedEnv.CLICKHOUSE_URL, getFullTableName("USAGE_EVENTS"));
+    const headers = buildClickHouseHeaders(cachedEnv.CLICKHOUSE_USER, cachedEnv.CLICKHOUSE_TOKEN);
+
+    await fetch(url, { method: "POST", headers, body });
+  } catch (e) {
+    console.error("[UsageEvents] Flush failed:", e);
+  }
+}
+
+/** Cached env for async flushes */
+let cachedEnv: Env | null = null;
 
 // ============================================================
 // Rate Limit Configuration
@@ -119,6 +209,9 @@ export function rateLimiter(options?: {
   return async (c: Context<{ Bindings: Env }>, next: Next) => {
     const path = new URL(c.req.url).pathname;
 
+    // Cache env for async usage event flushes
+    cachedEnv = c.env;
+
     // Skip rate limiting for certain paths
     if (skipPaths.some((skip) => path.startsWith(skip))) {
       return next();
@@ -195,7 +288,12 @@ export function rateLimiter(options?: {
     c.header("X-RateLimit-Reset", String(Math.floor(reset / 1000)));
     c.header("X-RateLimit-Tier", tier);
 
-    return next();
+    // Execute the request handler
+    await next();
+
+    // Log usage event after request completes (fire-and-forget)
+    // Note: rows_returned is 0 here; can be enhanced by response handlers
+    logUsageEvent(apiKeyHash, tier, path, 0);
   };
 }
 

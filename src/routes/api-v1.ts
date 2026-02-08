@@ -310,7 +310,6 @@ All endpoints require an API key via the \`X-API-Key\` header.
           bids: { type: "array", items: { $ref: "#/components/schemas/PriceLevel" } },
           asks: { type: "array", items: { $ref: "#/components/schemas/PriceLevel" } },
           spread_bps: { type: "number", nullable: true },
-          mid_price: { type: "number", nullable: true },
         },
       },
       PriceLevel: {
@@ -744,7 +743,6 @@ apiV1.get(
       SELECT
         best_bid,
         best_ask,
-        (best_bid + best_ask) / 2 as mid_price,
         spread_bps
       FROM ${DB_CONFIG.DATABASE}.ob_bbo
       WHERE asset_id = '${escapedAssetId}'
@@ -805,7 +803,6 @@ apiV1.get(
         data: Array<{
           best_bid: number;
           best_ask: number;
-          mid_price: number;
           spread_bps: number;
         }>;
       };
@@ -814,7 +811,6 @@ apiV1.get(
         currentPrice = {
           bid: Number(bbo.best_bid),
           ask: Number(bbo.best_ask),
-          mid: Number(bbo.mid_price),
           spread_bps: Number(bbo.spread_bps),
         };
       }
@@ -899,7 +895,7 @@ apiV1.get(
     const bestBid = data.bids[0]?.price;
     const bestAsk = data.asks[0]?.price;
 
-    // If either side is missing, we can't calculate valid spread/mid
+    // If either side is missing, we can't calculate valid spread
     if (bestBid === undefined || bestAsk === undefined) {
       return c.json({
         asset_id: data.asset_id,
@@ -907,7 +903,6 @@ apiV1.get(
         bids: data.bids,
         asks: data.asks,
         spread_bps: null,
-        mid_price: null,
       });
     }
 
@@ -920,7 +915,6 @@ apiV1.get(
       bids: data.bids,
       asks: data.asks,
       spread_bps: Math.round(spreadBps),
-      mid_price: midPrice,
     });
   }
 );

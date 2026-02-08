@@ -101,7 +101,6 @@ backtest.get("/export/backtest", async (c) => {
         toFloat64(best_ask) AS best_ask,
         bid_size,
         ask_size,
-        toFloat64(mid_price) AS mid_price,
         spread_bps,
         book_hash,
         sequence_number

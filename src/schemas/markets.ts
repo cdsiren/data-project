@@ -86,7 +86,6 @@ export const OrderbookResponseSchema = z.object({
   bids: z.array(PriceLevelSchema),
   asks: z.array(PriceLevelSchema),
   spread_bps: z.number(),
-  mid_price: z.number(),
 });
 
 // ============================================================

@@ -197,7 +197,6 @@ describe("PolymarketConnector", () => {
         expect(result!.best_bid).toBeNull();
         expect(result!.bid_size).toBeNull();
         expect(result!.best_ask).toBe(0.55);
-        expect(result!.mid_price).toBeNull();
         expect(result!.spread_bps).toBeNull();
       });
 
@@ -218,7 +217,6 @@ describe("PolymarketConnector", () => {
         expect(result!.best_bid).toBe(0.45);
         expect(result!.best_ask).toBeNull();
         expect(result!.ask_size).toBeNull();
-        expect(result!.mid_price).toBeNull();
         expect(result!.spread_bps).toBeNull();
       });
 
@@ -240,7 +238,6 @@ describe("PolymarketConnector", () => {
         expect(result!.best_ask).toBeNull();
         expect(result!.bid_size).toBeNull();
         expect(result!.ask_size).toBeNull();
-        expect(result!.mid_price).toBeNull();
         expect(result!.spread_bps).toBeNull();
       });
     });
@@ -302,7 +299,6 @@ describe("PolymarketConnector", () => {
         expect(result!.best_bid).toBe(0.50);
         expect(result!.best_ask).toBe(0.50);
         expect(result!.spread_bps).toBe(0);
-        expect(result!.mid_price).toBe(0.50);
       });
     });
 
@@ -345,23 +341,7 @@ describe("PolymarketConnector", () => {
       });
     });
 
-    describe("spread and mid_price calculations", () => {
-      it("should calculate correct mid_price", () => {
-        const event: PolymarketBookEvent = {
-          event_type: "book",
-          asset_id: "test_asset",
-          market: "test_market",
-          bids: [{ price: "0.40", size: "100" }],
-          asks: [{ price: "0.60", size: "100" }],
-          timestamp: "1700000000000",
-          hash: "abc123",
-        };
-
-        const result = connector.normalizeBookEvent(event);
-
-        expect(result!.mid_price).toBe(0.50); // (0.40 + 0.60) / 2
-      });
-
+    describe("spread_bps calculations", () => {
       it("should calculate correct spread_bps", () => {
         const event: PolymarketBookEvent = {
           event_type: "book",

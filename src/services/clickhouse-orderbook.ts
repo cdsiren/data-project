@@ -1,6 +1,6 @@
 import type { Env } from "../types";
 import type { BBOSnapshot } from "../types/orderbook";
-import { toClickHouseDateTime64, toClickHouseDateTime64Micro } from "../utils/datetime";
+import { toClickHouseDateTime64, toClickHouseDateTime64_6 } from "../utils/datetime";
 import { getFullTableName, normalizeMarketInfo, getBatchMarketDefaults } from "../config/database";
 import { buildAsyncInsertUrl, buildClickHouseHeaders } from "./clickhouse-client";
 import { executeInsert, type InsertResult } from "./clickhouse-utils";
@@ -51,13 +51,12 @@ export class ClickHouseOrderbookClient {
         asset_id: s.asset_id,
         condition_id: s.condition_id,
         source_ts: toClickHouseDateTime64(s.source_ts),
-        ingestion_ts: toClickHouseDateTime64Micro(s.ingestion_ts),
+        ingestion_ts: toClickHouseDateTime64(s.ingestion_ts),
         book_hash: s.book_hash,
         best_bid: Number(s.best_bid ?? 0),
         best_ask: Number(s.best_ask ?? 0),
         bid_size: Number(s.bid_size ?? 0),
         ask_size: Number(s.ask_size ?? 0),
-        mid_price: Number(s.mid_price ?? 0),
         spread_bps: Number(s.spread_bps ?? 0),
         tick_size: Number(s.tick_size),
         is_resync: s.is_resync ? 1 : 0,
@@ -101,7 +100,7 @@ export class ClickHouseOrderbookClient {
         market_type: type,
         asset_id: m.assetId,
         source_ts: toClickHouseDateTime64(m.sourceTs),
-        ingestion_ts: toClickHouseDateTime64Micro(m.ingestionTs),
+        ingestion_ts: toClickHouseDateTime64_6(m.ingestionTs),
         event_type: m.eventType,
       };
     });
@@ -129,7 +128,7 @@ export class ClickHouseOrderbookClient {
       market_source: source,
       market_type: type,
       asset_id: assetId,
-      detected_at: toClickHouseDateTime64(Date.now()),
+      detected_at: toClickHouseDateTime64_6(Date.now()),
       last_known_hash: lastKnownHash,
       new_hash: newHash,
       gap_duration_ms: gapDurationMs,

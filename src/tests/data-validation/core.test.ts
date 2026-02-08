@@ -320,7 +320,7 @@ describe("P0: Critical Validation Tests", () => {
 
         // Get stored spread_bps
         const storedQuery = `
-          SELECT spread_bps, best_bid, best_ask, mid_price
+          SELECT spread_bps, best_bid, best_ask
           FROM ${getTable("OB_BBO")}
           WHERE asset_id = '${assetId}'
             AND best_bid > 0 AND best_ask > 0
@@ -332,7 +332,6 @@ describe("P0: Critical Validation Tests", () => {
           spread_bps: number;
           best_bid: number;
           best_ask: number;
-          mid_price: number;
         }>(config, storedQuery);
 
         if (storedResult.data.length === 0) {

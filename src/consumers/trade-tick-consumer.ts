@@ -1,7 +1,7 @@
 // src/consumers/trade-tick-consumer.ts
 import type { Env } from "../types";
 import type { TradeTick } from "../types/orderbook";
-import { toClickHouseDateTime64, toClickHouseDateTime64Micro } from "../utils/datetime";
+import { toClickHouseDateTime64 } from "../utils/datetime";
 import { getFullTableName, getBatchMarketDefaults, normalizeMarketInfo } from "../config/database";
 import { insertRows, handleBatchResult } from "../services/clickhouse-utils";
 
@@ -30,7 +30,7 @@ export async function tradeTickConsumer(
       size: m.body.size,
       side: m.body.side,
       source_ts: toClickHouseDateTime64(m.body.source_ts),
-      ingestion_ts: toClickHouseDateTime64Micro(m.body.ingestion_ts),
+      ingestion_ts: toClickHouseDateTime64(m.body.ingestion_ts),
     };
   });
 

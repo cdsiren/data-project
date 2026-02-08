@@ -32,20 +32,3 @@ export function getConnector(marketSource: string): MarketConnector {
   }
   return factory();
 }
-
-/**
- * Check if a market source is supported.
- * @param marketSource - Market source identifier
- * @returns true if supported
- */
-export function isMarketSupported(marketSource: string): boolean {
-  return marketSource in ADAPTERS;
-}
-
-/**
- * Get list of supported market sources.
- * @returns Array of supported market source identifiers
- */
-export function getSupportedMarkets(): string[] {
-  return Object.keys(ADAPTERS);
-}

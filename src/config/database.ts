@@ -27,6 +27,7 @@ export const DB_CONFIG = {
     OB_BBO: "ob_bbo",
     OB_LEVEL_CHANGES: "ob_level_changes",
     DEAD_LETTER: "dead_letter_messages",
+    USAGE_EVENTS: "usage_events",
     // Materialized views (operational)
     MV_HOURLY_STATS: "mv_ob_hourly_stats",
     MV_LATENCY_HOURLY: "mv_ob_latency_hourly",

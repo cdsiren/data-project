@@ -68,7 +68,6 @@ function createMockSnapshot(overrides: Partial<BBOSnapshot> = {}): BBOSnapshot {
     best_ask: 0.55,
     bid_size: 1000,
     ask_size: 1000,
-    mid_price: 0.50,
     spread_bps: 2000, // 20% spread (0.55 - 0.45) / 0.50 * 10000
     tick_size: 0.01,
     sequence_number: 1,
@@ -184,7 +183,8 @@ function evaluateTrigger(
     }
 
     case "PRICE_MOVE": {
-      if (snapshot.mid_price === null || !window_ms) break;
+      // Uses best_bid as reference price since mid_price was removed
+      if (snapshot.best_bid === null || !window_ms) break;
 
       const history = state.priceHistory.get(snapshot.asset_id);
       if (!history || history.length === 0) break;
@@ -198,8 +198,8 @@ function evaluateTrigger(
         }
       }
 
-      if (baselineEntry && baselineEntry.mid_price > 0) {
-        const pctChange = Math.abs((snapshot.mid_price - baselineEntry.mid_price) / baselineEntry.mid_price) * 100;
+      if (baselineEntry && baselineEntry.price > 0) {
+        const pctChange = Math.abs((snapshot.best_bid - baselineEntry.price) / baselineEntry.price) * 100;
         if (pctChange >= threshold) {
           return { fired: true, actualValue: pctChange };
         }
@@ -229,7 +229,8 @@ function evaluateTrigger(
 
     // HFT Triggers
     case "VOLATILITY_SPIKE": {
-      if (snapshot.mid_price === null || !window_ms) break;
+      // Uses best_bid as reference price since mid_price was removed
+      if (snapshot.best_bid === null || !window_ms) break;
 
       const history = state.priceHistory.get(snapshot.asset_id);
       if (!history || history.length < 2) break;
@@ -240,9 +241,9 @@ function evaluateTrigger(
 
       const returns: number[] = [];
       for (let i = 1; i < windowEntries.length; i++) {
-        const prevPrice = windowEntries[i - 1].mid_price;
+        const prevPrice = windowEntries[i - 1].price;
         if (prevPrice > 0) {
-          returns.push((windowEntries[i].mid_price - prevPrice) / prevPrice);
+          returns.push((windowEntries[i].price - prevPrice) / prevPrice);
         }
       }
 
@@ -266,15 +267,16 @@ function evaluateTrigger(
     case "MICROPRICE_DIVERGENCE": {
       if (
         snapshot.best_bid === null || snapshot.best_ask === null ||
-        snapshot.bid_size === null || snapshot.ask_size === null ||
-        snapshot.mid_price === null
+        snapshot.bid_size === null || snapshot.ask_size === null
       ) break;
 
       const totalSize = snapshot.bid_size + snapshot.ask_size;
       if (totalSize === 0) break;
 
       const microprice = (snapshot.best_bid * snapshot.ask_size + snapshot.best_ask * snapshot.bid_size) / totalSize;
-      const divergenceBps = Math.abs((microprice - snapshot.mid_price) / snapshot.mid_price) * 10000;
+      const midPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
+      if (midPrice === 0) break;
+      const divergenceBps = Math.abs((microprice - midPrice) / midPrice) * 10000;
 
       if (divergenceBps > threshold) {
         return {
@@ -767,14 +769,14 @@ describe("Generic Triggers", () => {
 
       // Add price history showing 10% move
       state.priceHistory.set("test_asset_123", [
-        { ts: baseTs - 30000 * 1000, mid_price: 0.50 }, // 30s ago
-        { ts: baseTs - 20000 * 1000, mid_price: 0.52 },
-        { ts: baseTs - 10000 * 1000, mid_price: 0.54 },
+        { ts: baseTs - 30000 * 1000, price: 0.50 }, // 30s ago
+        { ts: baseTs - 20000 * 1000, price: 0.52 },
+        { ts: baseTs - 10000 * 1000, price: 0.54 },
       ]);
 
       const snapshot = createMockSnapshot({
         source_ts: baseTs,
-        mid_price: 0.55, // 10% higher than baseline
+        best_bid: 0.55, // 10% higher than baseline
       });
 
       const result = evaluateTrigger(trigger, snapshot, state);
@@ -788,12 +790,12 @@ describe("Generic Triggers", () => {
       const baseTs = Date.now() * 1000;
 
       state.priceHistory.set("test_asset_123", [
-        { ts: baseTs - 30000 * 1000, mid_price: 0.50 },
+        { ts: baseTs - 30000 * 1000, price: 0.50 },
       ]);
 
       const snapshot = createMockSnapshot({
         source_ts: baseTs,
-        mid_price: 0.52, // 4% move
+        best_bid: 0.52, // 4% move
       });
 
       const result = evaluateTrigger(trigger, snapshot, state);
@@ -878,16 +880,16 @@ describe("HFT / Market Making Triggers", () => {
 
       // Create volatile price history with large swings
       state.priceHistory.set("test_asset_123", [
-        { ts: baseTs - 50000 * 1000, mid_price: 0.50 },
-        { ts: baseTs - 40000 * 1000, mid_price: 0.55 }, // +10%
-        { ts: baseTs - 30000 * 1000, mid_price: 0.48 }, // -13%
-        { ts: baseTs - 20000 * 1000, mid_price: 0.56 }, // +17%
-        { ts: baseTs - 10000 * 1000, mid_price: 0.49 }, // -12%
+        { ts: baseTs - 50000 * 1000, price: 0.50 },
+        { ts: baseTs - 40000 * 1000, price: 0.55 }, // +10%
+        { ts: baseTs - 30000 * 1000, price: 0.48 }, // -13%
+        { ts: baseTs - 20000 * 1000, price: 0.56 }, // +17%
+        { ts: baseTs - 10000 * 1000, price: 0.49 }, // -12%
       ]);
 
       const snapshot = createMockSnapshot({
         source_ts: baseTs,
-        mid_price: 0.52,
+        best_bid: 0.52,
       });
 
       const result = evaluateTrigger(trigger, snapshot, state);
@@ -903,16 +905,16 @@ describe("HFT / Market Making Triggers", () => {
 
       // Stable price history
       state.priceHistory.set("test_asset_123", [
-        { ts: baseTs - 50000 * 1000, mid_price: 0.500 },
-        { ts: baseTs - 40000 * 1000, mid_price: 0.501 },
-        { ts: baseTs - 30000 * 1000, mid_price: 0.500 },
-        { ts: baseTs - 20000 * 1000, mid_price: 0.502 },
-        { ts: baseTs - 10000 * 1000, mid_price: 0.501 },
+        { ts: baseTs - 50000 * 1000, price: 0.500 },
+        { ts: baseTs - 40000 * 1000, price: 0.501 },
+        { ts: baseTs - 30000 * 1000, price: 0.500 },
+        { ts: baseTs - 20000 * 1000, price: 0.502 },
+        { ts: baseTs - 10000 * 1000, price: 0.501 },
       ]);
 
       const snapshot = createMockSnapshot({
         source_ts: baseTs,
-        mid_price: 0.500,
+        best_bid: 0.500,
       });
 
       const result = evaluateTrigger(trigger, snapshot, state);
@@ -931,7 +933,6 @@ describe("HFT / Market Making Triggers", () => {
         best_ask: 0.55,
         bid_size: 9000,
         ask_size: 1000,
-        mid_price: 0.50,
       });
       // microprice = (0.45 * 1000 + 0.55 * 9000) / 10000 = 5400 / 10000 = 0.54
       // divergence = |0.54 - 0.50| / 0.50 * 10000 = 800 bps
@@ -952,7 +953,6 @@ describe("HFT / Market Making Triggers", () => {
         best_ask: 0.55,
         bid_size: 1000,
         ask_size: 1000,
-        mid_price: 0.50,
       });
       // microprice = (0.45 * 1000 + 0.55 * 1000) / 2000 = 0.50
 

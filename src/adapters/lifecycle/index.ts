@@ -9,8 +9,4 @@ export type {
 
 export { PolymarketLifecycleAdapter } from "./polymarket-lifecycle-adapter";
 
-export {
-  getLifecycleAdapter,
-  hasLifecycleAdapter,
-  getSupportedLifecycleMarkets,
-} from "./registry";
+export { getLifecycleAdapter } from "./registry";

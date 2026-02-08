@@ -22,7 +22,16 @@
  */
 
 import { describe, it, expect } from "vitest";
-import type { EnhancedOrderbookSnapshot } from "../types/orderbook";
+import type { BBOSnapshot } from "../types/orderbook";
+
+// Test-only type extending BBOSnapshot with full depth arrays
+interface EnhancedOrderbookSnapshot extends Omit<BBOSnapshot, "market_source" | "bid_size" | "ask_size"> {
+  market_source?: string;
+  bids: Array<{ price: number; size: number }>;
+  asks: Array<{ price: number; size: number }>;
+  bid_size?: number | null;
+  ask_size?: number | null;
+}
 
 // Known active Polymarket token IDs for testing (these are real, active markets)
 const TEST_TOKEN_ID =
@@ -156,8 +165,6 @@ describe("ClickHouse Database Integration", () => {
       ],
       best_bid: 0.45,
       best_ask: 0.55,
-      mid_price: 0.5,
-      spread: 0.1,
       spread_bps: 2000,
       tick_size: 0.01,
       is_resync: false,
@@ -366,8 +373,6 @@ describe("End-to-End Pipeline Test", () => {
       asks,
       best_bid: bestBid,
       best_ask: bestAsk,
-      mid_price: bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null,
-      spread: bestBid && bestAsk ? bestAsk - bestBid : null,
       spread_bps:
         bestBid && bestAsk ? ((bestAsk - bestBid) / ((bestBid + bestAsk) / 2)) * 10000 : null,
       tick_size: 0.01,
