@@ -3343,14 +3343,15 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // Update price history for PRICE_MOVE triggers and VOLATILITY_SPIKE global trigger
     // Always track since global triggers need this data for volatility calculations
-    // Uses best_bid as reference price since mid_price was removed
-    if (snapshot.best_bid !== null) {
+    // Compute midpoint from best_bid and best_ask for accurate price movement detection
+    if (snapshot.best_bid !== null && snapshot.best_ask !== null) {
+      const midPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
       let history = this.priceHistory.get(snapshot.asset_id);
       if (!history) {
         history = [];
         this.priceHistory.set(snapshot.asset_id, history);
       }
-      history.push({ ts: snapshot.source_ts, price: snapshot.best_bid });
+      history.push({ ts: snapshot.source_ts, price: midPrice });
 
       // CRITICAL: Prune on EVERY update to prevent unbounded growth
       // Time-based (60s) + count-based (1000 entries) limits

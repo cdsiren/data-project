@@ -1,6 +1,6 @@
 import type { Env } from "../types";
 import type { BBOSnapshot } from "../types/orderbook";
-import { toClickHouseDateTime64, toClickHouseDateTime64_6 } from "../utils/datetime";
+import { toClickHouseDateTime64, toClickHouseDateTime64Micro, toClickHouseDateTime64_6 } from "../utils/datetime";
 import { getFullTableName, normalizeMarketInfo, getBatchMarketDefaults } from "../config/database";
 import { buildAsyncInsertUrl, buildClickHouseHeaders } from "./clickhouse-client";
 import { executeInsert, type InsertResult } from "./clickhouse-utils";
@@ -51,7 +51,7 @@ export class ClickHouseOrderbookClient {
         asset_id: s.asset_id,
         condition_id: s.condition_id,
         source_ts: toClickHouseDateTime64(s.source_ts),
-        ingestion_ts: toClickHouseDateTime64(s.ingestion_ts),
+        ingestion_ts: toClickHouseDateTime64Micro(s.ingestion_ts),
         book_hash: s.book_hash,
         best_bid: Number(s.best_bid ?? 0),
         best_ask: Number(s.best_ask ?? 0),

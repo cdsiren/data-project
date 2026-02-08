@@ -366,13 +366,14 @@ export function updatePriceHistory(
   maxAgeMs: number = 60000,
   maxEntries: number = 1000
 ): PriceHistoryEntry[] {
-  // Use best_bid as reference price since mid_price was removed
-  if (snapshot.best_bid === null) {
+  // Compute midpoint from best_bid and best_ask for accurate price movement detection
+  if (snapshot.best_bid === null || snapshot.best_ask === null) {
     return history;
   }
 
   // Add new entry (mutates in place for better performance)
-  history.push({ ts: snapshot.source_ts, price: snapshot.best_bid });
+  const midPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
+  history.push({ ts: snapshot.source_ts, price: midPrice });
 
   // Calculate cutoff once, reuse below
   const cutoffUs = snapshot.source_ts - (maxAgeMs * 1000);
