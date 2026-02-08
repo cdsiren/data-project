@@ -112,7 +112,14 @@ export const EventDetailSection = memo<EventDetailSectionProps>(
             }
             className="text-red-400"
           />
-          <DetailRow label="Mid" value={formatPrice(event.mid_price)} />
+          <DetailRow
+            label="Mid"
+            value={formatPrice(
+              event.best_bid !== null && event.best_ask !== null
+                ? (event.best_bid + event.best_ask) / 2
+                : null
+            )}
+          />
           <DetailRow label="Spread" value={formatSpread(event.spread_bps)} />
         </DetailSection>
 

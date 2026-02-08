@@ -206,7 +206,6 @@ export async function fetchOrderbookSummary(tokenId: string): Promise<{
   token_id: string;
   best_bid: number;
   best_ask: number;
-  mid_price: number;
   spread: number;
   spread_bps: number;
   total_bid_depth: number;
@@ -241,7 +240,6 @@ export async function fetchOrderbookSummary(tokenId: string): Promise<{
       token_id: tokenId,
       best_bid: bestBid,
       best_ask: bestAsk,
-      mid_price: midPrice,
       spread,
       spread_bps: spreadBps,
       total_bid_depth: totalBidDepth,

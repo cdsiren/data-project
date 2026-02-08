@@ -22,7 +22,16 @@
  */
 
 import { describe, it, expect } from "vitest";
-import type { EnhancedOrderbookSnapshot } from "../types/orderbook";
+import type { BBOSnapshot } from "../types/orderbook";
+
+// Test-only type extending BBOSnapshot with full depth arrays
+interface EnhancedOrderbookSnapshot extends Omit<BBOSnapshot, "market_source" | "bid_size" | "ask_size"> {
+  market_source?: string;
+  bids: Array<{ price: number; size: number }>;
+  asks: Array<{ price: number; size: number }>;
+  bid_size?: number | null;
+  ask_size?: number | null;
+}
 
 // Known active Polymarket token IDs for testing (these are real, active markets)
 const TEST_TOKEN_ID =
@@ -147,17 +156,15 @@ describe("ClickHouse Database Integration", () => {
       ingestion_ts: Date.now() * 1000, // microseconds
       book_hash: "test_hash_" + crypto.randomUUID(),
       bids: [
-        { price: 0.45, size: 100 },
         { price: 0.44, size: 200 },
+        { price: 0.45, size: 100 },
       ],
       asks: [
-        { price: 0.55, size: 150 },
         { price: 0.56, size: 250 },
+        { price: 0.55, size: 150 },
       ],
       best_bid: 0.45,
       best_ask: 0.55,
-      mid_price: 0.5,
-      spread: 0.1,
       spread_bps: 2000,
       tick_size: 0.01,
       is_resync: false,
@@ -210,13 +217,18 @@ describe("ClickHouse Database Integration", () => {
     const readData = await readResponse.json();
     expect(readData.data.length).toBe(1);
     expect(readData.data[0].asset_id).toBe(testSnapshot.asset_id);
-    expect(readData.data[0].bid_prices).toEqual([0.45, 0.44]);
-    expect(readData.data[0].ask_prices).toEqual([0.55, 0.56]);
+    expect(readData.data[0].bid_prices).toEqual([0.44, 0.45]);
+    expect(readData.data[0].ask_prices).toEqual([0.56, 0.55]);
 
-    // Verify materialized columns computed correctly
-    expect(readData.data[0].best_bid).toBeCloseTo(0.45);
-    expect(readData.data[0].best_ask).toBeCloseTo(0.55);
-    expect(readData.data[0].spread).toBeCloseTo(0.1);
+    // Verify we can compute BBO from arrays (materialized columns were removed)
+    const bidPrices = readData.data[0].bid_prices;
+    const askPrices = readData.data[0].ask_prices;
+    // Polymarket: bids ascending (best last), asks descending (best last)
+    const bestBid = bidPrices[bidPrices.length - 1];
+    const bestAsk = askPrices[askPrices.length - 1];
+    expect(bestBid).toBeCloseTo(0.45);
+    expect(bestAsk).toBeCloseTo(0.55);
+    expect(bestAsk - bestBid).toBeCloseTo(0.1);
 
     // Cleanup - delete test data
     await fetch(
@@ -366,8 +378,6 @@ describe("End-to-End Pipeline Test", () => {
       asks,
       best_bid: bestBid,
       best_ask: bestAsk,
-      mid_price: bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null,
-      spread: bestBid && bestAsk ? bestAsk - bestBid : null,
       spread_bps:
         bestBid && bestAsk ? ((bestAsk - bestBid) / ((bestBid + bestAsk) / 2)) * 10000 : null,
       tick_size: 0.01,
@@ -430,13 +440,19 @@ describe("End-to-End Pipeline Test", () => {
     expect(stored.bid_prices.length).toBeGreaterThan(0);
     expect(stored.ask_prices.length).toBeGreaterThan(0);
 
+    // NOTE: Materialized columns (best_bid, best_ask, spread_bps, bid_levels, ask_levels)
+    // were removed for cost optimization. Compute from arrays if needed.
+    const storedBidPrices = stored.bid_prices || [];
+    const storedAskPrices = stored.ask_prices || [];
+    const storedBestBid = storedBidPrices.length > 0 ? storedBidPrices[storedBidPrices.length - 1] : 0;
+    const storedBestAsk = storedAskPrices.length > 0 ? storedAskPrices[storedAskPrices.length - 1] : 0;
+
     console.log("\nE2E Test Results:");
     console.log(`  Asset ID: ${snapshot.asset_id}`);
-    console.log(`  Best Bid: ${stored.best_bid}`);
-    console.log(`  Best Ask: ${stored.best_ask}`);
-    console.log(`  Spread (bps): ${stored.spread_bps?.toFixed(2)}`);
-    console.log(`  Bid Levels: ${stored.bid_levels}`);
-    console.log(`  Ask Levels: ${stored.ask_levels}`);
+    console.log(`  Best Bid: ${storedBestBid} (computed from bid_prices array)`);
+    console.log(`  Best Ask: ${storedBestAsk} (computed from ask_prices array)`);
+    console.log(`  Bid Levels: ${storedBidPrices.length}`);
+    console.log(`  Ask Levels: ${storedAskPrices.length}`);
 
     // 5. Cleanup
     await fetch(

@@ -55,27 +55,4 @@ export class WebhookSigner {
       headers["X-Signature"] = await this.signPayload(payload, secret);
     }
   }
-
-  /**
-   * Verify an incoming webhook signature.
-   * Use this to validate webhooks you receive.
-   *
-   * @param payload - The received payload
-   * @param signature - The X-Signature header value
-   * @param secret - Your HMAC secret
-   * @returns true if signature is valid
-   */
-  static async verifySignature(
-    payload: string,
-    signature: string,
-    secret: string
-  ): Promise<boolean> {
-    try {
-      const expectedSignature = await this.signPayload(payload, secret);
-      // Constant-time comparison to prevent timing attacks
-      return signature === expectedSignature;
-    } catch {
-      return false;
-    }
-  }
 }

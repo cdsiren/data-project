@@ -87,8 +87,8 @@ backtest.get("/export/backtest", async (c) => {
         min(sequence_number) AS sequence_start,
         max(sequence_number) AS sequence_end
       FROM ${DB_CONFIG.DATABASE}.ob_bbo
-      WHERE asset_id = {asset_id:String}
-        AND source_ts BETWEEN parseDateTimeBestEffort({start:String}) AND parseDateTimeBestEffort({end:String})
+      PREWHERE asset_id = {asset_id:String}
+      WHERE source_ts BETWEEN parseDateTimeBestEffort({start:String}) AND parseDateTimeBestEffort({end:String})
       GROUP BY toStartOfMinute(source_ts)
       ORDER BY time ASC
       LIMIT ${limit}
@@ -101,13 +101,12 @@ backtest.get("/export/backtest", async (c) => {
         toFloat64(best_ask) AS best_ask,
         bid_size,
         ask_size,
-        toFloat64(mid_price) AS mid_price,
         spread_bps,
         book_hash,
         sequence_number
       FROM ${DB_CONFIG.DATABASE}.ob_bbo
-      WHERE asset_id = {asset_id:String}
-        AND source_ts BETWEEN parseDateTimeBestEffort({start:String}) AND parseDateTimeBestEffort({end:String})
+      PREWHERE asset_id = {asset_id:String}
+      WHERE source_ts BETWEEN parseDateTimeBestEffort({start:String}) AND parseDateTimeBestEffort({end:String})
       ORDER BY source_ts ASC, sequence_number ASC
       LIMIT ${limit}
       FORMAT JSON
@@ -257,7 +256,7 @@ backtest.get("/export/quality/:asset_id", async (c) => {
       count(DISTINCT sequence_number) AS unique_sequences,
       1 - (count(DISTINCT sequence_number) / (max(sequence_number) - min(sequence_number) + 1)) AS sequence_gap_ratio
     FROM ${DB_CONFIG.DATABASE}.ob_bbo
-    WHERE asset_id = {asset_id:String}
+    PREWHERE asset_id = {asset_id:String}
     FORMAT JSON
   `;
 

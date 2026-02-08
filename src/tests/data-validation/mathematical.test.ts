@@ -38,79 +38,24 @@ describe("P0: Mathematical Consistency", () => {
   });
 
   describe("BBO Calculated Fields", () => {
-    it("should have mid_price = (best_bid + best_ask) / 2", async () => {
+    it("should have spread_bps = (best_ask - best_bid) / ((best_bid + best_ask) / 2) * 10000", async () => {
       if (!config) return;
 
-      // Check for mid_price calculation errors
-      // Allow for floating point tolerance
+      // Check spread_bps calculation
+      // spread_bps = (ask - bid) / mid * 10000, where mid = (bid + ask) / 2
       const query = `
         SELECT
           count() as total,
           countIf(
             best_bid > 0 AND best_ask > 0
-            AND abs(mid_price - (best_bid + best_ask) / 2) > 0.0001
-          ) as mismatches
-        FROM ${getTable("OB_BBO")}
-        WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
-          AND best_bid > 0
-          AND best_ask > 0
-      `;
-
-      const result = await executeQuery<{
-        total: string;
-        mismatches: string;
-      }>(config, query);
-
-      const total = Number(result.data[0].total);
-      const mismatches = Number(result.data[0].mismatches);
-
-      validationResults.push({
-        passed: mismatches === 0,
-        test: "mid_price = (best_bid + best_ask) / 2",
-        message:
-          mismatches === 0
-            ? `All ${total} records have correct mid_price`
-            : `${mismatches}/${total} records have incorrect mid_price`,
-        sampleSize: total,
-      });
-
-      if (mismatches > 0) {
-        // Get sample of mismatches
-        const sampleQuery = `
-          SELECT asset_id, best_bid, best_ask, mid_price,
-                 (best_bid + best_ask) / 2 as expected_mid
-          FROM ${getTable("OB_BBO")}
-          WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
-            AND best_bid > 0 AND best_ask > 0
-            AND abs(mid_price - (best_bid + best_ask) / 2) > 0.0001
-          LIMIT 5
-        `;
-        const sampleResult = await executeQuery(config, sampleQuery);
-        console.log(`\nMid-price mismatches:`, sampleResult.data);
-      }
-
-      expect(mismatches).toBe(0);
-    });
-
-    it("should have spread_bps = (best_ask - best_bid) / mid_price * 10000", async () => {
-      if (!config) return;
-
-      // Check spread_bps calculation
-      // spread_bps = (ask - bid) / mid * 10000
-      const query = `
-        SELECT
-          count() as total,
-          countIf(
-            best_bid > 0 AND best_ask > 0 AND mid_price > 0
             AND abs(
-              spread_bps - ((best_ask - best_bid) / mid_price * 10000)
+              spread_bps - ((best_ask - best_bid) / ((best_bid + best_ask) / 2) * 10000)
             ) > ${TEST_CONFIG.SPREAD_BPS_TOLERANCE}
           ) as mismatches
         FROM ${getTable("OB_BBO")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
           AND best_bid > 0
           AND best_ask > 0
-          AND mid_price > 0
       `;
 
       const result = await executeQuery<{
@@ -133,12 +78,12 @@ describe("P0: Mathematical Consistency", () => {
 
       if (mismatches > 0) {
         const sampleQuery = `
-          SELECT asset_id, best_bid, best_ask, mid_price, spread_bps,
-                 ((best_ask - best_bid) / mid_price * 10000) as expected_spread_bps
+          SELECT asset_id, best_bid, best_ask, spread_bps,
+                 ((best_ask - best_bid) / ((best_bid + best_ask) / 2) * 10000) as expected_spread_bps
           FROM ${getTable("OB_BBO")}
           WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
-            AND best_bid > 0 AND best_ask > 0 AND mid_price > 0
-            AND abs(spread_bps - ((best_ask - best_bid) / mid_price * 10000)) > ${TEST_CONFIG.SPREAD_BPS_TOLERANCE}
+            AND best_bid > 0 AND best_ask > 0
+            AND abs(spread_bps - ((best_ask - best_bid) / ((best_bid + best_ask) / 2) * 10000)) > ${TEST_CONFIG.SPREAD_BPS_TOLERANCE}
           LIMIT 5
         `;
         const sampleResult = await executeQuery(config, sampleQuery);
@@ -221,8 +166,7 @@ describe("P0: Mathematical Consistency", () => {
         SELECT
           count() as total,
           countIf(best_bid < 0 OR best_bid > 1) as invalid_bid,
-          countIf(best_ask < 0 OR best_ask > 1) as invalid_ask,
-          countIf(mid_price < 0 OR mid_price > 1) as invalid_mid
+          countIf(best_ask < 0 OR best_ask > 1) as invalid_ask
         FROM ${getTable("OB_BBO")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
           AND (best_bid != 0 OR best_ask != 0)
@@ -232,19 +176,16 @@ describe("P0: Mathematical Consistency", () => {
         total: string;
         invalid_bid: string;
         invalid_ask: string;
-        invalid_mid: string;
       }>(config, query);
 
       const total = Number(result.data[0].total);
       const invalidBid = Number(result.data[0].invalid_bid);
       const invalidAsk = Number(result.data[0].invalid_ask);
-      const invalidMid = Number(result.data[0].invalid_mid);
-      const totalInvalid = invalidBid + invalidAsk + invalidMid;
+      const totalInvalid = invalidBid + invalidAsk;
 
       console.log(`\nPrice range validation (n=${total}):`);
       console.log(`  Invalid bids (< 0 or > 1): ${invalidBid}`);
       console.log(`  Invalid asks (< 0 or > 1): ${invalidAsk}`);
-      console.log(`  Invalid mids (< 0 or > 1): ${invalidMid}`);
 
       validationResults.push({
         passed: totalInvalid === 0,
@@ -253,7 +194,7 @@ describe("P0: Mathematical Consistency", () => {
           totalInvalid === 0
             ? `All ${total} records have valid prices`
             : `${totalInvalid} records have out-of-range prices`,
-        actual: { invalidBid, invalidAsk, invalidMid },
+        actual: { invalidBid, invalidAsk },
         sampleSize: total,
       });
 
@@ -432,84 +373,95 @@ describe("P0: Mathematical Consistency", () => {
   });
 
   describe("L2 Snapshot Calculated Fields", () => {
-    it("should have spread = best_ask - best_bid", async () => {
+    // NOTE: Materialized columns (spread, total_bid_depth, total_ask_depth, bid_levels,
+    // ask_levels, book_imbalance) were removed for cost optimization.
+    // These tests now compute values at query time to verify array data integrity.
+
+    it("should have valid spread calculated from bid/ask arrays", async () => {
       if (!config) return;
 
+      // Compute spread at query time: best_ask - best_bid
+      // Polymarket: bids ascending (best last), asks descending (best last)
       const query = `
         SELECT
           count() as total,
           countIf(
             length(bid_prices) > 0 AND length(ask_prices) > 0
-            AND abs(spread - (best_ask - best_bid)) > 0.0001
-          ) as mismatches
+            AND ask_prices[length(ask_prices)] < bid_prices[length(bid_prices)]
+          ) as crossed_books
         FROM ${getTable("OB_SNAPSHOTS")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
       `;
 
       const result = await executeQuery<{
         total: string;
-        mismatches: string;
+        crossed_books: string;
       }>(config, query);
 
       const total = Number(result.data[0].total);
-      const mismatches = Number(result.data[0].mismatches);
+      const crossedBooks = Number(result.data[0].crossed_books);
+      const crossedPercent = total > 0 ? (crossedBooks / total) * 100 : 0;
 
       validationResults.push({
-        passed: mismatches === 0,
-        test: "L2 spread = best_ask - best_bid",
+        passed: crossedPercent < 1,
+        test: "L2 spread valid (best_ask >= best_bid)",
         message:
-          mismatches === 0
-            ? `All ${total} snapshots have correct spread`
-            : `${mismatches}/${total} snapshots have incorrect spread`,
+          crossedPercent < 1
+            ? `All ${total} snapshots have valid spread (${crossedBooks} crossed)`
+            : `${crossedBooks}/${total} snapshots have crossed books`,
         sampleSize: total,
       });
 
-      expect(mismatches).toBe(0);
+      expect(crossedPercent).toBeLessThan(1);
     });
 
-    it("should have total_bid_depth = sum of bid_sizes", async () => {
+    it("should have valid bid/ask depth from arrays", async () => {
       if (!config) return;
 
+      // Compute depth at query time using arraySum
       const query = `
         SELECT
           count() as total,
-          countIf(
-            length(bid_sizes) > 0
-            AND abs(total_bid_depth - arraySum(bid_sizes)) > 0.01
-          ) as mismatches
+          countIf(arraySum(bid_sizes) < 0) as negative_bid_depth,
+          countIf(arraySum(ask_sizes) < 0) as negative_ask_depth
         FROM ${getTable("OB_SNAPSHOTS")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
+          AND (length(bid_sizes) > 0 OR length(ask_sizes) > 0)
       `;
 
       const result = await executeQuery<{
         total: string;
-        mismatches: string;
+        negative_bid_depth: string;
+        negative_ask_depth: string;
       }>(config, query);
 
       const total = Number(result.data[0].total);
-      const mismatches = Number(result.data[0].mismatches);
+      const negativeBid = Number(result.data[0].negative_bid_depth);
+      const negativeAsk = Number(result.data[0].negative_ask_depth);
+      const totalNegative = negativeBid + negativeAsk;
 
       validationResults.push({
-        passed: mismatches === 0,
-        test: "total_bid_depth = sum(bid_sizes)",
+        passed: totalNegative === 0,
+        test: "Depth values non-negative",
         message:
-          mismatches === 0
-            ? `All ${total} snapshots have correct total_bid_depth`
-            : `${mismatches}/${total} snapshots have incorrect total_bid_depth`,
+          totalNegative === 0
+            ? `All ${total} snapshots have valid depth`
+            : `${totalNegative}/${total} snapshots have negative depth`,
         sampleSize: total,
       });
 
-      expect(mismatches).toBe(0);
+      expect(totalNegative).toBe(0);
     });
 
-    it("should have bid_levels = length(bid_prices)", async () => {
+    it("should have matching array lengths for prices and sizes", async () => {
       if (!config) return;
 
+      // Verify bid_prices.length == bid_sizes.length and same for asks
       const query = `
         SELECT
           count() as total,
-          countIf(bid_levels != length(bid_prices)) as bid_mismatches,
-          countIf(ask_levels != length(ask_prices)) as ask_mismatches
+          countIf(length(bid_prices) != length(bid_sizes)) as bid_mismatches,
+          countIf(length(ask_prices) != length(ask_sizes)) as ask_mismatches
         FROM ${getTable("OB_SNAPSHOTS")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
       `;
@@ -527,11 +479,11 @@ describe("P0: Mathematical Consistency", () => {
 
       validationResults.push({
         passed: totalMismatches === 0,
-        test: "Level counts match array lengths",
+        test: "Price/size array lengths match",
         message:
           totalMismatches === 0
-            ? `All ${total} snapshots have correct level counts`
-            : `${totalMismatches}/${total} snapshots have incorrect level counts`,
+            ? `All ${total} snapshots have matching array lengths`
+            : `${totalMismatches}/${total} snapshots have mismatched arrays`,
         actual: { bidMismatches, askMismatches },
         sampleSize: total,
       });
@@ -539,16 +491,23 @@ describe("P0: Mathematical Consistency", () => {
       expect(totalMismatches).toBe(0);
     });
 
-    it("should have book_imbalance in valid range [-1, 1]", async () => {
+    it("should have book_imbalance computable in valid range [-1, 1]", async () => {
       if (!config) return;
 
+      // Compute book_imbalance at query time
       const query = `
         SELECT
           count() as total,
-          countIf(book_imbalance < -1 OR book_imbalance > 1) as out_of_range
+          countIf(
+            (arraySum(bid_sizes) - arraySum(ask_sizes)) /
+            (arraySum(bid_sizes) + arraySum(ask_sizes)) < -1
+            OR
+            (arraySum(bid_sizes) - arraySum(ask_sizes)) /
+            (arraySum(bid_sizes) + arraySum(ask_sizes)) > 1
+          ) as out_of_range
         FROM ${getTable("OB_SNAPSHOTS")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
-          AND total_bid_depth + total_ask_depth > 0
+          AND arraySum(bid_sizes) + arraySum(ask_sizes) > 0
       `;
 
       const result = await executeQuery<{

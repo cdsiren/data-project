@@ -41,20 +41,3 @@ export function getLifecycleAdapter(
   }
   return factory(env);
 }
-
-/**
- * Check if a market source has a lifecycle adapter.
- * @param marketSource - Market source identifier
- * @returns true if supported
- */
-export function hasLifecycleAdapter(marketSource: string): boolean {
-  return marketSource in LIFECYCLE_ADAPTERS;
-}
-
-/**
- * Get list of market sources with lifecycle adapters.
- * @returns Array of supported market source identifiers
- */
-export function getSupportedLifecycleMarkets(): string[] {
-  return Object.keys(LIFECYCLE_ADAPTERS);
-}

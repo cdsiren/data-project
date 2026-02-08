@@ -40,7 +40,6 @@ export const BacktestTickSchema = z.object({
   best_ask: z.number(),
   bid_size: z.number(),
   ask_size: z.number(),
-  mid_price: z.number(),
   spread_bps: z.number(),
   book_hash: z.string(),
   sequence_number: z.number(),

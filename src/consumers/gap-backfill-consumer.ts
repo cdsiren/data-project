@@ -109,9 +109,14 @@ export async function gapBackfillConsumer(
       const bestAsk = bestAskLevel?.price ?? null;
       const bidSize = bestBidLevel?.size ?? null;
       const askSize = bestAskLevel?.size ?? null;
-      const midPrice = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null;
-      const spread = bestBid && bestAsk ? bestAsk - bestBid : null;
-      const spreadBps = midPrice && spread ? (spread / midPrice) * 10000 : null;
+      // Calculate spread_bps (mid_price used only for calculation, not stored)
+      let spreadBps: number | null = null;
+      if (bestBid !== null && bestAsk !== null) {
+        const midPrice = (bestBid + bestAsk) / 2;
+        if (midPrice > 0) {
+          spreadBps = ((bestAsk - bestBid) / midPrice) * 10000;
+        }
+      }
 
       // Create BBO snapshot for tick-level data
       // Use normalizeMarketInfo for consistent defaulting
@@ -133,7 +138,6 @@ export async function gapBackfillConsumer(
         best_ask: bestAsk,
         bid_size: bidSize,
         ask_size: askSize,
-        mid_price: midPrice,
         spread_bps: spreadBps,
         tick_size: parseFloat(book.tick_size),
         is_resync: true,

@@ -90,7 +90,6 @@ export interface TriggerEvent {
   best_ask: number | null;
   bid_size: number | null;
   ask_size: number | null;
-  mid_price: number | null;
   spread_bps: number | null;
 
   // Trigger-specific data
@@ -197,10 +196,11 @@ export interface TriggerRegistration {
 
 /**
  * Price history entry for PRICE_MOVE trigger
+ * Stores the midpoint (best_bid + best_ask) / 2 for accurate price movement detection
  */
 export interface PriceHistoryEntry {
   ts: number;
-  mid_price: number;
+  price: number;
 }
 
 /**

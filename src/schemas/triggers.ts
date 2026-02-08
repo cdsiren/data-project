@@ -127,7 +127,6 @@ export const TriggerEventSchema = z.object({
   context: z.object({
     best_bid: z.number().optional(),
     best_ask: z.number().optional(),
-    mid_price: z.number().optional(),
     spread_bps: z.number().optional(),
     bid_size: z.number().optional(),
     ask_size: z.number().optional(),

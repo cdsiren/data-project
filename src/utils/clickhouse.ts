@@ -33,32 +33,6 @@ export function quoteClickHouseString(value: string): string {
 }
 
 /**
- * Validate that a value is a safe identifier (table name, column name, etc.)
- * Only allows alphanumeric characters and underscores.
- *
- * @param value - The identifier to validate
- * @returns true if safe, false otherwise
- */
-export function isValidIdentifier(value: string): boolean {
-  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(value);
-}
-
-/**
- * Escape an identifier (table name, column name) for ClickHouse.
- * Wraps in backticks and escapes internal backticks.
- *
- * @param value - The identifier to escape
- * @returns Escaped identifier
- * @throws Error if identifier contains invalid characters
- */
-export function escapeIdentifier(value: string): string {
-  if (!isValidIdentifier(value)) {
-    throw new Error(`Invalid identifier: ${value}`);
-  }
-  return value; // Safe identifiers don't need escaping
-}
-
-/**
  * Validate and escape a market source value.
  * Only allows known market sources from MARKET_SOURCE_TO_TYPE registry.
  *
@@ -100,35 +74,6 @@ export function escapeAssetId(value: string): string {
     throw new Error(`Invalid asset ID format: ${value.slice(0, 20)}...`);
   }
   return trimmed; // Hex strings are safe, no escaping needed
-}
-
-/**
- * Parse and validate a numeric limit parameter.
- *
- * @param value - String value to parse
- * @param defaultValue - Default if value is empty/undefined
- * @param max - Maximum allowed value
- * @returns Validated number
- */
-export function parseLimit(value: string | undefined, defaultValue: number, max: number): number {
-  if (!value) return defaultValue;
-  const parsed = parseInt(value, 10);
-  if (isNaN(parsed) || parsed < 1) return defaultValue;
-  return Math.min(parsed, max);
-}
-
-/**
- * Parse and validate a numeric offset parameter.
- *
- * @param value - String value to parse
- * @param defaultValue - Default if value is empty/undefined
- * @returns Validated number (non-negative)
- */
-export function parseOffset(value: string | undefined, defaultValue: number = 0): number {
-  if (!value) return defaultValue;
-  const parsed = parseInt(value, 10);
-  if (isNaN(parsed) || parsed < 0) return defaultValue;
-  return parsed;
 }
 
 /**

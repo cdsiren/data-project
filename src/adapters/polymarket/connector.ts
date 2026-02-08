@@ -125,11 +125,10 @@ export class PolymarketConnector implements MarketConnector {
     const bestBid = bestBidLevel?.price ?? null;
     const bestAsk = bestAskLevel?.price ?? null;
 
-    // Calculate derived metrics - single null check, no redundant conditions
-    let midPrice: number | null = null;
+    // Calculate spread_bps (mid_price used only for calculation, not stored)
     let spreadBps: number | null = null;
     if (bestBid !== null && bestAsk !== null) {
-      midPrice = (bestBid + bestAsk) / 2;
+      const midPrice = (bestBid + bestAsk) / 2;
       if (midPrice > 0) {
         spreadBps = ((bestAsk - bestBid) / midPrice) * 10000;
       }
@@ -150,7 +149,6 @@ export class PolymarketConnector implements MarketConnector {
       best_ask: bestAsk,
       bid_size: bestBidLevel?.size ?? null,
       ask_size: bestAskLevel?.size ?? null,
-      mid_price: midPrice,
       spread_bps: spreadBps,
       tick_size: 0.01, // Default, should be overridden from market config
     };
