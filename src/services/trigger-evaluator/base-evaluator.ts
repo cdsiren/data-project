@@ -275,8 +275,8 @@ export class GenericTriggerEvaluator extends BaseTriggerEvaluator {
     window_ms: number | undefined,
     context: TriggerContext
   ): TriggerEvaluationResult {
-    // Use best_bid as reference price since mid_price was removed
-    if (snapshot.best_bid === null || !window_ms) {
+    // Compute midpoint for accurate price movement detection
+    if (snapshot.best_bid === null || snapshot.best_ask === null || !window_ms) {
       return this.notFired();
     }
 
@@ -299,8 +299,9 @@ export class GenericTriggerEvaluator extends BaseTriggerEvaluator {
     }
 
     if (baselineEntry && baselineEntry.price > 0) {
+      const currentMidPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
       const pctChange =
-        Math.abs((snapshot.best_bid - baselineEntry.price) / baselineEntry.price) * 100;
+        Math.abs((currentMidPrice - baselineEntry.price) / baselineEntry.price) * 100;
       if (pctChange >= threshold) {
         return this.fired(this.createTriggerEvent(trigger, snapshot, pctChange));
       }

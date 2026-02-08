@@ -196,7 +196,7 @@ export interface TriggerRegistration {
 
 /**
  * Price history entry for PRICE_MOVE trigger
- * Uses best_bid as the reference price since mid_price was removed
+ * Stores the midpoint (best_bid + best_ask) / 2 for accurate price movement detection
  */
 export interface PriceHistoryEntry {
   ts: number;

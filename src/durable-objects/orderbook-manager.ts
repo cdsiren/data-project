@@ -3383,11 +3383,12 @@ export class OrderbookManager extends DurableObject<Env> {
       this.updateCounts.set(snapshot.asset_id, { count: 1, windowStartUs: snapshot.source_ts });
     }
 
-    // MID_PRICE_TREND: Track consecutive price moves (uses best_bid since mid_price was removed)
-    if (snapshot.best_bid !== null) {
+    // MID_PRICE_TREND: Track consecutive price moves using true midpoint
+    if (snapshot.best_bid !== null && snapshot.best_ask !== null) {
+      const midPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
       const trend = this.trendTracker.get(snapshot.asset_id);
       if (trend) {
-        if (snapshot.best_bid > trend.lastMid) {
+        if (midPrice > trend.lastMid) {
           // Price went up
           if (trend.direction === "UP") {
             trend.consecutiveMoves++;
@@ -3395,7 +3396,7 @@ export class OrderbookManager extends DurableObject<Env> {
             trend.direction = "UP";
             trend.consecutiveMoves = 1;
           }
-        } else if (snapshot.best_bid < trend.lastMid) {
+        } else if (midPrice < trend.lastMid) {
           // Price went down
           if (trend.direction === "DOWN") {
             trend.consecutiveMoves++;
@@ -3405,10 +3406,10 @@ export class OrderbookManager extends DurableObject<Env> {
           }
         }
         // If equal, keep current state
-        trend.lastMid = snapshot.best_bid;
+        trend.lastMid = midPrice;
       } else {
         this.trendTracker.set(snapshot.asset_id, {
-          lastMid: snapshot.best_bid,
+          lastMid: midPrice,
           consecutiveMoves: 0,
           direction: "UP", // Initial direction doesn't matter until we see movement
         });
@@ -3679,8 +3680,8 @@ export class OrderbookManager extends DurableObject<Env> {
 
       case "PRICE_MOVE": {
         // Check if price moved threshold% within window_ms
-        // Uses best_bid as reference price since mid_price was removed
-        if (snapshot.best_bid === null || !window_ms) break;
+        // Compare midpoint-to-midpoint for accurate price movement detection
+        if (snapshot.best_bid === null || snapshot.best_ask === null || !window_ms) break;
 
         const history = this.priceHistory.get(snapshot.asset_id);
         if (!history || history.length === 0) break;
@@ -3710,8 +3711,9 @@ export class OrderbookManager extends DurableObject<Env> {
         }
 
         if (baselineEntry && baselineEntry.price > 0) {
+          const currentMidPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
           const pctChange =
-            Math.abs((snapshot.best_bid - baselineEntry.price) / baselineEntry.price) * 100;
+            Math.abs((currentMidPrice - baselineEntry.price) / baselineEntry.price) * 100;
           if (pctChange >= threshold) {
             return { fired: true, actualValue: pctChange };
           }
