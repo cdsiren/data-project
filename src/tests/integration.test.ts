@@ -156,12 +156,12 @@ describe("ClickHouse Database Integration", () => {
       ingestion_ts: Date.now() * 1000, // microseconds
       book_hash: "test_hash_" + crypto.randomUUID(),
       bids: [
-        { price: 0.45, size: 100 },
         { price: 0.44, size: 200 },
+        { price: 0.45, size: 100 },
       ],
       asks: [
-        { price: 0.55, size: 150 },
         { price: 0.56, size: 250 },
+        { price: 0.55, size: 150 },
       ],
       best_bid: 0.45,
       best_ask: 0.55,
@@ -217,15 +217,15 @@ describe("ClickHouse Database Integration", () => {
     const readData = await readResponse.json();
     expect(readData.data.length).toBe(1);
     expect(readData.data[0].asset_id).toBe(testSnapshot.asset_id);
-    expect(readData.data[0].bid_prices).toEqual([0.45, 0.44]);
-    expect(readData.data[0].ask_prices).toEqual([0.55, 0.56]);
+    expect(readData.data[0].bid_prices).toEqual([0.44, 0.45]);
+    expect(readData.data[0].ask_prices).toEqual([0.56, 0.55]);
 
     // Verify we can compute BBO from arrays (materialized columns were removed)
     const bidPrices = readData.data[0].bid_prices;
     const askPrices = readData.data[0].ask_prices;
-    // Polymarket: bids ascending (best last), asks descending (best first)
+    // Polymarket: bids ascending (best last), asks descending (best last)
     const bestBid = bidPrices[bidPrices.length - 1];
-    const bestAsk = askPrices[0];
+    const bestAsk = askPrices[askPrices.length - 1];
     expect(bestBid).toBeCloseTo(0.45);
     expect(bestAsk).toBeCloseTo(0.55);
     expect(bestAsk - bestBid).toBeCloseTo(0.1);
@@ -445,7 +445,7 @@ describe("End-to-End Pipeline Test", () => {
     const storedBidPrices = stored.bid_prices || [];
     const storedAskPrices = stored.ask_prices || [];
     const storedBestBid = storedBidPrices.length > 0 ? storedBidPrices[storedBidPrices.length - 1] : 0;
-    const storedBestAsk = storedAskPrices.length > 0 ? storedAskPrices[0] : 0;
+    const storedBestAsk = storedAskPrices.length > 0 ? storedAskPrices[storedAskPrices.length - 1] : 0;
 
     console.log("\nE2E Test Results:");
     console.log(`  Asset ID: ${snapshot.asset_id}`);

@@ -59,7 +59,11 @@ export const TriggerTableRow = memo<TriggerTableRowProps>(
             {truncateId(event.condition_id)}
           </TableCell>
           <TableCell className="text-right font-mono">
-            {formatPrice(event.mid_price)}
+            {formatPrice(
+              event.best_bid !== null && event.best_ask !== null
+                ? (event.best_bid + event.best_ask) / 2
+                : null
+            )}
           </TableCell>
           <TableCell className="text-right font-mono text-[hsl(var(--muted-foreground))]">
             {formatSpread(event.spread_bps)}

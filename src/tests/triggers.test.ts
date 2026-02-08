@@ -183,8 +183,8 @@ function evaluateTrigger(
     }
 
     case "PRICE_MOVE": {
-      // Uses best_bid as reference price since mid_price was removed
-      if (snapshot.best_bid === null || !window_ms) break;
+      // Uses midpoint (best_bid + best_ask) / 2 to match production code
+      if (snapshot.best_bid === null || snapshot.best_ask === null || !window_ms) break;
 
       const history = state.priceHistory.get(snapshot.asset_id);
       if (!history || history.length === 0) break;
@@ -199,7 +199,8 @@ function evaluateTrigger(
       }
 
       if (baselineEntry && baselineEntry.price > 0) {
-        const pctChange = Math.abs((snapshot.best_bid - baselineEntry.price) / baselineEntry.price) * 100;
+        const currentMidPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
+        const pctChange = Math.abs((currentMidPrice - baselineEntry.price) / baselineEntry.price) * 100;
         if (pctChange >= threshold) {
           return { fired: true, actualValue: pctChange };
         }

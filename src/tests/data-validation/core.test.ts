@@ -106,7 +106,7 @@ describe("P0: Critical Validation Tests", () => {
           const snapshotQuery = `
             SELECT
               if(length(bid_prices) > 0, bid_prices[length(bid_prices)], 0) as best_bid,
-              if(length(ask_prices) > 0, ask_prices[1], 0) as best_ask,
+              if(length(ask_prices) > 0, ask_prices[length(ask_prices)], 0) as best_ask,
               source_ts
             FROM ${getTable("OB_SNAPSHOTS")}
             WHERE asset_id = '${assetId}'

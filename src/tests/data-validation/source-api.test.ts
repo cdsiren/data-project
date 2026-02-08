@@ -461,11 +461,12 @@ describe("P0: Source API Validation", () => {
       if (!config) return;
 
       // Verify materialized columns match array values
+      // Polymarket: bids ascending (best last), asks descending (best last)
       const query = `
         SELECT count() as total,
                countIf(
-                 abs(best_bid - bid_prices[1]) > 0.0001
-                 OR abs(best_ask - ask_prices[1]) > 0.0001
+                 abs(best_bid - bid_prices[length(bid_prices)]) > 0.0001
+                 OR abs(best_ask - ask_prices[length(ask_prices)]) > 0.0001
                ) as mismatches
         FROM ${getTable("OB_SNAPSHOTS")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR

@@ -46,7 +46,6 @@ export interface TriggerEvent {
   best_ask: number | null;
   bid_size: number | null;
   ask_size: number | null;
-  mid_price: number | null;
   spread_bps: number | null;
 
   threshold: number;

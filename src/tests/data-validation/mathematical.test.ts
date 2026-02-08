@@ -380,13 +380,14 @@ describe("P0: Mathematical Consistency", () => {
     it("should have valid spread calculated from bid/ask arrays", async () => {
       if (!config) return;
 
-      // Compute spread at query time: best_ask - best_bid (first elements of arrays)
+      // Compute spread at query time: best_ask - best_bid
+      // Polymarket: bids ascending (best last), asks descending (best last)
       const query = `
         SELECT
           count() as total,
           countIf(
             length(bid_prices) > 0 AND length(ask_prices) > 0
-            AND ask_prices[1] < bid_prices[length(bid_prices)]
+            AND ask_prices[length(ask_prices)] < bid_prices[length(bid_prices)]
           ) as crossed_books
         FROM ${getTable("OB_SNAPSHOTS")}
         WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR
