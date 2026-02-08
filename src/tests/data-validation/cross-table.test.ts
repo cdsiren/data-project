@@ -448,18 +448,20 @@ describe("P1: Cross-Table Consistency", () => {
       // This test validates that level_changes are being recorded and correlate with snapshots
       // Simplified to avoid ClickHouse memory limits on large JOINs
       try {
+        // NOTE: total_bid_depth and total_ask_depth materialized columns were removed
+        // for cost optimization. We now compute them at query time using arraySum().
         const query = `
           WITH depth_changes AS (
             SELECT
               asset_id,
               toStartOfMinute(source_ts) as minute,
-              max(total_bid_depth) - min(total_bid_depth) as bid_depth_change,
-              max(total_ask_depth) - min(total_ask_depth) as ask_depth_change,
+              max(arraySum(bid_sizes)) - min(arraySum(bid_sizes)) as bid_depth_change,
+              max(arraySum(ask_sizes)) - min(arraySum(ask_sizes)) as ask_depth_change,
               count() as snapshot_count
             FROM ${getTable("OB_SNAPSHOTS")}
             WHERE source_ts >= now() - INTERVAL 1 HOUR
-              AND total_bid_depth IS NOT NULL
-              AND total_ask_depth IS NOT NULL
+              AND length(bid_sizes) > 0
+              AND length(ask_sizes) > 0
             GROUP BY asset_id, minute
             HAVING snapshot_count >= 2
           ),
@@ -549,8 +551,8 @@ describe("P1: Cross-Table Consistency", () => {
           SELECT
             asset_id,
             toStartOfMinute(source_ts) as minute,
-            max(total_bid_depth) - min(total_bid_depth) as bid_depth_range,
-            max(total_ask_depth) - min(total_ask_depth) as ask_depth_range,
+            max(arraySum(bid_sizes)) - min(arraySum(bid_sizes)) as bid_depth_range,
+            max(arraySum(ask_sizes)) - min(arraySum(ask_sizes)) as ask_depth_range,
             count() as snapshot_count
           FROM ${getTable("OB_SNAPSHOTS")}
           WHERE source_ts >= now() - INTERVAL ${TEST_CONFIG.LOOKBACK_HOURS} HOUR

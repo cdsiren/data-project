@@ -102,9 +102,12 @@ describe("P0: Critical Validation Tests", () => {
         }>(config, storedQuery);
 
         if (storedResult.data.length === 0) {
-          // Try ob_snapshots as fallback
+          // Try ob_snapshots as fallback (compute best_bid/best_ask from arrays)
           const snapshotQuery = `
-            SELECT best_bid, best_ask, source_ts
+            SELECT
+              if(length(bid_prices) > 0, bid_prices[length(bid_prices)], 0) as best_bid,
+              if(length(ask_prices) > 0, ask_prices[1], 0) as best_ask,
+              source_ts
             FROM ${getTable("OB_SNAPSHOTS")}
             WHERE asset_id = '${assetId}'
             ORDER BY source_ts DESC
@@ -216,13 +219,13 @@ describe("P0: Critical Validation Tests", () => {
         const liveSummary = await fetchOrderbookSummary(assetId);
         if (!liveSummary) continue;
 
-        // Get stored depth from ob_snapshots
+        // Get stored depth from ob_snapshots (compute from arrays since materialized columns removed)
         const storedQuery = `
           SELECT
-            total_bid_depth,
-            total_ask_depth,
-            bid_levels,
-            ask_levels
+            arraySum(bid_sizes) as total_bid_depth,
+            arraySum(ask_sizes) as total_ask_depth,
+            length(bid_prices) as bid_levels,
+            length(ask_prices) as ask_levels
           FROM ${getTable("OB_SNAPSHOTS")}
           WHERE asset_id = '${assetId}'
           ORDER BY source_ts DESC

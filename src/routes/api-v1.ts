@@ -738,28 +738,28 @@ apiV1.get(
       FORMAT JSON
     `;
 
-    // Get current BBO
+    // Get current BBO (PREWHERE for primary key filter optimization)
     const bboQuery = `
       SELECT
         best_bid,
         best_ask,
         spread_bps
       FROM ${DB_CONFIG.DATABASE}.ob_bbo
-      WHERE asset_id = '${escapedAssetId}'
+      PREWHERE asset_id = '${escapedAssetId}'
       ORDER BY source_ts DESC
       LIMIT 1
       FORMAT JSON
     `;
 
-    // Get 24h stats
+    // Get 24h stats (PREWHERE for primary key filter optimization)
     const statsQuery = `
       SELECT
         count() as tick_count,
         max(best_bid) as high,
         min(best_bid) as low
       FROM ${DB_CONFIG.DATABASE}.ob_bbo
-      WHERE asset_id = '${escapedAssetId}'
-        AND source_ts >= now() - INTERVAL 24 HOUR
+      PREWHERE asset_id = '${escapedAssetId}'
+      WHERE source_ts >= now() - INTERVAL 24 HOUR
       FORMAT JSON
     `;
 
