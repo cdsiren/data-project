@@ -3839,8 +3839,8 @@ export class OrderbookManager extends DurableObject<Env> {
       case "VOLATILITY_SPIKE": {
         // Calculate rolling std dev of price returns over window_ms
         // AS model spread = 2/γ + γσ²(T-t) — when σ spikes, spreads should widen
-        // Uses best_bid as reference price since mid_price was removed
-        if (snapshot.best_bid === null || !window_ms) break;
+        // Requires both bid and ask since price history stores midpoint
+        if (snapshot.best_bid === null || snapshot.best_ask === null || !window_ms) break;
 
         const history = this.priceHistory.get(snapshot.asset_id);
         if (!history || history.length < 2) break;
@@ -4305,8 +4305,8 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // VOLATILITY_SPIKE: Fire when volatility > 2% (checked with 10s window)
     // OPTIMIZED: Uses binary search + in-place variance calculation to avoid allocations
-    // Uses best_bid as reference price since mid_price was removed
-    if (snapshot.best_bid !== null) {
+    // Requires both bid and ask since price history stores midpoint
+    if (snapshot.best_bid !== null && snapshot.best_ask !== null) {
       const history = this.priceHistory.get(assetId);
       if (history && history.length >= 5) {
         const windowStartUs = snapshot.source_ts - 10000000; // 10 second window
