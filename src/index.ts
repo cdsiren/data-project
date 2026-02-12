@@ -10,12 +10,16 @@ import type {
 } from "./types/orderbook";
 import { OrderbookManager } from "./durable-objects/orderbook-manager";
 import { TriggerEventBuffer } from "./durable-objects/trigger-event-buffer";
+import { GraphManager } from "./durable-objects/graph-manager";
 import { snapshotConsumer } from "./consumers/snapshot-consumer";
 import { gapBackfillConsumer } from "./consumers/gap-backfill-consumer";
 import { tradeTickConsumer } from "./consumers/trade-tick-consumer";
 import { levelChangeConsumer } from "./consumers/level-change-consumer";
 import { fullL2SnapshotConsumer } from "./consumers/full-l2-snapshot-consumer";
 import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
+import { edgeSignalConsumer } from "./consumers/edge-signal-consumer";
+import { graphRouter } from "./routes/graph";
+import type { GraphQueueMessage } from "./services/graph/types";
 import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache, refreshAllMarketMetadata, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { MarketCacheService } from "./services/market-cache";
 import { TriggerValidator } from "./services/trigger-evaluator/trigger-validator";
@@ -1695,8 +1699,11 @@ app.route("/api/v1", legacyDashboardApi);
 // Mount backtest API under /api/v1/backtest
 app.route("/api/v1/backtest", backtest);
 
+// Mount graph API under /api/graph
+app.route("/api/graph", graphRouter);
+
 // Export Durable Objects
-export { OrderbookManager, TriggerEventBuffer };
+export { OrderbookManager, TriggerEventBuffer, GraphManager };
 
 async function queueHandler(batch: MessageBatch, env: Env) {
   const queueName = batch.queue;
@@ -1719,6 +1726,9 @@ async function queueHandler(batch: MessageBatch, env: Env) {
       break;
     case "dead-letter-queue":
       await deadLetterConsumer(batch as MessageBatch<DeadLetterMessage>, env);
+      break;
+    case "graph-edge-signal-queue":
+      await edgeSignalConsumer(batch as MessageBatch<GraphQueueMessage>, env);
       break;
   }
 }
@@ -1837,6 +1847,47 @@ async function scheduledHandler(
       })
     );
     return; // Don't run other crons in same invocation
+  }
+
+  // ============================================================
+  // 15-MINUTE CRON: Graph rebuild (cron: "7,22,37,52 * * * *")
+  // Rebuilds market graph from ClickHouse edge signals
+  // Runs correlation seeding and negative cycle detection
+  // ============================================================
+  if (event.cron === "7,22,37,52 * * * *") {
+    console.log("[Scheduled] Running graph rebuild at", now);
+
+    ctx.waitUntil(
+      withCronErrorTracking(
+        env.MARKET_CACHE,
+        "7,22,37,52 * * * *",
+        "graph-rebuild",
+        async () => {
+          // Trigger GraphManager rebuild
+          const ns = env.GRAPH_MANAGER as unknown as DurableObjectNamespaceExt;
+          const doId = ns.idFromName("global", { locationHint: DEFAULT_LOCATION_HINT });
+          const stub = env.GRAPH_MANAGER.get(doId);
+
+          const response = await stub.fetch("http://do/rebuild", { method: "POST" });
+          const result = await response.json() as { market_count?: number; edge_count?: number };
+
+          console.log(
+            `[Scheduled] Graph rebuild complete: ${result.market_count ?? 0} markets, ${result.edge_count ?? 0} edges`
+          );
+
+          // Run cycle detection after rebuild
+          const cycleResponse = await stub.fetch("http://do/detect-cycles", { method: "POST" });
+          const cycleResult = await cycleResponse.json() as { count?: number };
+
+          if (cycleResult.count && cycleResult.count > 0) {
+            console.log(`[Scheduled] Detected ${cycleResult.count} negative cycles (arbitrage opportunities)`);
+          }
+        }
+      ).catch((error) => {
+        console.error("[Scheduled] CRON FAILED - Graph rebuild error:", error);
+      })
+    );
+    return;
   }
 
   // ============================================================

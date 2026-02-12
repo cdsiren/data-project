@@ -20,8 +20,9 @@ import type {
   PriceHistoryEntry,
 } from "../types/orderbook";
 import type { MarketSource, LevelChangeType } from "../core/enums";
-import type { TriggerType, TriggerBounds } from "../core/triggers";
-import { computeTriggerBounds } from "../core/triggers";
+import type { TriggerType, TriggerBounds, CompoundTrigger } from "../core/triggers";
+import { computeTriggerBounds, isCompoundTrigger } from "../core/triggers";
+import { CompoundTriggerEvaluator } from "../services/trigger-evaluator/compound-evaluator";
 import { getDefaultMarketSource } from "../config/database";
 import { ClickHouseOrderbookClient } from "../services/clickhouse-orderbook";
 import type { MarketConnector } from "../adapters/base-connector";
@@ -59,6 +60,7 @@ interface PoolState {
   negRisk: [string, boolean][];
   orderMinSizes: [string, number][];
   triggers?: Trigger[]; // Low-latency triggers
+  compoundTriggers?: CompoundTrigger[]; // Multi-market compound triggers
 }
 
 /**
@@ -95,6 +97,8 @@ export class OrderbookManager extends DurableObject<Env> {
   // Processes signals directly, bypassing queues for <50ms latency
   // ============================================================
   private triggers: Map<string, Trigger> = new Map(); // trigger_id -> Trigger
+  private compoundTriggers: Map<string, CompoundTrigger> = new Map(); // compound trigger_id -> CompoundTrigger
+  private compoundEvaluator: CompoundTriggerEvaluator | null = null; // Initialized after env available
   private triggerBounds: Map<string, TriggerBounds> = new Map(); // trigger_id -> pre-computed bounds for fast pre-filtering
   private triggersByAsset: Map<string, Set<string>> = new Map(); // asset_id -> Set<trigger_id>
   private lastTriggerFire: Map<string, number> = new Map(); // trigger_id -> last fire timestamp
@@ -113,6 +117,15 @@ export class OrderbookManager extends DurableObject<Env> {
   // Market relationships for arbitrage: maps asset_id -> Set of related asset_ids (YES/NO pairs)
   // Used to proactively mark counterpart BBO as stale when primary updates
   private marketRelationships: Map<string, Set<string>> = new Map();
+
+  // ============================================================
+  // GRAPH CACHE - 1-hop neighbors for compound triggers
+  // Local cache with lazy loading from KV/GraphManager DO
+  // ============================================================
+  private graphCache: Map<string, import("../services/graph/types").GraphNeighbor[]> = new Map();
+  private readonly GRAPH_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+  private graphCacheTimestamps: Map<string, number> = new Map(); // market_id -> cache timestamp
+
   // CRITICAL PATH OPTIMIZATION: Pre-cached HMAC keys for webhook signing (avoids crypto.subtle.importKey on hot path)
   private hmacKeyCache: Map<string, CryptoKey> = new Map();
   private readonly PRICE_HISTORY_MAX_AGE_MS = 60000; // Keep 60s of price history
@@ -258,6 +271,14 @@ export class OrderbookManager extends DurableObject<Env> {
 
     this.initialConnectionDelayMs = 5000 + staggerMs;
 
+    // Initialize compound trigger evaluator with cross-shard KV and graph queue
+    // This enables compound triggers with gradual decay for wrong hypotheses
+    this.compoundEvaluator = new CompoundTriggerEvaluator(
+      this.shardId,
+      this.env.CROSS_SHARD_KV,
+      this.env.GRAPH_QUEUE
+    );
+
     // Restore state on wake with comprehensive validation
     this.ctx.blockConcurrencyWhile(async () => {
       try {
@@ -340,6 +361,43 @@ export class OrderbookManager extends DurableObject<Env> {
           if (validTriggers > 0 || invalidTriggers > 0) {
             console.log(
               `[DO ${this.shardId}] Restored triggers: ${validTriggers} valid, ${invalidTriggers} invalid/skipped`
+            );
+          }
+        }
+
+        // Restore compound triggers with validation
+        if (stored.compoundTriggers && Array.isArray(stored.compoundTriggers)) {
+          let validCompound = 0;
+          let invalidCompound = 0;
+
+          for (const trigger of stored.compoundTriggers) {
+            // Validate compound trigger structure
+            if (!trigger.id || !trigger.conditions || !Array.isArray(trigger.conditions) || trigger.conditions.length === 0) {
+              console.warn(`[DO ${this.shardId}] Skipping invalid compound trigger:`, trigger.id || "unknown");
+              invalidCompound++;
+              continue;
+            }
+
+            try {
+              this.compoundTriggers.set(trigger.id, trigger);
+
+              // Index by all asset_ids in conditions
+              for (const condition of trigger.conditions) {
+                if (!this.triggersByAsset.has(condition.asset_id)) {
+                  this.triggersByAsset.set(condition.asset_id, new Set());
+                }
+                this.triggersByAsset.get(condition.asset_id)!.add(trigger.id);
+              }
+              validCompound++;
+            } catch (triggerError) {
+              console.error(`[DO ${this.shardId}] Failed to restore compound trigger ${trigger.id}:`, triggerError);
+              invalidCompound++;
+            }
+          }
+
+          if (validCompound > 0 || invalidCompound > 0) {
+            console.log(
+              `[DO ${this.shardId}] Restored compound triggers: ${validCompound} valid, ${invalidCompound} invalid/skipped`
             );
           }
         }
@@ -487,6 +545,9 @@ export class OrderbookManager extends DurableObject<Env> {
     this.previousBBO.clear();
     // Clear data integrity tracking
     this.missingBookFirstSeen.clear();
+    // Clear graph cache
+    this.graphCache.clear();
+    this.graphCacheTimestamps.clear();
 
     // Clear corrupted storage
     try {
@@ -495,6 +556,98 @@ export class OrderbookManager extends DurableObject<Env> {
     } catch (deleteError) {
       console.error(`[DO ${this.shardId}] Failed to clear corrupted state:`, deleteError);
     }
+  }
+
+  // ============================================================
+  // GRAPH CACHE METHODS
+  // Tiered lookup: L1 (memory) -> L2 (KV) -> L3 (GraphManager DO)
+  // Target: < 5ms for hot path lookups
+  // ============================================================
+
+  /**
+   * Get 1-hop graph neighbors for a market.
+   * Uses tiered caching: memory -> KV -> GraphManager DO
+   *
+   * @param marketId - Market ID (condition_id) to look up
+   * @returns Array of graph neighbors with weights
+   */
+  async get1HopNeighbors(marketId: string): Promise<import("../services/graph/types").GraphNeighbor[]> {
+    // L1: Check memory cache
+    const cachedTs = this.graphCacheTimestamps.get(marketId);
+    if (cachedTs && Date.now() - cachedTs < this.GRAPH_CACHE_TTL_MS) {
+      const cached = this.graphCache.get(marketId);
+      if (cached) return cached;
+    }
+
+    // L2: Check KV cache
+    const kvKey = `graph:neighbors:${marketId}`;
+    try {
+      const kvData = await this.env.GRAPH_CACHE.get(kvKey, "json") as {
+        neighbors: import("../services/graph/types").GraphNeighbor[];
+        updated_at: number;
+      } | null;
+
+      if (kvData && kvData.neighbors) {
+        // Cache in memory
+        this.graphCache.set(marketId, kvData.neighbors);
+        this.graphCacheTimestamps.set(marketId, Date.now());
+        return kvData.neighbors;
+      }
+    } catch (error) {
+      console.warn(`[DO ${this.shardId}] KV graph cache miss for ${marketId}:`, error);
+    }
+
+    // L3: Fall back to GraphManager DO
+    try {
+      const ns = this.env.GRAPH_MANAGER as unknown as {
+        idFromName(name: string, options?: { locationHint?: DurableObjectLocationHint }): DurableObjectId;
+      };
+      const doId = ns.idFromName("global", { locationHint: "weur" });
+      const stub = this.env.GRAPH_MANAGER.get(doId);
+
+      const response = await stub.fetch(`http://do/neighbors/${marketId}`);
+      if (response.ok) {
+        const data = await response.json() as {
+          neighbors: import("../services/graph/types").GraphNeighbor[];
+        };
+
+        // Cache in memory and KV
+        const neighbors = data.neighbors || [];
+        this.graphCache.set(marketId, neighbors);
+        this.graphCacheTimestamps.set(marketId, Date.now());
+
+        // Async KV cache write (don't await on hot path)
+        this.env.GRAPH_CACHE.put(kvKey, JSON.stringify({
+          market_id: marketId,
+          neighbors,
+          updated_at: Date.now(),
+        }), { expirationTtl: 900 }).catch(() => {});
+
+        return neighbors;
+      }
+    } catch (error) {
+      console.warn(`[DO ${this.shardId}] GraphManager DO lookup failed for ${marketId}:`, error);
+    }
+
+    return [];
+  }
+
+  /**
+   * Invalidate graph cache for a market.
+   * Called when the market is resolved or when graph is rebuilt.
+   */
+  invalidateGraphCache(marketId: string): void {
+    this.graphCache.delete(marketId);
+    this.graphCacheTimestamps.delete(marketId);
+  }
+
+  /**
+   * Clear all graph cache entries.
+   * Called during graph rebuild to ensure fresh data.
+   */
+  clearGraphCache(): void {
+    this.graphCache.clear();
+    this.graphCacheTimestamps.clear();
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -2341,6 +2494,7 @@ export class OrderbookManager extends DurableObject<Env> {
       negRisk: Array.from(this.negRisk.entries()),
       orderMinSizes: Array.from(this.orderMinSizes.entries()),
       triggers: Array.from(this.triggers.values()),
+      compoundTriggers: Array.from(this.compoundTriggers.values()),
     } satisfies PoolState);
   }
 
@@ -3046,9 +3200,13 @@ export class OrderbookManager extends DurableObject<Env> {
 
   private handleListTriggers(): Response {
     const triggers = Array.from(this.triggers.values());
+    const compoundTriggers = Array.from(this.compoundTriggers.values());
     return Response.json({
       triggers,
-      total: triggers.length,
+      compound_triggers: compoundTriggers,
+      total: triggers.length + compoundTriggers.length,
+      standard_count: triggers.length,
+      compound_count: compoundTriggers.length,
       by_asset: Object.fromEntries(
         Array.from(this.triggersByAsset.entries()).map(([k, v]) => [k, v.size])
       ),
@@ -3057,28 +3215,53 @@ export class OrderbookManager extends DurableObject<Env> {
 
   private async handleRegisterTrigger(request: Request): Promise<Response> {
     try {
-      const body = (await request.json()) as Partial<Trigger>;
+      // Accept both standard trigger and compound trigger fields
+      const body = (await request.json()) as Partial<Trigger> & Partial<CompoundTrigger> & {
+        compound_mode?: CompoundTrigger["compound_mode"];
+        conditions?: CompoundTrigger["conditions"];
+        compound_threshold?: number;
+        cross_shard?: boolean;
+        inferred_edge_type?: "correlation" | "hedge" | "causal";
+        user_id?: string;
+        market_source?: string;
+      };
 
-      // Validate required fields
-      if (!body.asset_id || !body.condition || !body.webhook_url) {
+      // Validate required fields (condition is optional for compound triggers)
+      if (!body.asset_id || !body.webhook_url || (!body.condition && !body.conditions)) {
         return Response.json(
           {
             trigger_id: "",
             status: "error",
-            message: "Missing required fields: asset_id, condition, webhook_url",
+            message: "Missing required fields: asset_id, webhook_url, and condition (or conditions for compound triggers)",
           } as TriggerRegistration,
           { status: 400 }
         );
       }
 
-      // Validate condition-specific parameters
-      const validationError = this.validateTriggerCondition(body.condition);
-      if (validationError) {
-        return Response.json(
-          { trigger_id: "", status: "error", message: validationError } as TriggerRegistration,
-          { status: 400 }
-        );
+      // Validate condition-specific parameters (skip for compound triggers)
+      if (body.condition && !body.compound_mode) {
+        const validationError = this.validateTriggerCondition(body.condition);
+        if (validationError) {
+          return Response.json(
+            { trigger_id: "", status: "error", message: validationError } as TriggerRegistration,
+            { status: 400 }
+          );
+        }
       }
+
+      // For compound triggers, validate all conditions
+      if (body.compound_mode && body.conditions) {
+        for (let i = 0; i < body.conditions.length; i++) {
+          const validationError = this.validateTriggerCondition(body.conditions[i]);
+          if (validationError) {
+            return Response.json(
+              { trigger_id: "", status: "error", message: `Condition ${i}: ${validationError}` } as TriggerRegistration,
+              { status: 400 }
+            );
+          }
+        }
+      }
+
       if (body.asset_id !== "*" && !this.assetToMarket.has(body.asset_id)) {
         return Response.json(
           {
@@ -3131,10 +3314,67 @@ export class OrderbookManager extends DurableObject<Env> {
         );
       }
 
+      const triggerId = body.id || `trig_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+
+      // Check if this is a compound trigger (has conditions array and compound_mode)
+      if (body.compound_mode && Array.isArray(body.conditions) && body.conditions.length > 0) {
+        // Create compound trigger
+        const compoundTrigger: CompoundTrigger = {
+          id: triggerId,
+          asset_id: body.asset_id, // Primary asset for routing
+          condition: body.conditions[0], // First condition as primary (for type compatibility)
+          conditions: body.conditions,
+          compound_mode: body.compound_mode,
+          compound_threshold: body.compound_threshold,
+          cross_shard: body.cross_shard ?? false,
+          inferred_edge_type: body.inferred_edge_type || "correlation",
+          market_ids: body.conditions.map((c: { market_id: string }) => c.market_id),
+          market_source: body.market_source || "polymarket",
+          user_id: body.user_id,
+          webhook_url: body.webhook_url,
+          webhook_secret: body.webhook_secret,
+          enabled: body.enabled ?? true,
+          cooldown_ms: cooldown,
+          created_at: Date.now(),
+          metadata: body.metadata,
+        };
+
+        // Store compound trigger
+        this.compoundTriggers.set(triggerId, compoundTrigger);
+
+        // Index by all asset_ids in conditions for efficient lookup
+        for (const condition of compoundTrigger.conditions) {
+          if (!this.triggersByAsset.has(condition.asset_id)) {
+            this.triggersByAsset.set(condition.asset_id, new Set());
+          }
+          this.triggersByAsset.get(condition.asset_id)!.add(triggerId);
+        }
+
+        // Emit edge signals for market pairs (user believes these are related)
+        if (this.env.GRAPH_QUEUE && compoundTrigger.market_ids.length > 1) {
+          this.ctx.waitUntil(this.emitTriggerCreationSignals(compoundTrigger));
+        }
+
+        await this.persistState();
+
+        console.log(
+          `[Trigger] Registered compound trigger ${triggerId}: ` +
+          `${compoundTrigger.compound_mode} with ${compoundTrigger.conditions.length} conditions`
+        );
+
+        return Response.json({
+          trigger_id: triggerId,
+          status: "created",
+          type: "compound",
+        } as TriggerRegistration);
+      }
+
+      // Standard single-condition trigger
+      // At this point body.condition must exist (validated above and not compound)
       const trigger: Trigger = {
-        id: body.id || `trig_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`,
+        id: triggerId,
         asset_id: body.asset_id,
-        condition: body.condition,
+        condition: body.condition!,
         webhook_url: body.webhook_url,
         webhook_secret: body.webhook_secret,
         enabled: body.enabled ?? true,
@@ -3221,30 +3461,54 @@ export class OrderbookManager extends DurableObject<Env> {
     try {
       const { trigger_id } = (await request.json()) as { trigger_id: string };
 
+      // Check standard triggers first
       const trigger = this.triggers.get(trigger_id);
-      if (!trigger) {
-        return Response.json({ status: "error", message: "Trigger not found" }, { status: 404 });
-      }
+      if (trigger) {
+        // Remove from all maps including bounds cache
+        this.triggers.delete(trigger_id);
+        this.triggerBounds.delete(trigger_id);
+        this.triggersByAsset.get(trigger.asset_id)?.delete(trigger_id);
 
-      // Remove from all maps including bounds cache
-      this.triggers.delete(trigger_id);
-      this.triggerBounds.delete(trigger_id);
-      this.triggersByAsset.get(trigger.asset_id)?.delete(trigger_id);
+        // Invalidate cached HMAC key
+        this.invalidateHmacKeyCache(trigger_id);
 
-      // Invalidate cached HMAC key
-      this.invalidateHmacKeyCache(trigger_id);
-
-      // If wildcard, remove from all assets
-      if (trigger.asset_id === "*") {
-        for (const assetTriggers of this.triggersByAsset.values()) {
-          assetTriggers.delete(trigger_id);
+        // If wildcard, remove from all assets
+        if (trigger.asset_id === "*") {
+          for (const assetTriggers of this.triggersByAsset.values()) {
+            assetTriggers.delete(trigger_id);
+          }
         }
+
+        await this.persistState();
+        console.log(`[Trigger] Deleted trigger ${trigger_id}`);
+        return Response.json({ status: "deleted", trigger_id });
       }
 
-      await this.persistState();
+      // Check compound triggers
+      const compoundTrigger = this.compoundTriggers.get(trigger_id);
+      if (compoundTrigger) {
+        // Remove from compound triggers map
+        this.compoundTriggers.delete(trigger_id);
 
-      console.log(`[Trigger] Deleted trigger ${trigger_id}`);
-      return Response.json({ status: "deleted", trigger_id });
+        // Remove from triggersByAsset for all conditions
+        for (const condition of compoundTrigger.conditions) {
+          this.triggersByAsset.get(condition.asset_id)?.delete(trigger_id);
+        }
+
+        // Invalidate cached HMAC key
+        this.invalidateHmacKeyCache(trigger_id);
+
+        // Clear evaluator state for this trigger
+        if (this.compoundEvaluator) {
+          this.compoundEvaluator.clearTriggerState(trigger_id);
+        }
+
+        await this.persistState();
+        console.log(`[Trigger] Deleted compound trigger ${trigger_id}`);
+        return Response.json({ status: "deleted", trigger_id, type: "compound" });
+      }
+
+      return Response.json({ status: "error", message: "Trigger not found" }, { status: 404 });
     } catch (error) {
       return Response.json({ status: "error", message: String(error) }, { status: 500 });
     }
@@ -3505,6 +3769,14 @@ export class OrderbookManager extends DurableObject<Env> {
           this.latencyTracker.record(event.total_latency_us, event.processing_latency_us);
         }
       }
+    }
+
+    // ============================================================
+    // COMPOUND TRIGGERS - Multi-market condition triggers
+    // Uses CompoundTriggerEvaluator with gradual decay for wrong hypotheses
+    // ============================================================
+    if (this.compoundTriggers.size > 0 && this.compoundEvaluator) {
+      this.ctx.waitUntil(this.evaluateCompoundTriggers(snapshot, now, firedEvents));
     }
 
     // ============================================================
@@ -4139,6 +4411,163 @@ export class OrderbookManager extends DurableObject<Env> {
     }
 
     return { fired: false, actualValue: 0 };
+  }
+
+  // ============================================================
+  // COMPOUND TRIGGER EVALUATION
+  // Multi-market triggers with gradual decay for wrong hypotheses
+  // ============================================================
+
+  /**
+   * Evaluate compound triggers that span multiple markets.
+   * Uses CompoundTriggerEvaluator which tracks:
+   * - Partial condition fires across BBO updates
+   * - Cross-shard coordination via KV
+   * - Gradual edge decay when triggers don't fire
+   */
+  private async evaluateCompoundTriggers(
+    snapshot: BBOSnapshot,
+    nowUs: number,
+    firedEvents: { trigger: Trigger; event: TriggerEvent }[]
+  ): Promise<void> {
+    if (!this.compoundEvaluator) return;
+
+    // Find compound triggers that include this asset in their conditions
+    for (const [triggerId, trigger] of this.compoundTriggers) {
+      if (!trigger.enabled) continue;
+
+      // Check if any condition involves this asset
+      const involvesAsset = trigger.conditions.some(
+        c => c.asset_id === snapshot.asset_id
+      );
+      if (!involvesAsset) continue;
+
+      // Check cooldown
+      const lastFire = this.lastTriggerFire.get(triggerId) || 0;
+      if (nowUs - lastFire < (trigger.cooldown_ms || 0) * 1000) continue;
+
+      // Circuit breaker check
+      if (!this.isTriggerCircuitClosed(triggerId)) continue;
+
+      try {
+        const result = await this.compoundEvaluator.evaluate(
+          trigger,
+          snapshot,
+          this.latestBBO
+        );
+
+        this.recordTriggerSuccess(triggerId);
+
+        if (result.shouldFire) {
+          this.lastTriggerFire.set(triggerId, nowUs);
+
+          // Create compound trigger event
+          const event = this.compoundEvaluator.createTriggerEvent(
+            trigger,
+            snapshot,
+            result,
+            snapshot.source_ts,
+            snapshot.ingestion_ts
+          );
+
+          // Push to firedEvents for webhook dispatch
+          // Note: We cast to Trigger since CompoundTrigger extends it
+          firedEvents.push({ trigger: trigger as unknown as Trigger, event });
+
+          // Record latency
+          this.latencyTracker.record(event.total_latency_us, event.processing_latency_us);
+
+          // Emit reinforcement signal to graph queue (trigger fire = user was right)
+          if (this.env.GRAPH_QUEUE && trigger.market_ids && trigger.market_ids.length > 1) {
+            this.ctx.waitUntil(this.emitTriggerFireSignals(trigger));
+          }
+        }
+        // Decay tracking happens automatically inside compoundEvaluator.evaluate()
+      } catch (error) {
+        console.error(
+          `[Trigger] Compound trigger ${triggerId} failed:`,
+          error instanceof Error ? error.message : error
+        );
+        this.recordTriggerFailure(triggerId);
+      }
+    }
+  }
+
+  /**
+   * Emit edge reinforcement signals when a compound trigger fires.
+   * This indicates the user's market relationship hypothesis was correct.
+   */
+  private async emitTriggerFireSignals(trigger: CompoundTrigger): Promise<void> {
+    const marketIds = trigger.market_ids;
+    if (!marketIds || marketIds.length < 2) return;
+
+    const edgeType = trigger.inferred_edge_type || "correlation";
+
+    // Generate all pairs and emit signals
+    for (let i = 0; i < marketIds.length; i++) {
+      for (let j = i + 1; j < marketIds.length; j++) {
+        try {
+          await this.env.GRAPH_QUEUE.send({
+            type: "edge_signal",
+            market_a: marketIds[i],
+            market_b: marketIds[j],
+            edge_type: edgeType,
+            signal_source: "trigger_fire",
+            user_id: trigger.user_id || "",
+            strength: 1.0, // Positive reinforcement
+            metadata: {
+              trigger_id: trigger.id,
+              shard_id: this.shardId,
+              fired_at: Date.now(),
+            },
+          });
+        } catch (error) {
+          console.error(
+            `[Graph] Failed to emit fire signal for ${marketIds[i]}-${marketIds[j]}:`,
+            error
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Emit initial edge signals when a compound trigger is created.
+   * This records the user's hypothesis that these markets are related.
+   */
+  private async emitTriggerCreationSignals(trigger: CompoundTrigger): Promise<void> {
+    const marketIds = trigger.market_ids;
+    if (!marketIds || marketIds.length < 2) return;
+
+    const edgeType = trigger.inferred_edge_type || "correlation";
+
+    // Generate all pairs and emit signals
+    for (let i = 0; i < marketIds.length; i++) {
+      for (let j = i + 1; j < marketIds.length; j++) {
+        try {
+          await this.env.GRAPH_QUEUE.send({
+            type: "edge_signal",
+            market_a: marketIds[i],
+            market_b: marketIds[j],
+            edge_type: edgeType,
+            signal_source: "user_trigger",
+            user_id: trigger.user_id || "",
+            strength: 1.5, // Stronger than analysis, weaker than fire
+            metadata: {
+              trigger_id: trigger.id,
+              shard_id: this.shardId,
+              created_at: Date.now(),
+              compound_mode: trigger.compound_mode,
+            },
+          });
+        } catch (error) {
+          console.error(
+            `[Graph] Failed to emit creation signal for ${marketIds[i]}-${marketIds[j]}:`,
+            error
+          );
+        }
+      }
+    }
   }
 
   // Global trigger cooldown tracking (separate from registered triggers)
