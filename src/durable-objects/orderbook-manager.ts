@@ -3251,16 +3251,33 @@ export class OrderbookManager extends DurableObject<Env> {
         );
       }
 
-      // Validation: N_OF_M mode requires compound_threshold >= 1
-      if (body.compound_mode === "N_OF_M" && (body.compound_threshold === undefined || body.compound_threshold < 1)) {
-        return Response.json(
-          {
-            trigger_id: "",
-            status: "error",
-            message: "compound_threshold is required for N_OF_M mode and must be >= 1",
-          } as TriggerRegistration,
-          { status: 400 }
-        );
+      // Validation: N_OF_M mode requires compound_threshold >= 1 AND <= conditions.length
+      // (threshold > conditions.length creates impossible-to-fire triggers that waste resources)
+      if (body.compound_mode === "N_OF_M") {
+        const threshold = body.compound_threshold;
+        const conditionCount = body.conditions?.length || 0;
+
+        if (threshold === undefined || threshold < 1) {
+          return Response.json(
+            {
+              trigger_id: "",
+              status: "error",
+              message: "compound_threshold is required for N_OF_M mode and must be >= 1",
+            } as TriggerRegistration,
+            { status: 400 }
+          );
+        }
+
+        if (threshold > conditionCount) {
+          return Response.json(
+            {
+              trigger_id: "",
+              status: "error",
+              message: `compound_threshold (${threshold}) cannot exceed number of conditions (${conditionCount})`,
+            } as TriggerRegistration,
+            { status: 400 }
+          );
+        }
       }
 
       // Validate condition-specific parameters (skip for compound triggers)

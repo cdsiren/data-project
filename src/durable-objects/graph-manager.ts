@@ -315,6 +315,18 @@ export class GraphManager extends DurableObject<Env> {
       // Then fetch the aggregated edges
       const edges = await this.fetchEdgesFromClickHouse();
 
+      // CRITICAL: Preserve existing graph data if fetch returned empty due to error
+      // An empty result from a working ClickHouse is valid (no edges above threshold),
+      // but we distinguish this by checking if we had data before and got nothing back.
+      // If we had a populated graph and get empty results, it's likely a transient error.
+      if (edges.length === 0 && this.adjacencyList.size > 0) {
+        console.warn(
+          `[GraphManager] Fetch returned 0 edges but graph has ${this.adjacencyList.size} markets. ` +
+          `Preserving existing data to avoid data loss from transient ClickHouse errors.`
+        );
+        return;
+      }
+
       // Build adjacency list with optimized Map access
       // Cache array references to reduce Map.get() calls from 4 to 2 per edge
       const newAdjacencyList = new Map<string, GraphNeighbor[]>();
