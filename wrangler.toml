@@ -95,6 +95,18 @@ max_batch_timeout = 5     # Low latency for real-time graph updates
 max_retries = 3
 dead_letter_queue = "dead-letter-queue"
 
+# Webhook dead letter queue for failed webhook deliveries
+# Allows retry/investigation of failed trigger notifications
+[[queues.producers]]
+queue = "webhook-dlq"
+binding = "WEBHOOK_DLQ"
+
+[[queues.consumers]]
+queue = "webhook-dlq"
+max_batch_size = 50       # Smaller batch for webhook retries
+max_batch_timeout = 30    # Allow some batching for efficiency
+max_retries = 3
+
 # ============================================================
 # DURABLE OBJECTS
 # ============================================================

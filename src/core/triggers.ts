@@ -337,6 +337,8 @@ export interface CompoundTriggerState {
   last_evaluation: number;
   /** Actual values when conditions fired: index -> value */
   condition_values: Map<string, number>;
+  /** Version counter for optimistic locking (prevents race conditions in concurrent evaluations) */
+  version: number;
 }
 
 /**

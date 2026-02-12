@@ -86,6 +86,9 @@ export class CompoundTriggerEvaluator {
   /**
    * Evaluate a compound trigger against a BBO update.
    *
+   * Uses optimistic locking to prevent race conditions when multiple concurrent
+   * evaluations occur (e.g., rapid BBO updates from different assets in the same trigger).
+   *
    * @param trigger - The compound trigger to evaluate
    * @param snapshot - The BBO snapshot that triggered evaluation
    * @param latestBBO - Map of all latest BBO data by asset_id
@@ -111,9 +114,22 @@ export class CompoundTriggerEvaluator {
         fired_conditions: new Set(),
         last_evaluation: Date.now(),
         condition_values: new Map(),
+        version: 0,
       };
       this.triggerState.set(trigger.id, state);
     }
+
+    // Optimistic locking: capture state version at start of evaluation
+    const startVersion = state.version;
+    const now = Date.now();
+
+    // Check staleness using version + time
+    const isStale = now - state.last_evaluation > this.STALE_STATE_THRESHOLD_MS;
+
+    // Clone current state for this evaluation (isolation from concurrent evaluations)
+    // This prevents one evaluation from seeing partial updates from another
+    const firedConditions = isStale ? new Set<string>() : new Set(state.fired_conditions);
+    const conditionValues = isStale ? new Map<string, number>() : new Map(state.condition_values);
 
     const results: Array<{
       index: number;
@@ -123,21 +139,15 @@ export class CompoundTriggerEvaluator {
       actual_value?: number;
     }> = [];
 
-    // Cleanup stale state BEFORE evaluation to prevent old data from affecting fire decision
-    if (Date.now() - state.last_evaluation > this.STALE_STATE_THRESHOLD_MS) {
-      state.fired_conditions.clear();
-      state.condition_values.clear();
-    }
-
-    // Evaluate each condition
+    // Evaluate each condition against cloned state
     for (let i = 0; i < trigger.conditions.length; i++) {
       const condition = trigger.conditions[i];
 
       // Check if this condition applies to the current snapshot
       if (condition.asset_id !== snapshot.asset_id) {
-        // Use cached state for conditions not in this update
-        const previouslyFired = state.fired_conditions.has(String(i));
-        const cachedValue = state.condition_values.get(String(i));
+        // Use cloned state for conditions not in this update
+        const previouslyFired = firedConditions.has(String(i));
+        const cachedValue = conditionValues.get(String(i));
 
         results.push({
           index: i,
@@ -152,13 +162,13 @@ export class CompoundTriggerEvaluator {
       // Evaluate this condition against the current snapshot
       const evalResult = this.evaluateCondition(condition, snapshot, latestBBO);
 
-      // Update state
+      // Update cloned state (not the original)
       if (evalResult.fired) {
-        state.fired_conditions.add(String(i));
-        state.condition_values.set(String(i), evalResult.actual_value);
+        firedConditions.add(String(i));
+        conditionValues.set(String(i), evalResult.actual_value);
       } else {
-        state.fired_conditions.delete(String(i));
-        state.condition_values.delete(String(i));
+        firedConditions.delete(String(i));
+        conditionValues.delete(String(i));
       }
 
       results.push({
@@ -175,17 +185,28 @@ export class CompoundTriggerEvaluator {
       await this.publishCrossShardState(trigger, results);
       const crossShardResult = await this.aggregateCrossShardState(trigger);
 
-      // Handle state cleanup for cross-shard triggers (same logic as local triggers)
-      if (crossShardResult.shouldFire) {
-        state.fired_conditions.clear();
-        state.condition_values.clear();
-        this.triggerMissCount.delete(trigger.id);
+      // Atomic state update with version check (optimistic locking)
+      const currentState = this.triggerState.get(trigger.id);
+      if (currentState && currentState.version === startVersion) {
+        if (crossShardResult.shouldFire) {
+          currentState.fired_conditions.clear();
+          currentState.condition_values.clear();
+          this.triggerMissCount.delete(trigger.id);
+        } else {
+          currentState.fired_conditions = firedConditions;
+          currentState.condition_values = conditionValues;
+          await this.trackTriggerMiss(trigger);
+        }
+        currentState.last_evaluation = now;
+        currentState.version++;
       } else {
-        await this.trackTriggerMiss(trigger);
+        // Concurrent modification detected - log and let newer evaluation win
+        console.warn(
+          `[CompoundTrigger] Skipping stale cross-shard state update for ${trigger.id} ` +
+          `(version: expected ${startVersion}, got ${currentState?.version})`
+        );
       }
-      state.last_evaluation = Date.now();
 
-      // Merge cross-shard results
       return {
         shouldFire: crossShardResult.shouldFire,
         firedConditions: crossShardResult.firedConditions,
@@ -194,34 +215,44 @@ export class CompoundTriggerEvaluator {
     }
 
     // Local evaluation (single-shard trigger)
-    const firedConditions = results
+    const firedIndices = results
       .filter(r => r.fired)
       .map(r => r.index);
 
     const shouldFire = this.checkFireCondition(
       trigger.compound_mode,
-      firedConditions.length,
+      firedIndices.length,
       trigger.conditions.length,
       trigger.compound_threshold
     );
 
-    // Clear state and reset miss count if trigger fires
-    if (shouldFire) {
-      state.fired_conditions.clear();
-      state.condition_values.clear();
-      // Reset miss count on successful fire - user's hypothesis was correct
-      this.triggerMissCount.delete(trigger.id);
+    // Atomic state update with version check (optimistic locking)
+    const currentState = this.triggerState.get(trigger.id);
+    if (currentState && currentState.version === startVersion) {
+      // No concurrent modification - safe to update
+      if (shouldFire) {
+        currentState.fired_conditions.clear();
+        currentState.condition_values.clear();
+        this.triggerMissCount.delete(trigger.id);
+      } else {
+        // Commit our evaluation's state changes
+        currentState.fired_conditions = firedConditions;
+        currentState.condition_values = conditionValues;
+        await this.trackTriggerMiss(trigger);
+      }
+      currentState.last_evaluation = now;
+      currentState.version++;
     } else {
-      // Track consecutive non-fires for gradual decay
-      await this.trackTriggerMiss(trigger);
+      // Concurrent modification detected - the other evaluation likely processed newer data
+      console.warn(
+        `[CompoundTrigger] Skipping stale state update for ${trigger.id} ` +
+        `(version: expected ${startVersion}, got ${currentState?.version})`
+      );
     }
-
-    // Update last_evaluation timestamp (stale cleanup now happens at start of evaluation)
-    state.last_evaluation = Date.now();
 
     return {
       shouldFire,
-      firedConditions,
+      firedConditions: firedIndices,
       conditionResults: results,
     };
   }

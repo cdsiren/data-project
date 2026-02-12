@@ -29,6 +29,7 @@ export interface Env {
   FULL_L2_QUEUE: Queue<FullL2Snapshot>;
   DEAD_LETTER_QUEUE: Queue<DeadLetterMessage>;
   GRAPH_QUEUE: Queue<GraphQueueMessage>;  // Graph edge signal queue
+  WEBHOOK_DLQ: Queue<WebhookDeadLetterMessage>;  // Failed webhook delivery queue
 
   // Durable Objects
   ORDERBOOK_MANAGER: DurableObjectNamespace;
@@ -86,5 +87,15 @@ export interface DeadLetterMessage {
   payload: unknown;
   error: string;
   failed_at: string;
+  retry_count: number;
+}
+
+// Webhook Dead Letter Queue message for failed webhook delivery
+export interface WebhookDeadLetterMessage {
+  trigger_id: string;
+  webhook_url: string;
+  event: unknown;
+  failed_at: number;
+  reason: string;
   retry_count: number;
 }

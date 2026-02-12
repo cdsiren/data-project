@@ -134,6 +134,14 @@ export class OrderbookManager extends DurableObject<Env> {
   private readonly MAX_TRIGGERS_PER_ASSET = 50; // Prevent trigger spam
 
   // ============================================================
+  // MEMORY MANAGEMENT - Prevent unbounded growth from inactive assets
+  // ============================================================
+  private readonly MAX_HISTORY_ASSETS = 5000; // Hard limit on tracked assets
+  private readonly ASSET_INACTIVITY_THRESHOLD_MS = 3600000; // 1 hour
+  private readonly HISTORY_CLEANUP_INTERVAL_MS = 300000; // 5 minutes
+  private lastHistoryCleanup = 0;
+
+  // ============================================================
   // HFT TRIGGER STATE MAPS
   // Additional state tracking for advanced market making triggers
   // ============================================================
@@ -3675,6 +3683,9 @@ export class OrderbookManager extends DurableObject<Env> {
     const hasRegisteredTriggers = triggerIdsToCheck.size > 0;
     const now = Date.now() * 1000; // Microseconds
 
+    // Periodic memory cleanup (amortized cost - runs every 5 minutes)
+    this.maybeCleanupMemory();
+
     // Update price history for PRICE_MOVE triggers and VOLATILITY_SPIKE global trigger
     // Always track since global triggers need this data for volatility calculations
     // Compute midpoint from best_bid and best_ask for accurate price movement detection
@@ -3682,6 +3693,15 @@ export class OrderbookManager extends DurableObject<Env> {
       const midPrice = (snapshot.best_bid + snapshot.best_ask) / 2;
       let history = this.priceHistory.get(snapshot.asset_id);
       if (!history) {
+        // Capacity check before creating new history
+        if (this.priceHistory.size >= this.MAX_HISTORY_ASSETS) {
+          // First try cleanup
+          this.cleanupInactiveAssets();
+          // If still at capacity, use LRU eviction
+          if (this.priceHistory.size >= this.MAX_HISTORY_ASSETS) {
+            this.evictOldestAsset();
+          }
+        }
         history = [];
         this.priceHistory.set(snapshot.asset_id, history);
       }
@@ -4909,6 +4929,112 @@ export class OrderbookManager extends DurableObject<Env> {
     }
   }
 
+  // ============================================================
+  // MEMORY MANAGEMENT - Cleanup inactive assets to prevent OOM
+  // ============================================================
+
+  /**
+   * Clean up history data for inactive assets.
+   * Called periodically (every 5 minutes) via amortized check in evaluation loop.
+   *
+   * This prevents unbounded memory growth from:
+   * - Assets that stop trading but have history data
+   * - Markets that are resolved or delisted
+   * - Temporary spikes in tracked assets
+   */
+  private cleanupInactiveAssets(): void {
+    const now = Date.now();
+    const cutoffMs = now - this.ASSET_INACTIVITY_THRESHOLD_MS;
+    let cleanedAssets = 0;
+    let cleanedEntries = 0;
+
+    // Cleanup price history for inactive assets
+    for (const [assetId, history] of this.priceHistory) {
+      // Check if asset has any recent data (last entry timestamp)
+      if (history.length === 0 || history[history.length - 1].ts / 1000 < cutoffMs) {
+        this.priceHistory.delete(assetId);
+        cleanedAssets++;
+        cleanedEntries += history.length;
+      }
+    }
+
+    // Cleanup imbalance history for inactive assets
+    for (const [assetId, history] of this.imbalanceHistory) {
+      if (history.length === 0 || history[history.length - 1].ts / 1000 < cutoffMs) {
+        this.imbalanceHistory.delete(assetId);
+        cleanedEntries += history.length;
+      }
+    }
+
+    // Cleanup other state maps for assets with no recent updates
+    for (const [assetId, lastTs] of this.lastUpdateTs) {
+      if (lastTs / 1000 < cutoffMs) {
+        this.lastUpdateTs.delete(assetId);
+        this.updateCounts.delete(assetId);
+        this.trendTracker.delete(assetId);
+        this.previousBBO.delete(assetId);
+        // Don't delete latestBBO - it may still be needed for arbitrage triggers
+        // that reference this asset as a counterpart
+      }
+    }
+
+    // Cleanup HMAC key cache for deleted triggers
+    for (const triggerId of this.hmacKeyCache.keys()) {
+      if (!this.triggers.has(triggerId)) {
+        this.hmacKeyCache.delete(triggerId);
+      }
+    }
+
+    if (cleanedAssets > 0) {
+      console.log(
+        `[Memory] Cleaned ${cleanedAssets} inactive assets, ${cleanedEntries} history entries ` +
+        `(threshold: ${this.ASSET_INACTIVITY_THRESHOLD_MS}ms)`
+      );
+    }
+  }
+
+  /**
+   * LRU eviction when at capacity - remove oldest tracked asset.
+   * This is a last resort to prevent OOM when many assets are active.
+   */
+  private evictOldestAsset(): void {
+    let oldestAsset: string | null = null;
+    let oldestTs = Infinity;
+
+    // Find asset with oldest last update
+    for (const [assetId, ts] of this.lastUpdateTs) {
+      if (ts < oldestTs) {
+        oldestTs = ts;
+        oldestAsset = assetId;
+      }
+    }
+
+    if (oldestAsset) {
+      this.priceHistory.delete(oldestAsset);
+      this.imbalanceHistory.delete(oldestAsset);
+      this.lastUpdateTs.delete(oldestAsset);
+      this.updateCounts.delete(oldestAsset);
+      this.trendTracker.delete(oldestAsset);
+      this.previousBBO.delete(oldestAsset);
+      console.warn(
+        `[Memory] LRU evicted history for ${oldestAsset} (at capacity: ${this.MAX_HISTORY_ASSETS})`
+      );
+    }
+  }
+
+  /**
+   * Check if memory cleanup should run (amortized cost).
+   * Called from hot path but only triggers cleanup every HISTORY_CLEANUP_INTERVAL_MS.
+   */
+  private maybeCleanupMemory(): void {
+    const now = Date.now();
+    if (now - this.lastHistoryCleanup > this.HISTORY_CLEANUP_INTERVAL_MS) {
+      this.lastHistoryCleanup = now;
+      // Run cleanup in background via waitUntil to not block hot path
+      this.ctx.waitUntil(Promise.resolve().then(() => this.cleanupInactiveAssets()));
+    }
+  }
+
   /**
    * CRITICAL PATH OPTIMIZATION: Get or create cached HMAC key for webhook signing
    * Avoids expensive crypto.subtle.importKey on every webhook dispatch (100-500μs savings)
@@ -4940,10 +5066,42 @@ export class OrderbookManager extends DurableObject<Env> {
     this.hmacKeyCache.delete(triggerId);
   }
 
+  // ============================================================
+  // WEBHOOK RELIABILITY CONFIGURATION
+  // ============================================================
+  private readonly WEBHOOK_TIMEOUT_MS = 5000; // 5 second timeout
+  private readonly WEBHOOK_MAX_RETRIES = 3;
+  private readonly WEBHOOK_RETRY_DELAYS_MS = [100, 500, 2000]; // Exponential backoff
+  private readonly WEBHOOK_CIRCUIT_BREAKER_THRESHOLD = 5;
+  private readonly WEBHOOK_CIRCUIT_BREAKER_RESET_MS = 300000; // 5 minutes
+
+  // Per-webhook URL circuit breaker state (separate from per-trigger circuit breaker)
+  private webhookCircuitOpen: Map<string, number> = new Map(); // url -> reset_time
+  private webhookFailureCount: Map<string, number> = new Map(); // url -> consecutive_failures
+
+  // Shared encoder for webhook signing (avoids allocation per dispatch)
+  private readonly webhookEncoder = new TextEncoder();
+
   /**
-   * Dispatch webhook with HMAC signature (background task)
+   * Dispatch webhook with HMAC signature, timeout, retry, and dead letter queue.
+   *
+   * Production reliability features:
+   * - 5 second timeout prevents hanging connections
+   * - 3 retries with exponential backoff (100ms, 500ms, 2s)
+   * - Per-webhook-URL circuit breaker isolates bad endpoints
+   * - Dead letter queue preserves failed events for retry/investigation
    */
   private async dispatchWebhook(trigger: Trigger, event: TriggerEvent): Promise<void> {
+    const webhookUrl = trigger.webhook_url!;
+
+    // Per-webhook circuit breaker check (separate from per-trigger)
+    const circuitResetTime = this.webhookCircuitOpen.get(webhookUrl);
+    if (circuitResetTime && Date.now() < circuitResetTime) {
+      // Circuit is open - queue to DLQ instead of attempting delivery
+      await this.queueFailedWebhook(trigger, event, "circuit_breaker_open");
+      return;
+    }
+
     const body = JSON.stringify(event);
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -4951,20 +5109,117 @@ export class OrderbookManager extends DurableObject<Env> {
       "X-Trigger-Type": trigger.condition.type,
     };
 
+    // Sign with HMAC if secret is configured
     if (trigger.webhook_secret) {
       const key = await this.getOrCreateHmacKey(trigger.id, trigger.webhook_secret);
-      const encoder = new TextEncoder();
-      const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
+      const signature = await crypto.subtle.sign("HMAC", key, this.webhookEncoder.encode(body));
       headers["X-Trigger-Signature"] = btoa(String.fromCharCode(...new Uint8Array(signature)));
     }
 
-    try {
-      const response = await fetch(trigger.webhook_url!, { method: "POST", headers, body });
-      if (!response.ok) {
-        console.error(`[Trigger] Webhook failed for ${trigger.id}: ${response.status}`);
+    // Retry loop with exponential backoff
+    for (let attempt = 0; attempt < this.WEBHOOK_MAX_RETRIES; attempt++) {
+      try {
+        // Create AbortController for timeout
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), this.WEBHOOK_TIMEOUT_MS);
+
+        const response = await fetch(webhookUrl, {
+          method: "POST",
+          headers,
+          body,
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          // Success - reset failure tracking for this webhook URL
+          this.webhookFailureCount.delete(webhookUrl);
+          this.webhookCircuitOpen.delete(webhookUrl);
+          return;
+        }
+
+        // Non-retryable errors (4xx except 429) - permanent failure
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+          console.error(
+            `[Webhook] Permanent failure for ${trigger.id}: HTTP ${response.status}`
+          );
+          await this.queueFailedWebhook(trigger, event, `http_${response.status}`);
+          return;
+        }
+
+        // Retryable error (5xx, 429) - try again after delay
+        if (attempt < this.WEBHOOK_MAX_RETRIES - 1) {
+          console.warn(
+            `[Webhook] Retryable error for ${trigger.id}: HTTP ${response.status} (attempt ${attempt + 1}/${this.WEBHOOK_MAX_RETRIES})`
+          );
+          await new Promise(r => setTimeout(r, this.WEBHOOK_RETRY_DELAYS_MS[attempt]));
+          continue;
+        }
+
+        // All retries exhausted
+        throw new Error(`HTTP ${response.status} after ${this.WEBHOOK_MAX_RETRIES} attempts`);
+      } catch (error) {
+        const isTimeout = error instanceof Error && error.name === "AbortError";
+        const errorType = isTimeout ? "timeout" : "network_error";
+
+        if (attempt < this.WEBHOOK_MAX_RETRIES - 1) {
+          console.warn(
+            `[Webhook] ${errorType} for ${trigger.id} (attempt ${attempt + 1}/${this.WEBHOOK_MAX_RETRIES})`
+          );
+          await new Promise(r => setTimeout(r, this.WEBHOOK_RETRY_DELAYS_MS[attempt]));
+          continue;
+        }
+
+        // All retries exhausted - handle circuit breaker and DLQ
+        console.error(
+          `[Webhook] Failed after ${this.WEBHOOK_MAX_RETRIES} attempts for ${trigger.id}:`,
+          error
+        );
+
+        // Increment per-URL failure count and potentially open circuit
+        const failureCount = (this.webhookFailureCount.get(webhookUrl) || 0) + 1;
+        this.webhookFailureCount.set(webhookUrl, failureCount);
+
+        if (failureCount >= this.WEBHOOK_CIRCUIT_BREAKER_THRESHOLD) {
+          const resetTime = Date.now() + this.WEBHOOK_CIRCUIT_BREAKER_RESET_MS;
+          this.webhookCircuitOpen.set(webhookUrl, resetTime);
+          console.warn(
+            `[CircuitBreaker] OPEN for webhook ${webhookUrl.slice(0, 50)}... ` +
+            `until ${new Date(resetTime).toISOString()}`
+          );
+        }
+
+        await this.queueFailedWebhook(trigger, event, errorType);
+        return;
       }
+    }
+  }
+
+  /**
+   * Queue failed webhook event to DLQ for later retry or manual intervention.
+   */
+  private async queueFailedWebhook(
+    trigger: Trigger,
+    event: TriggerEvent,
+    reason: string
+  ): Promise<void> {
+    try {
+      await this.env.WEBHOOK_DLQ.send({
+        trigger_id: trigger.id,
+        webhook_url: trigger.webhook_url!,
+        event,
+        failed_at: Date.now(),
+        reason,
+        retry_count: 0,
+      });
     } catch (error) {
-      console.error(`[Trigger] Webhook error for ${trigger.id}:`, error);
+      // If even DLQ fails, log with full context as last resort
+      console.error(
+        `[CRITICAL] Failed to queue webhook to DLQ for ${trigger.id}:`,
+        error,
+        { event_summary: { trigger_id: event.trigger_id, fired_at: event.fired_at } }
+      );
     }
   }
 
