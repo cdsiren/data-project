@@ -356,6 +356,11 @@ export class GraphManager extends DurableObject<Env> {
 
   /**
    * Run the aggregation query to populate graph_edges from signals.
+   *
+   * NOTE: We insert ALL edges (no HAVING filter) so that decayed edges get
+   * updated with their new low weights. The weight > 0.1 filter is applied
+   * at query time in fetchEdgesFromClickHouse. This ensures stale high-weight
+   * edges don't persist indefinitely in the ReplacingMergeTree.
    */
   private async runAggregationQuery(): Promise<void> {
     const query = `
@@ -385,7 +390,6 @@ export class GraphManager extends DurableObject<Env> {
       FROM trading_data.graph_edge_signals
       WHERE created_at > now() - INTERVAL 90 DAY
       GROUP BY market_a, market_b, edge_type
-      HAVING weight > 0.1
     `;
 
     try {

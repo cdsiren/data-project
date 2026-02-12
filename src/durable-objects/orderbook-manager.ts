@@ -3277,10 +3277,36 @@ export class OrderbookManager extends DurableObject<Env> {
       // For compound triggers, validate all conditions
       if (body.compound_mode && body.conditions) {
         for (let i = 0; i < body.conditions.length; i++) {
-          const validationError = this.validateTriggerCondition(body.conditions[i]);
+          const condition = body.conditions[i];
+          const validationError = this.validateTriggerCondition(condition);
           if (validationError) {
             return Response.json(
               { trigger_id: "", status: "error", message: `Condition ${i}: ${validationError}` } as TriggerRegistration,
+              { status: 400 }
+            );
+          }
+
+          // Validate each condition's asset_id is subscribed on this shard
+          // (compound triggers can span multiple assets, all must be accessible)
+          if (condition.asset_id && condition.asset_id !== "*" && !this.assetToMarket.has(condition.asset_id)) {
+            return Response.json(
+              {
+                trigger_id: "",
+                status: "error",
+                message: `Condition ${i}: asset ${condition.asset_id.slice(0, 20)}... is not subscribed on this shard`,
+              } as TriggerRegistration,
+              { status: 400 }
+            );
+          }
+
+          // Validate market_id is provided (required for graph signals)
+          if (!condition.market_id) {
+            return Response.json(
+              {
+                trigger_id: "",
+                status: "error",
+                message: `Condition ${i}: market_id is required for compound triggers`,
+              } as TriggerRegistration,
               { status: 400 }
             );
           }
