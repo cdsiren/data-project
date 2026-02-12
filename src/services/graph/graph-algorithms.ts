@@ -236,7 +236,9 @@ export function detectNegativeCycles(
         // Found negative cycle - trace back to find it
         const cycle = traceNegativeCycle(pred, edge.target, markets.length);
 
-        if (cycle.length > 0) {
+        // Filter out trivial 2-node cycles (caused by bidirectional hedge edges)
+        // Real arbitrage opportunities require at least 3 markets to form a meaningful cycle
+        if (cycle.length >= 3) {
           // Mark all markets in cycle as processed
           for (const m of cycle) {
             processedInCycle.add(m);

@@ -1920,7 +1920,7 @@ async function scheduledHandler(
             `;
 
             try {
-              await fetch(env.CLICKHOUSE_URL, {
+              const correlationResponse = await fetch(env.CLICKHOUSE_URL, {
                 method: "POST",
                 headers: {
                   "Content-Type": "text/plain",
@@ -1930,7 +1930,11 @@ async function scheduledHandler(
                 body: correlationQuery,
               });
 
-              await fetch(env.CLICKHOUSE_URL, {
+              if (!correlationResponse.ok) {
+                throw new Error(`Correlation seeding failed: ${correlationResponse.status} ${await correlationResponse.text()}`);
+              }
+
+              const hedgeResponse = await fetch(env.CLICKHOUSE_URL, {
                 method: "POST",
                 headers: {
                   "Content-Type": "text/plain",
@@ -1940,9 +1944,14 @@ async function scheduledHandler(
                 body: hedgeQuery,
               });
 
+              if (!hedgeResponse.ok) {
+                throw new Error(`Hedge seeding failed: ${hedgeResponse.status} ${await hedgeResponse.text()}`);
+              }
+
               await env.GRAPH_CACHE.put(lastSeedKey, Date.now().toString(), { expirationTtl: 86400 * 2 });
               console.log("[Scheduled] Correlation seeding complete");
             } catch (seedError) {
+              // Don't mark as complete on failure - will retry next cron run
               console.error("[Scheduled] Correlation seeding failed:", seedError);
             }
           }

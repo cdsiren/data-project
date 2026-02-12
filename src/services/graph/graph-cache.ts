@@ -347,12 +347,14 @@ export class CrossShardService {
   ): Promise<{ shouldFire: boolean; firedConditions: number[]; notifications: CrossShardNotification[] }> {
     const notifications = await this.getTriggerState(triggerId);
 
-    const firedConditions: number[] = [];
+    // Use Set to deduplicate condition indices (same condition may be reported by multiple shards)
+    const firedConditionSet = new Set<number>();
     for (const n of notifications) {
       if (n.fired) {
-        firedConditions.push(n.condition_index);
+        firedConditionSet.add(n.condition_index);
       }
     }
+    const firedConditions = Array.from(firedConditionSet);
 
     let shouldFire = false;
 
