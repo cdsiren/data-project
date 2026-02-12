@@ -3287,13 +3287,15 @@ export class OrderbookManager extends DurableObject<Env> {
           }
 
           // Validate each condition's asset_id is subscribed on this shard
-          // (compound triggers can span multiple assets, all must be accessible)
-          if (condition.asset_id && condition.asset_id !== "*" && !this.assetToMarket.has(condition.asset_id)) {
+          // EXCEPTION: Cross-shard triggers can reference assets on OTHER shards
+          // (they use KV for coordination, so local subscription isn't required)
+          if (!body.cross_shard && condition.asset_id && condition.asset_id !== "*" && !this.assetToMarket.has(condition.asset_id)) {
             return Response.json(
               {
                 trigger_id: "",
                 status: "error",
-                message: `Condition ${i}: asset ${condition.asset_id.slice(0, 20)}... is not subscribed on this shard`,
+                message: `Condition ${i}: asset ${condition.asset_id.slice(0, 20)}... is not subscribed on this shard. ` +
+                         `Set cross_shard: true for triggers spanning multiple shards.`,
               } as TriggerRegistration,
               { status: 400 }
             );

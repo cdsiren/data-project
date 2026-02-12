@@ -391,7 +391,7 @@ export class GraphManager extends DurableObject<Env> {
           market_a,
           market_b,
           edge_type,
-          log(1 + sum(
+          log(greatest(0.001, 1 + sum(
             strength *
             CASE signal_source
               WHEN 'trigger_fire' THEN 2.0
@@ -404,7 +404,7 @@ export class GraphManager extends DurableObject<Env> {
               ELSE 1.0
             END *
             exp(-dateDiff('day', created_at, now()) / 30)
-          )) AS weight,
+          ))) AS weight,
           uniqExact(user_id) AS user_count,
           count() AS signal_count,
           max(created_at) AS last_signal_at,
