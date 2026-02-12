@@ -294,9 +294,10 @@ export class CrossShardService {
 
   /**
    * Publish a condition fire/unfire from a shard.
+   * Key includes condition_index to support multiple conditions per shard.
    */
   async publishConditionUpdate(notification: CrossShardNotification): Promise<void> {
-    const key = `${CROSS_SHARD_KEYS.TRIGGER_STATE}${notification.trigger_id}:${notification.shard_id}`;
+    const key = `${CROSS_SHARD_KEYS.TRIGGER_STATE}${notification.trigger_id}:${notification.shard_id}:${notification.condition_index}`;
     await this.kv.put(key, JSON.stringify(notification), {
       expirationTtl: this.ttlSeconds,
     });
@@ -384,15 +385,17 @@ export function formatEdgeReason(neighbor: GraphNeighbor): string {
   switch (edge_type) {
     case "correlation":
       if (user_count > 0) {
-        return `${user_count} user${user_count > 1 ? "s" : ""} linked these markets (correlation: ${(weight * 100).toFixed(0)}%)`;
+        return `${user_count} user${user_count > 1 ? "s" : ""} linked these markets`;
       }
-      return `${(weight * 100).toFixed(0)}% price correlation`;
+      // Weight is log-scaled, show as strength score not percentage
+      return `Correlation strength: ${weight.toFixed(2)}`;
 
     case "hedge":
       if (user_count > 0) {
         return `${user_count} user${user_count > 1 ? "s" : ""} use this as a hedge`;
       }
-      return `${(Math.abs(weight) * 100).toFixed(0)}% inverse correlation`;
+      // Weight is log-scaled, show as strength score not percentage
+      return `Hedge strength: ${Math.abs(weight).toFixed(2)}`;
 
     case "causal":
       return `Related by shared topics/tags`;

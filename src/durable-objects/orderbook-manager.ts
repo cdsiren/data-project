@@ -99,6 +99,7 @@ export class OrderbookManager extends DurableObject<Env> {
   private triggers: Map<string, Trigger> = new Map(); // trigger_id -> Trigger
   private compoundTriggers: Map<string, CompoundTrigger> = new Map(); // compound trigger_id -> CompoundTrigger
   private compoundEvaluator: CompoundTriggerEvaluator | null = null; // Initialized after env available
+  private compoundTriggerInFlight: Set<string> = new Set(); // Prevents race conditions in concurrent async evaluations
   private triggerBounds: Map<string, TriggerBounds> = new Map(); // trigger_id -> pre-computed bounds for fast pre-filtering
   private triggersByAsset: Map<string, Set<string>> = new Map(); // asset_id -> Set<trigger_id>
   private lastTriggerFire: Map<string, number> = new Map(); // trigger_id -> last fire timestamp
@@ -4462,6 +4463,12 @@ export class OrderbookManager extends DurableObject<Env> {
       // Circuit breaker check
       if (!this.isTriggerCircuitClosed(triggerId)) continue;
 
+      // CRITICAL: Check if this trigger is already being evaluated (race condition prevention)
+      // Multiple concurrent evaluations via waitUntil could otherwise pass cooldown check
+      // before any of them complete, causing duplicate fires
+      if (this.compoundTriggerInFlight.has(triggerId)) continue;
+      this.compoundTriggerInFlight.add(triggerId);
+
       try {
         const result = await this.compoundEvaluator.evaluate(
           trigger,
@@ -4502,6 +4509,9 @@ export class OrderbookManager extends DurableObject<Env> {
           error instanceof Error ? error.message : error
         );
         this.recordTriggerFailure(triggerId);
+      } finally {
+        // Always remove from in-flight set to allow future evaluations
+        this.compoundTriggerInFlight.delete(triggerId);
       }
     }
   }

@@ -373,9 +373,10 @@ export function findShortestPath(
 ): ShortestPath | null {
   const { minWeight = 0, edgeTypes } = options;
 
-  // Transform weights: use 1 - |weight| so higher weight = shorter path
-  // This makes sense because weight represents correlation strength
-  const transformWeight = (w: number) => 1 - Math.abs(w);
+  // Transform weights: use 1 / (1 + |weight|) so higher weight = shorter path
+  // This ensures non-negative distances for Dijkstra (required for correctness)
+  // Range: (0, 1] - always positive regardless of input weight magnitude
+  const transformWeight = (w: number) => 1 / (1 + Math.abs(w));
 
   const dist = new Map<string, number>();
   const prev = new Map<string, { market: string; edgeType: EdgeType } | null>();
