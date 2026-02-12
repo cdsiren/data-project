@@ -3576,9 +3576,9 @@ export class OrderbookManager extends DurableObject<Env> {
         // Invalidate cached HMAC key
         this.invalidateHmacKeyCache(trigger_id);
 
-        // Clear evaluator state for this trigger
+        // Clear evaluator state for this trigger (including cross-shard KV state)
         if (this.compoundEvaluator) {
-          this.compoundEvaluator.clearTriggerState(trigger_id);
+          await this.compoundEvaluator.clearTriggerState(trigger_id);
         }
 
         await this.persistState();
@@ -3878,35 +3878,48 @@ export class OrderbookManager extends DurableObject<Env> {
     });
 
     // ============================================================
-    // COMPOUND TRIGGERS - Multi-market condition triggers
-    // Uses CompoundTriggerEvaluator with gradual decay for wrong hypotheses
-    // CRITICAL: Must await to ensure fired events are collected before SSE/webhook dispatch
+    // DISPATCH STANDARD + GLOBAL EVENTS IMMEDIATELY
+    // Don't wait for compound trigger evaluation - these events are ready now
     // ============================================================
-    if (this.compoundTriggers.size > 0 && this.compoundEvaluator) {
-      await this.evaluateCompoundTriggers(snapshot, now, firedEvents);
-    }
 
-    // Collect all events for batched SSE publish (reduces DO hops)
-    // OPTIMIZED: Push loop instead of spread operator to avoid intermediate allocations
-    const allEvents: TriggerEvent[] = [];
-    for (const f of firedEvents) allEvents.push(f.event);
-    for (const e of globalEvents) allEvents.push(e);
+    // Collect standard + global events for immediate dispatch
+    const standardEvents: TriggerEvent[] = [];
+    for (const f of firedEvents) standardEvents.push(f.event);
+    for (const e of globalEvents) standardEvents.push(e);
 
     // LATENCY OPTIMIZATION: Write to premium SSE clients FIRST (1-5ms savings)
-    // Premium clients bypass the TriggerEventBuffer hop
-    if (allEvents.length > 0) {
-      this.writeToPremiumSSE(allEvents);
+    if (standardEvents.length > 0) {
+      this.writeToPremiumSSE(standardEvents);
+      this.ctx.waitUntil(this.publishEventsToBuffer(standardEvents));
     }
 
-    // Then publish to buffer for standard SSE clients (fire-and-forget)
-    if (allEvents.length > 0) {
-      this.ctx.waitUntil(this.publishEventsToBuffer(allEvents));
-    }
-
-    // Dispatch webhooks individually for registered triggers with webhook_url
+    // Dispatch webhooks for standard triggers immediately (fire-and-forget)
     for (const { trigger, event } of firedEvents) {
       if (trigger.webhook_url) {
         this.ctx.waitUntil(this.dispatchWebhook(trigger, event));
+      }
+    }
+
+    // ============================================================
+    // COMPOUND TRIGGERS - Multi-market condition triggers
+    // Uses CompoundTriggerEvaluator with gradual decay for wrong hypotheses
+    // Evaluated AFTER standard events dispatched to avoid blocking them
+    // ============================================================
+    if (this.compoundTriggers.size > 0 && this.compoundEvaluator) {
+      const compoundFiredEvents: { trigger: Trigger; event: TriggerEvent }[] = [];
+      await this.evaluateCompoundTriggers(snapshot, now, compoundFiredEvents);
+
+      // Dispatch compound trigger events separately
+      if (compoundFiredEvents.length > 0) {
+        const compoundEvents = compoundFiredEvents.map(f => f.event);
+        this.writeToPremiumSSE(compoundEvents);
+        this.ctx.waitUntil(this.publishEventsToBuffer(compoundEvents));
+
+        for (const { trigger, event } of compoundFiredEvents) {
+          if (trigger.webhook_url) {
+            this.ctx.waitUntil(this.dispatchWebhook(trigger, event));
+          }
+        }
       }
     }
     // Note: Removed per-trigger console.log to avoid microtask overhead in hot path.

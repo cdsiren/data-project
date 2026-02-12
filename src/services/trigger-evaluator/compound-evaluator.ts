@@ -522,10 +522,16 @@ export class CompoundTriggerEvaluator {
 
   /**
    * Clear state for a specific trigger (e.g., when deleted).
+   * Also clears cross-shard KV state if the trigger was cross-shard.
    */
-  clearTriggerState(triggerId: string): void {
+  async clearTriggerState(triggerId: string): Promise<void> {
     this.triggerState.delete(triggerId);
     this.triggerMissCount.delete(triggerId);
+
+    // Clear cross-shard KV state to prevent orphaned entries
+    if (this.crossShardService) {
+      await this.crossShardService.clearTriggerState(triggerId);
+    }
   }
 
   /**
