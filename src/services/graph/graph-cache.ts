@@ -50,10 +50,16 @@ export class GraphCacheService {
 
     if (!cached) return null;
 
-    // Check if data is too stale (beyond 2x TTL is definitely stale)
-    const staleCutoff = Date.now() - this.ttlSeconds * 2 * 1000;
-    if (cached.updated_at < staleCutoff) {
-      return null;
+    // KV auto-deletes entries after ttlSeconds, so no stale check needed.
+    // Warn if data is approaching expiry (80% of TTL) to help detect
+    // if rebuild frequency is insufficient for the access pattern.
+    const expiryWarningThreshold = Date.now() - this.ttlSeconds * 0.8 * 1000;
+    if (cached.updated_at < expiryWarningThreshold) {
+      const ageSeconds = Math.round((Date.now() - cached.updated_at) / 1000);
+      console.warn(
+        `[GraphCache] Data for ${marketId} is ${ageSeconds}s old ` +
+        `(approaching ${this.ttlSeconds}s TTL). Consider rebuilding graph more frequently.`
+      );
     }
 
     return cached.neighbors;
@@ -119,6 +125,7 @@ export class GraphCacheService {
   /**
    * Set neighbors for multiple markets in parallel.
    * Used during graph rebuild to warm the cache efficiently.
+   * Includes retry logic for transient failures and alerts on high failure rates.
    *
    * @param adjacencyList - Map of market_id -> neighbors
    */
@@ -127,6 +134,7 @@ export class GraphCacheService {
   ): Promise<{ success: number; failed: number }> {
     let success = 0;
     let failed = 0;
+    const failedMarkets: Array<{ marketId: string; neighbors: GraphNeighbor[] }> = [];
 
     // Process in batches to avoid overwhelming KV
     const batchSize = 50;
@@ -141,11 +149,42 @@ export class GraphCacheService {
             await this.setNeighbors(marketId, neighbors);
             success++;
           } catch (error) {
-            console.error(`Failed to cache neighbors for ${marketId}:`, error);
+            console.error(`[GraphCache] Failed to cache neighbors for ${marketId}:`, error);
             failed++;
+            failedMarkets.push({ marketId, neighbors });
           }
         })
       );
+    }
+
+    // Retry failed markets once (only if less than 20% failed to avoid retry storms)
+    if (failedMarkets.length > 0 && failedMarkets.length < entries.length * 0.2) {
+      console.log(`[GraphCache] Retrying ${failedMarkets.length} failed markets`);
+
+      await Promise.all(
+        failedMarkets.map(async ({ marketId, neighbors }) => {
+          try {
+            await this.setNeighbors(marketId, neighbors);
+            success++;
+            failed--;
+          } catch (retryError) {
+            // Already counted as failed, just log
+            console.error(`[GraphCache] Retry failed for ${marketId}:`, retryError);
+          }
+        })
+      );
+    }
+
+    // Alert if failure rate is high
+    const total = success + failed;
+    if (failed > 0 && total > 0) {
+      const failureRate = failed / total;
+      if (failureRate > 0.05) {
+        console.error(
+          `[GraphCache] High KV failure rate: ${(failureRate * 100).toFixed(1)}% ` +
+          `(${failed}/${total}). Check KV quota and performance.`
+        );
+      }
     }
 
     return { success, failed };

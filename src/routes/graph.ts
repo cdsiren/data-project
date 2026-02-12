@@ -44,6 +44,52 @@ const authMiddleware = async (
   await next();
 };
 
+// ============================================================
+// Input Validation Helpers
+// ============================================================
+
+/**
+ * Valid edge types for filtering.
+ */
+const VALID_EDGE_TYPES = ["correlation", "hedge", "causal", "arbitrage"] as const;
+type ValidEdgeType = typeof VALID_EDGE_TYPES[number];
+
+/**
+ * Parse and validate a numeric query parameter with bounds.
+ * Returns defaultValue for invalid/missing inputs.
+ */
+function parseNumber(
+  value: string | undefined,
+  defaultValue: number,
+  min: number,
+  max: number
+): number {
+  if (!value) return defaultValue;
+
+  const parsed = Number(value);
+
+  // Check for NaN, Infinity, -Infinity
+  if (!Number.isFinite(parsed)) {
+    return defaultValue;
+  }
+
+  return Math.max(min, Math.min(max, parsed));
+}
+
+/**
+ * Parse and validate edge types parameter.
+ * Returns undefined if not provided, or filtered array of valid edge types.
+ */
+function parseEdgeTypes(value: string | undefined): ValidEdgeType[] | undefined {
+  if (!value) return undefined;
+
+  const types = value.split(",").filter((t): t is ValidEdgeType =>
+    VALID_EDGE_TYPES.includes(t as ValidEdgeType)
+  );
+
+  return types.length > 0 ? types : undefined;
+}
+
 // Create Hono app for graph routes
 export const graphRouter = new Hono<{ Bindings: Env }>();
 
@@ -99,10 +145,9 @@ graphRouter.get("/stats", async (c) => {
  */
 graphRouter.get("/neighbors/:marketId", async (c) => {
   const marketId = c.req.param("marketId");
-  const minWeight = parseFloat(c.req.query("min_weight") || "0");
-  const limit = parseInt(c.req.query("limit") || "50");
-  const edgeTypesParam = c.req.query("edge_types");
-  const edgeTypes = edgeTypesParam ? edgeTypesParam.split(",") : undefined;
+  const minWeight = parseNumber(c.req.query("min_weight"), 0, 0, 1000);
+  const limit = parseNumber(c.req.query("limit"), 50, 1, 1000);
+  const edgeTypes = parseEdgeTypes(c.req.query("edge_types"));
 
   try {
     // Try KV cache first
@@ -195,16 +240,16 @@ graphRouter.get("/paths/:from/:to", async (c) => {
  */
 graphRouter.get("/arbitrage/:marketId", async (c) => {
   const marketId = c.req.param("marketId");
-  const maxDepth = c.req.query("max_depth") || "2";
-  const minWeight = c.req.query("min_weight") || "0.5";
-  const limit = c.req.query("limit") || "10";
+  const maxDepth = parseNumber(c.req.query("max_depth"), 2, 1, 5);
+  const minWeight = parseNumber(c.req.query("min_weight"), 0.5, 0, 1000);
+  const limit = parseNumber(c.req.query("limit"), 10, 1, 100);
 
   try {
     const stub = getGraphManagerStub(c.env);
     const queryParams = new URLSearchParams({
-      max_depth: maxDepth,
-      min_weight: minWeight,
-      limit,
+      max_depth: String(maxDepth),
+      min_weight: String(minWeight),
+      limit: String(limit),
     });
     const response = await stub.fetch(`http://do/arbitrage/${marketId}?${queryParams}`);
 
@@ -264,20 +309,30 @@ graphRouter.post("/detect-cycles", async (c) => {
  * - edge_type: Filter by edge type
  */
 graphRouter.get("/top-edges", async (c) => {
-  const limit = Math.min(Math.max(1, parseInt(c.req.query("limit") || "100")), 1000);
+  const limitParam = parseInt(c.req.query("limit") || "100");
+  // Validate limit is a finite number within bounds
+  const limit = Number.isFinite(limitParam) ? Math.min(Math.max(1, limitParam), 1000) : 100;
   const edgeType = c.req.query("edge_type");
 
-  // Whitelist valid edge types to prevent SQL injection
-  const VALID_EDGE_TYPES = ["correlation", "hedge", "causal", "arbitrage"] as const;
+  // Whitelist valid edge types - using a Map for O(1) lookup and safe value retrieval
+  const VALID_EDGE_TYPES: Record<string, string> = {
+    correlation: "correlation",
+    hedge: "hedge",
+    causal: "causal",
+    arbitrage: "arbitrage",
+  };
 
   try {
-    // Validate edge_type against whitelist
+    // Validate and safely retrieve edge_type from whitelist
+    // This completely avoids string interpolation by only using pre-defined values
     let typeFilter = "";
     if (edgeType) {
-      if (!VALID_EDGE_TYPES.includes(edgeType as typeof VALID_EDGE_TYPES[number])) {
-        return c.json({ error: `Invalid edge_type. Must be one of: ${VALID_EDGE_TYPES.join(", ")}` }, 400);
+      const safeEdgeType = VALID_EDGE_TYPES[edgeType];
+      if (!safeEdgeType) {
+        return c.json({ error: `Invalid edge_type. Must be one of: ${Object.keys(VALID_EDGE_TYPES).join(", ")}` }, 400);
       }
-      typeFilter = `AND edge_type = '${edgeType}'`;
+      // Use the whitelist value, not the user input
+      typeFilter = `AND edge_type = '${safeEdgeType}'`;
     }
 
     const query = `
@@ -340,8 +395,8 @@ graphRouter.get("/top-edges", async (c) => {
  */
 graphRouter.get("/suggestions/:marketId", async (c) => {
   const marketId = c.req.param("marketId");
-  const limit = parseInt(c.req.query("limit") || "10");
-  const minUserCount = parseInt(c.req.query("min_user_count") || "2");
+  const limit = parseNumber(c.req.query("limit"), 10, 1, 100);
+  const minUserCount = parseNumber(c.req.query("min_user_count"), 2, 0, 1000);
 
   try {
     // Get neighbors sorted by user_count and weight
@@ -422,11 +477,8 @@ graphRouter.get("/suggestions/:marketId", async (c) => {
  */
 graphRouter.get("/nhop/:marketId/:hops?", async (c) => {
   const marketId = c.req.param("marketId");
-  const hops = parseInt(c.req.param("hops") || "2");
-
-  if (hops < 1 || hops > 3) {
-    return c.json({ error: "hops must be between 1 and 3" }, 400);
-  }
+  // parseNumber enforces bounds, so separate validation not needed
+  const hops = parseNumber(c.req.param("hops"), 2, 1, 3);
 
   try {
     const stub = getGraphManagerStub(c.env);

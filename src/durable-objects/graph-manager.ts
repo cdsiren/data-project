@@ -287,13 +287,24 @@ export class GraphManager extends DurableObject<Env> {
 
   /**
    * Rebuild the graph from ClickHouse.
+   * Uses DO storage for atomic locking to prevent concurrent rebuilds.
    */
   async rebuildGraph(): Promise<void> {
-    if (this.isRebuilding) {
-      console.log("[GraphManager] Rebuild already in progress, skipping");
+    // Use DO storage for atomic rebuild lock (prevents race conditions)
+    const LOCK_KEY = "rebuild:lock";
+    const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutes max rebuild time
+
+    const existingLock = await this.ctx.storage.get<number>(LOCK_KEY);
+    const now = Date.now();
+
+    // Check if lock exists and hasn't expired
+    if (existingLock && (now - existingLock) < LOCK_TTL_MS) {
+      console.log("[GraphManager] Rebuild already in progress (locked), skipping");
       return;
     }
 
+    // Acquire lock atomically via DO storage
+    await this.ctx.storage.put(LOCK_KEY, now);
     this.isRebuilding = true;
     console.log("[GraphManager] Starting graph rebuild from ClickHouse");
 
@@ -304,31 +315,40 @@ export class GraphManager extends DurableObject<Env> {
       // Then fetch the aggregated edges
       const edges = await this.fetchEdgesFromClickHouse();
 
-      // Build adjacency list
+      // Build adjacency list with optimized Map access
+      // Cache array references to reduce Map.get() calls from 4 to 2 per edge
       const newAdjacencyList = new Map<string, GraphNeighbor[]>();
 
       for (const edge of edges) {
-        // Add forward edge
-        if (!newAdjacencyList.has(edge.market_a)) {
-          newAdjacencyList.set(edge.market_a, []);
-        }
-        newAdjacencyList.get(edge.market_a)!.push({
+        // Create neighbor objects once
+        const forwardNeighbor: GraphNeighbor = {
           market_id: edge.market_b,
           edge_type: edge.edge_type as GraphNeighbor["edge_type"],
           weight: edge.weight,
           user_count: edge.user_count,
-        });
-
-        // Add reverse edge (graph is bidirectional for most edge types)
-        if (!newAdjacencyList.has(edge.market_b)) {
-          newAdjacencyList.set(edge.market_b, []);
-        }
-        newAdjacencyList.get(edge.market_b)!.push({
+        };
+        const reverseNeighbor: GraphNeighbor = {
           market_id: edge.market_a,
           edge_type: edge.edge_type as GraphNeighbor["edge_type"],
           weight: edge.weight,
           user_count: edge.user_count,
-        });
+        };
+
+        // Get or create forward list (cache reference)
+        let forwardList = newAdjacencyList.get(edge.market_a);
+        if (!forwardList) {
+          forwardList = [];
+          newAdjacencyList.set(edge.market_a, forwardList);
+        }
+        forwardList.push(forwardNeighbor);
+
+        // Get or create reverse list (cache reference)
+        let reverseList = newAdjacencyList.get(edge.market_b);
+        if (!reverseList) {
+          reverseList = [];
+          newAdjacencyList.set(edge.market_b, reverseList);
+        }
+        reverseList.push(reverseNeighbor);
       }
 
       // Update state
@@ -351,6 +371,8 @@ export class GraphManager extends DurableObject<Env> {
       await this.persistState();
     } finally {
       this.isRebuilding = false;
+      // Release the lock
+      await this.ctx.storage.delete("rebuild:lock");
     }
   }
 
@@ -415,8 +437,48 @@ export class GraphManager extends DurableObject<Env> {
 
   /**
    * Fetch edges from ClickHouse graph_edges table.
+   * Warns if edge count exceeds limit (100K) to help operators tune thresholds.
    */
   private async fetchEdgesFromClickHouse(): Promise<GraphEdge[]> {
+    const MAX_EDGES = 100000;
+    const MIN_WEIGHT_THRESHOLD = 0.1;
+
+    // First, check total count to warn if truncation will occur
+    try {
+      const countQuery = `
+        SELECT count() as edge_count
+        FROM trading_data.graph_edges FINAL
+        WHERE weight > ${MIN_WEIGHT_THRESHOLD}
+        FORMAT JSONEachRow
+      `;
+
+      const countResponse = await fetch(this.env.CLICKHOUSE_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain",
+          "X-ClickHouse-User": this.env.CLICKHOUSE_USER,
+          "X-ClickHouse-Key": this.env.CLICKHOUSE_TOKEN,
+        },
+        body: countQuery,
+      });
+
+      if (countResponse.ok) {
+        const countText = await countResponse.text();
+        if (countText.trim()) {
+          const { edge_count } = JSON.parse(countText.trim());
+          if (edge_count > MAX_EDGES) {
+            console.warn(
+              `[GraphManager] Graph has ${edge_count} edges but only fetching top ${MAX_EDGES}. ` +
+              `Consider increasing MIN_WEIGHT_THRESHOLD (currently ${MIN_WEIGHT_THRESHOLD}) or MAX_EDGES.`
+            );
+          }
+        }
+      }
+    } catch (error) {
+      // Non-fatal - continue with fetch
+      console.warn("[GraphManager] Failed to check edge count:", error);
+    }
+
     const query = `
       SELECT
         market_a,
@@ -427,9 +489,9 @@ export class GraphManager extends DurableObject<Env> {
         signal_count,
         last_signal_at
       FROM trading_data.graph_edges FINAL
-      WHERE weight > 0.1
+      WHERE weight > ${MIN_WEIGHT_THRESHOLD}
       ORDER BY weight DESC
-      LIMIT 100000
+      LIMIT ${MAX_EDGES}
       FORMAT JSONEachRow
     `;
 
@@ -510,15 +572,19 @@ export class GraphManager extends DurableObject<Env> {
   private async storeCyclesToClickHouse(cycles: NegativeCycle[]): Promise<void> {
     if (cycles.length === 0) return;
 
-    const rows = cycles.map(c => JSON.stringify({
-      cycle_id: c.cycle_id,
-      markets: c.markets,
-      total_weight: c.total_weight,
-      opportunity_type: c.opportunity_type,
-      detected_at: new Date(c.detected_at / 1000).toISOString().replace("T", " ").replace("Z", ""),
-      detected_date: new Date(c.detected_at / 1000).toISOString().split("T")[0],
-      metadata: "{}",
-    })).join("\n");
+    const rows = cycles.map(c => {
+      // detected_at is in milliseconds (standard JS timestamp)
+      const date = new Date(c.detected_at);
+      return JSON.stringify({
+        cycle_id: c.cycle_id,
+        markets: c.markets,
+        total_weight: c.total_weight,
+        opportunity_type: c.opportunity_type,
+        detected_at: date.toISOString().replace("T", " ").replace("Z", ""),
+        detected_date: date.toISOString().split("T")[0],
+        metadata: "{}",
+      });
+    }).join("\n");
 
     try {
       const response = await fetch(
