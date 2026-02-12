@@ -1868,6 +1868,85 @@ async function scheduledHandler(
           const doId = ns.idFromName("global", { locationHint: DEFAULT_LOCATION_HINT });
           const stub = env.GRAPH_MANAGER.get(doId);
 
+          // Run correlation seeding before rebuild (daily, but check every 15 min)
+          // Only seed once per day to avoid duplicate signals
+          const lastSeedKey = "graph:last_correlation_seed";
+          const lastSeed = await env.GRAPH_CACHE.get(lastSeedKey);
+          const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+
+          if (!lastSeed || parseInt(lastSeed) < oneDayAgo) {
+            console.log("[Scheduled] Running daily correlation seeding...");
+
+            // Seed positive correlations
+            const correlationQuery = `
+              INSERT INTO trading_data.graph_edge_signals
+              SELECT
+                a.condition_id AS market_a,
+                b.condition_id AS market_b,
+                'correlation' AS edge_type,
+                'cron_correlation' AS signal_source,
+                '' AS user_id,
+                abs(corr(a.mid_price, b.mid_price)) AS strength,
+                '' AS metadata,
+                now64(6) AS created_at,
+                today() AS created_date
+              FROM trading_data.ob_bbo a
+              JOIN trading_data.ob_bbo b ON a.ingestion_ts = b.ingestion_ts
+              WHERE a.condition_id < b.condition_id
+                AND a.ingestion_ts > now() - INTERVAL 7 DAY
+              GROUP BY a.condition_id, b.condition_id
+              HAVING abs(corr(a.mid_price, b.mid_price)) > 0.6
+            `;
+
+            // Seed hedge relationships (negative correlations)
+            const hedgeQuery = `
+              INSERT INTO trading_data.graph_edge_signals
+              SELECT
+                a.condition_id AS market_a,
+                b.condition_id AS market_b,
+                'hedge' AS edge_type,
+                'cron_correlation' AS signal_source,
+                '' AS user_id,
+                abs(corr(a.mid_price, b.mid_price)) AS strength,
+                '' AS metadata,
+                now64(6) AS created_at,
+                today() AS created_date
+              FROM trading_data.ob_bbo a
+              JOIN trading_data.ob_bbo b ON a.ingestion_ts = b.ingestion_ts
+              WHERE a.condition_id < b.condition_id
+                AND a.ingestion_ts > now() - INTERVAL 7 DAY
+              GROUP BY a.condition_id, b.condition_id
+              HAVING corr(a.mid_price, b.mid_price) < -0.5
+            `;
+
+            try {
+              await fetch(env.CLICKHOUSE_URL, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "text/plain",
+                  "X-ClickHouse-User": env.CLICKHOUSE_USER,
+                  "X-ClickHouse-Key": env.CLICKHOUSE_TOKEN,
+                },
+                body: correlationQuery,
+              });
+
+              await fetch(env.CLICKHOUSE_URL, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "text/plain",
+                  "X-ClickHouse-User": env.CLICKHOUSE_USER,
+                  "X-ClickHouse-Key": env.CLICKHOUSE_TOKEN,
+                },
+                body: hedgeQuery,
+              });
+
+              await env.GRAPH_CACHE.put(lastSeedKey, Date.now().toString(), { expirationTtl: 86400 * 2 });
+              console.log("[Scheduled] Correlation seeding complete");
+            } catch (seedError) {
+              console.error("[Scheduled] Correlation seeding failed:", seedError);
+            }
+          }
+
           const response = await stub.fetch("http://do/rebuild", { method: "POST" });
           const result = await response.json() as { market_count?: number; edge_count?: number };
 
