@@ -43,7 +43,6 @@ export function findArbitragePaths(
 ): ArbitragePath[] {
   const { maxDepth = 2, minWeight = 0.5, limit = 10 } = options;
 
-  const visited = new Set<string>();
   const queue: BFSQueueEntry[] = [{
     market: startMarket,
     path: [startMarket],
@@ -57,7 +56,7 @@ export function findArbitragePaths(
     const entry = queue.shift()!;
     const { market, path, weights, edgeTypes, totalWeight } = entry;
 
-    // Skip if we've visited this market in current path depth
+    // Skip if path exceeds max depth
     if (path.length > maxDepth + 1) continue;
 
     // Get neighbors from adjacency list
