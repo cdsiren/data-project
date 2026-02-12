@@ -264,12 +264,21 @@ graphRouter.post("/detect-cycles", async (c) => {
  * - edge_type: Filter by edge type
  */
 graphRouter.get("/top-edges", async (c) => {
-  const limit = parseInt(c.req.query("limit") || "100");
+  const limit = Math.min(Math.max(1, parseInt(c.req.query("limit") || "100")), 1000);
   const edgeType = c.req.query("edge_type");
 
+  // Whitelist valid edge types to prevent SQL injection
+  const VALID_EDGE_TYPES = ["correlation", "hedge", "causal", "arbitrage"] as const;
+
   try {
-    // Query ClickHouse directly for top edges
-    const typeFilter = edgeType ? `AND edge_type = '${edgeType}'` : "";
+    // Validate edge_type against whitelist
+    let typeFilter = "";
+    if (edgeType) {
+      if (!VALID_EDGE_TYPES.includes(edgeType as typeof VALID_EDGE_TYPES[number])) {
+        return c.json({ error: `Invalid edge_type. Must be one of: ${VALID_EDGE_TYPES.join(", ")}` }, 400);
+      }
+      typeFilter = `AND edge_type = '${edgeType}'`;
+    }
 
     const query = `
       SELECT

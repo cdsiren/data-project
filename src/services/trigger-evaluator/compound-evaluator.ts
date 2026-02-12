@@ -123,6 +123,12 @@ export class CompoundTriggerEvaluator {
       actual_value?: number;
     }> = [];
 
+    // Cleanup stale state BEFORE evaluation to prevent old data from affecting fire decision
+    if (Date.now() - state.last_evaluation > this.STALE_STATE_THRESHOLD_MS) {
+      state.fired_conditions.clear();
+      state.condition_values.clear();
+    }
+
     // Evaluate each condition
     for (let i = 0; i < trigger.conditions.length; i++) {
       const condition = trigger.conditions[i];
@@ -169,6 +175,16 @@ export class CompoundTriggerEvaluator {
       await this.publishCrossShardState(trigger, results);
       const crossShardResult = await this.aggregateCrossShardState(trigger);
 
+      // Handle state cleanup for cross-shard triggers (same logic as local triggers)
+      if (crossShardResult.shouldFire) {
+        state.fired_conditions.clear();
+        state.condition_values.clear();
+        this.triggerMissCount.delete(trigger.id);
+      } else {
+        await this.trackTriggerMiss(trigger);
+      }
+      state.last_evaluation = Date.now();
+
       // Merge cross-shard results
       return {
         shouldFire: crossShardResult.shouldFire,
@@ -200,11 +216,7 @@ export class CompoundTriggerEvaluator {
       await this.trackTriggerMiss(trigger);
     }
 
-    // Cleanup stale state
-    if (Date.now() - state.last_evaluation > this.STALE_STATE_THRESHOLD_MS) {
-      state.fired_conditions.clear();
-      state.condition_values.clear();
-    }
+    // Update last_evaluation timestamp (stale cleanup now happens at start of evaluation)
     state.last_evaluation = Date.now();
 
     return {

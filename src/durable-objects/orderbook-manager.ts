@@ -1641,7 +1641,7 @@ export class OrderbookManager extends DurableObject<Env> {
     this.bufferSnapshot(finalSnapshot);
 
     // Evaluate triggers
-    this.evaluateTriggersSync(finalSnapshot);
+    this.ctx.waitUntil(this.evaluateTriggersAsync(finalSnapshot));
   }
 
   /**
@@ -1725,7 +1725,7 @@ export class OrderbookManager extends DurableObject<Env> {
 
       if (snapshot) {
         this.bufferSnapshot(snapshot);
-        this.evaluateTriggersSync(snapshot);
+        this.ctx.waitUntil(this.evaluateTriggersAsync(snapshot));
       }
     }
   }
@@ -1930,7 +1930,7 @@ export class OrderbookManager extends DurableObject<Env> {
     this.bufferSnapshot(snapshot);
 
     // LOW-LATENCY: Evaluate triggers synchronously (bypasses queues)
-    this.evaluateTriggersSync(snapshot);
+    this.ctx.waitUntil(this.evaluateTriggersAsync(snapshot));
   }
 
   /**
@@ -2142,7 +2142,7 @@ export class OrderbookManager extends DurableObject<Env> {
       this.bufferSnapshot(snapshot);
 
       // LOW-LATENCY: Evaluate triggers synchronously (bypasses queues)
-      this.evaluateTriggersSync(snapshot);
+      this.ctx.waitUntil(this.evaluateTriggersAsync(snapshot));
     }
   }
 
@@ -3238,6 +3238,18 @@ export class OrderbookManager extends DurableObject<Env> {
         );
       }
 
+      // Validation: conditions array requires compound_mode
+      if (body.conditions && !body.compound_mode) {
+        return Response.json(
+          {
+            trigger_id: "",
+            status: "error",
+            message: "compound_mode is required when using conditions array. Use 'ALL_OF', 'ANY_OF', or 'N_OF_M'.",
+          } as TriggerRegistration,
+          { status: 400 }
+        );
+      }
+
       // Validate condition-specific parameters (skip for compound triggers)
       if (body.condition && !body.compound_mode) {
         const validationError = this.validateTriggerCondition(body.condition);
@@ -3520,9 +3532,9 @@ export class OrderbookManager extends DurableObject<Env> {
   // Only webhook dispatch is async (via waitUntil)
   // ============================================================
 
-  private evaluateTriggersSync(snapshot: BBOSnapshot): void {
+  private async evaluateTriggersAsync(snapshot: BBOSnapshot): Promise<void> {
     try {
-      this.evaluateTriggersCore(snapshot);
+      await this.evaluateTriggersCore(snapshot);
     } catch (error) {
       // CRITICAL: Don't let trigger evaluation crash the DO
       // Log error with stack trace and continue processing orderbook updates
@@ -3572,9 +3584,9 @@ export class OrderbookManager extends DurableObject<Env> {
 
   /**
    * Core trigger evaluation logic, separated for error isolation.
-   * Any exception here is caught by evaluateTriggersSync.
+   * Any exception here is caught by evaluateTriggersAsync.
    */
-  private evaluateTriggersCore(snapshot: BBOSnapshot): void {
+  private async evaluateTriggersCore(snapshot: BBOSnapshot): Promise<void> {
     // Store latest BBO for arbitrage calculations
     // Mark as NOT stale since we just received fresh data
     // Include size data for trade sizing calculations
@@ -3774,9 +3786,10 @@ export class OrderbookManager extends DurableObject<Env> {
     // ============================================================
     // COMPOUND TRIGGERS - Multi-market condition triggers
     // Uses CompoundTriggerEvaluator with gradual decay for wrong hypotheses
+    // CRITICAL: Must await to ensure fired events are collected before SSE/webhook dispatch
     // ============================================================
     if (this.compoundTriggers.size > 0 && this.compoundEvaluator) {
-      this.ctx.waitUntil(this.evaluateCompoundTriggers(snapshot, now, firedEvents));
+      await this.evaluateCompoundTriggers(snapshot, now, firedEvents);
     }
 
     // ============================================================
