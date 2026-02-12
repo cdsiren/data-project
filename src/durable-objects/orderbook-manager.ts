@@ -3823,6 +3823,22 @@ export class OrderbookManager extends DurableObject<Env> {
     }
 
     // ============================================================
+    // GLOBAL TRIGGERS - Always-on triggers for dashboard streaming
+    // These fire without registration and publish directly to SSE (no webhook)
+    // CRITICAL: Evaluate BEFORE compound trigger await to prevent race conditions
+    // with concurrent evaluations accessing stale previousBBO state
+    // ============================================================
+    const globalEvents = this.evaluateGlobalTriggers(snapshot, now);
+
+    // LARGE_FILL: Update previousBBO IMMEDIATELY after global triggers read it
+    // This must happen BEFORE any await to prevent concurrent evaluations from
+    // reading stale previousBBO values (race condition via ctx.waitUntil)
+    this.previousBBO.set(snapshot.asset_id, {
+      bid_size: snapshot.bid_size,
+      ask_size: snapshot.ask_size,
+    });
+
+    // ============================================================
     // COMPOUND TRIGGERS - Multi-market condition triggers
     // Uses CompoundTriggerEvaluator with gradual decay for wrong hypotheses
     // CRITICAL: Must await to ensure fired events are collected before SSE/webhook dispatch
@@ -3830,23 +3846,6 @@ export class OrderbookManager extends DurableObject<Env> {
     if (this.compoundTriggers.size > 0 && this.compoundEvaluator) {
       await this.evaluateCompoundTriggers(snapshot, now, firedEvents);
     }
-
-    // ============================================================
-    // GLOBAL TRIGGERS - Always-on triggers for dashboard streaming
-    // These fire without registration and publish directly to SSE (no webhook)
-    // ============================================================
-    const globalEvents = this.evaluateGlobalTriggers(snapshot, now);
-
-    // Note: Global trigger latency is NOT recorded separately - they're included
-    // in allEvents which is sufficient for dashboard display. Registered triggers
-    // already record latency at line 3218 above.
-
-    // LARGE_FILL: Update previousBBO BEFORE dispatch to ensure state consistency
-    // (if dispatch throws, we still have correct state for next evaluation)
-    this.previousBBO.set(snapshot.asset_id, {
-      bid_size: snapshot.bid_size,
-      ask_size: snapshot.ask_size,
-    });
 
     // Collect all events for batched SSE publish (reduces DO hops)
     // OPTIMIZED: Push loop instead of spread operator to avoid intermediate allocations
