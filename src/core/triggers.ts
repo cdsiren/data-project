@@ -276,6 +276,97 @@ export interface TriggerBounds {
  * @param trigger The trigger to compute bounds for
  * @returns TriggerBounds with constraints, null values mean "no constraint"
  */
+// ============================================================
+// COMPOUND TRIGGER TYPES
+// For multi-market graph-based triggers
+// ============================================================
+
+/**
+ * Modes for evaluating compound trigger conditions.
+ * - ALL_OF: All conditions must fire (AND logic)
+ * - ANY_OF: At least one condition must fire (OR logic)
+ * - N_OF_M: At least N of M conditions must fire
+ */
+export type CompoundMode = "ALL_OF" | "ANY_OF" | "N_OF_M";
+
+/**
+ * Extended condition for compound triggers.
+ * Adds market_id to support cross-market conditions.
+ */
+export interface CompoundCondition extends TriggerCondition {
+  /** Market ID (condition_id) this condition applies to */
+  market_id: string;
+  /** Asset ID within the market */
+  asset_id: string;
+  /** Human-readable label for this condition */
+  label?: string;
+}
+
+/**
+ * Compound trigger spanning multiple markets.
+ * Extends base Trigger with multi-condition support.
+ */
+export interface CompoundTrigger extends Omit<Trigger, "condition"> {
+  /** Evaluation mode for conditions */
+  compound_mode: CompoundMode;
+  /** Threshold for N_OF_M mode (min conditions that must fire) */
+  compound_threshold?: number;
+  /** Multiple conditions to evaluate */
+  conditions: CompoundCondition[];
+  /** Whether trigger spans multiple shards (auto-detected based on market_ids) */
+  cross_shard: boolean;
+  /** Inferred edge type for graph signal emission */
+  inferred_edge_type: "correlation" | "hedge" | "causal";
+  /** Markets involved in this trigger (condition_ids for edge signal generation) */
+  market_ids: string[];
+  /** Original user ID who created the trigger */
+  user_id?: string;
+  /** Single condition kept for backward compatibility (uses first condition) */
+  condition: TriggerCondition;
+}
+
+/**
+ * State for tracking compound trigger partial fires.
+ * Used in OrderbookManager to track which conditions have fired.
+ */
+export interface CompoundTriggerState {
+  trigger_id: string;
+  /** Set of indices (as strings) of fired conditions */
+  fired_conditions: Set<string>;
+  /** Last evaluation timestamp (ms) */
+  last_evaluation: number;
+  /** Actual values when conditions fired: index -> value */
+  condition_values: Map<string, number>;
+  /** Version counter for optimistic locking (prevents race conditions in concurrent evaluations) */
+  version: number;
+}
+
+/**
+ * Event emitted when a compound trigger fires.
+ * Extends TriggerEvent with compound-specific fields.
+ */
+export interface CompoundTriggerEvent extends TriggerEvent {
+  /** All conditions and their status */
+  conditions_status: Array<{
+    index: number;
+    market_id: string;
+    asset_id: string;
+    fired: boolean;
+    actual_value?: number;
+  }>;
+  /** Indices of conditions that actually fired */
+  fired_conditions: number[];
+  /** Compound mode used */
+  compound_mode: CompoundMode;
+}
+
+/**
+ * Type guard for CompoundTrigger.
+ */
+export function isCompoundTrigger(trigger: Trigger | CompoundTrigger): trigger is CompoundTrigger {
+  return "compound_mode" in trigger && "conditions" in trigger;
+}
+
 export function computeTriggerBounds(trigger: Trigger): TriggerBounds {
   const bounds: TriggerBounds = {
     minBid: null,

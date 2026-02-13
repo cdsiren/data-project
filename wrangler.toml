@@ -83,6 +83,30 @@ max_batch_timeout = 5     # Reduced from 60s for low-latency writes
 max_retries = 5
 dead_letter_queue = "dead-letter-queue"
 
+# Graph edge signal queue for market relationship tracking
+[[queues.producers]]
+queue = "graph-edge-signal-queue"
+binding = "GRAPH_QUEUE"
+
+[[queues.consumers]]
+queue = "graph-edge-signal-queue"
+max_batch_size = 100      # Max allowed by Cloudflare
+max_batch_timeout = 5     # Low latency for real-time graph updates
+max_retries = 3
+dead_letter_queue = "dead-letter-queue"
+
+# Webhook dead letter queue for failed webhook deliveries
+# Allows retry/investigation of failed trigger notifications
+[[queues.producers]]
+queue = "webhook-dlq"
+binding = "WEBHOOK_DLQ"
+
+[[queues.consumers]]
+queue = "webhook-dlq"
+max_batch_size = 50       # Smaller batch for webhook retries
+max_batch_timeout = 30    # Allow some batching for efficiency
+max_retries = 3
+
 # ============================================================
 # DURABLE OBJECTS
 # ============================================================
@@ -90,8 +114,14 @@ dead_letter_queue = "dead-letter-queue"
 [durable_objects]
 bindings = [
   { name = "ORDERBOOK_MANAGER", class_name = "OrderbookManager" },
-  { name = "TRIGGER_EVENT_BUFFER", class_name = "TriggerEventBuffer" }
+  { name = "TRIGGER_EVENT_BUFFER", class_name = "TriggerEventBuffer" },
+  { name = "GRAPH_MANAGER", class_name = "GraphManager" }
 ]
+
+# Migrations for new Durable Objects
+[[migrations]]
+tag = "v1"
+new_classes = ["GraphManager"]
 
 # Migrations removed - OrderbookManager and TriggerEventBuffer already exist in production
 # Add new migrations here only for future schema changes (e.g., renamed_classes, deleted_classes)
@@ -108,15 +138,27 @@ id = "9377c262330f4d80b9fb6841d6b8cf19"
 binding = "HASH_CHAIN_CACHE"
 id = "2d5f178dcab04f4697eb6f6a9a0946a5"
 
+# Graph adjacency list cache (TTL: 15 minutes, matches rebuild interval)
+[[kv_namespaces]]
+binding = "GRAPH_CACHE"
+id = "72261b1c3d1f41a3b357506f6178ee5a"
+
+# Cross-shard coordination for compound triggers (TTL: 60 seconds)
+[[kv_namespaces]]
+binding = "CROSS_SHARD_KV"
+id = "3fc6ff2fddb04b9c889fb59ee04102fc"
+
 # ============================================================
 # SCHEDULED TRIGGERS
 # - Market lifecycle check every 5 minutes (resolutions & new markets)
 # - Full metadata refresh hourly (ensures stale data doesn't accumulate)
 #   Runs at minute 2 to avoid collision with 5-minute cron at :00
+# - Graph rebuild every 15 minutes (correlation seeding, edge aggregation)
+#   Runs at minutes 7, 22, 37, 52 to offset from other crons
 # ============================================================
 
 [triggers]
-crons = ["*/5 * * * *", "2 * * * *"]
+crons = ["*/5 * * * *", "2 * * * *", "7,22,37,52 * * * *"]
 
 # ============================================================
 # ENVIRONMENT VARIABLES

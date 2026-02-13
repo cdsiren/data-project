@@ -6,6 +6,7 @@ import type {
   FullL2Snapshot,
 } from "./types/orderbook";
 import type { MarketSource, MarketType } from "./core/enums";
+import type { GraphQueueMessage } from "./services/graph/types";
 
 // Re-export Polymarket types from their canonical location (avoid duplication)
 export type {
@@ -17,6 +18,8 @@ export interface Env {
   // KV Namespaces
   MARKET_CACHE: KVNamespace;
   HASH_CHAIN_CACHE: KVNamespace;
+  GRAPH_CACHE: KVNamespace;           // Graph adjacency list cache
+  CROSS_SHARD_KV: KVNamespace;        // Cross-shard coordination for compound triggers
 
   // Queues
   SNAPSHOT_QUEUE: Queue<BBOSnapshot>;
@@ -25,10 +28,13 @@ export interface Env {
   LEVEL_CHANGE_QUEUE: Queue<OrderbookLevelChange>;
   FULL_L2_QUEUE: Queue<FullL2Snapshot>;
   DEAD_LETTER_QUEUE: Queue<DeadLetterMessage>;
+  GRAPH_QUEUE: Queue<GraphQueueMessage>;  // Graph edge signal queue
+  WEBHOOK_DLQ: Queue<WebhookDeadLetterMessage>;  // Failed webhook delivery queue
 
   // Durable Objects
   ORDERBOOK_MANAGER: DurableObjectNamespace;
   TRIGGER_EVENT_BUFFER: DurableObjectNamespace;
+  GRAPH_MANAGER: DurableObjectNamespace;  // Market graph manager
 
   // Environment Variables
   GAMMA_API_URL: string;
@@ -81,5 +87,15 @@ export interface DeadLetterMessage {
   payload: unknown;
   error: string;
   failed_at: string;
+  retry_count: number;
+}
+
+// Webhook Dead Letter Queue message for failed webhook delivery
+export interface WebhookDeadLetterMessage {
+  trigger_id: string;
+  webhook_url: string;
+  event: unknown;
+  failed_at: number;
+  reason: string;
   retry_count: number;
 }
