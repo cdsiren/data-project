@@ -89,15 +89,8 @@ export class GraphManager extends DurableObject<Env> {
           );
         }
 
-        // Schedule alarm for next rebuild if needed
-        const nextRebuild = this.lastRebuild + this.REBUILD_INTERVAL_MS;
-        if (Date.now() >= nextRebuild) {
-          // Rebuild now
-          await this.ctx.storage.setAlarm(Date.now() + 1000);
-        } else {
-          // Schedule for next interval
-          await this.ctx.storage.setAlarm(nextRebuild);
-        }
+        // Note: Rebuilds are triggered by cron in index.ts ("7,22,37,52 * * * *")
+        // DO alarms removed to prevent duplicate rebuilds
       } catch (error) {
         console.error("[GraphManager] Error restoring state:", error);
       }
@@ -265,24 +258,13 @@ export class GraphManager extends DurableObject<Env> {
   }
 
   /**
-   * Handle scheduled alarm for periodic rebuild.
+   * Handle any stale alarms from before cron migration.
+   * Rebuilds are now triggered only by cron in index.ts to prevent duplicates.
    */
   async alarm(): Promise<void> {
-    console.log("[GraphManager] Alarm triggered, starting rebuild");
-
-    try {
-      await this.rebuildGraph();
-
-      // Run cycle detection after rebuild
-      await this.runCycleDetection();
-
-      // Schedule next alarm
-      await this.ctx.storage.setAlarm(Date.now() + this.REBUILD_INTERVAL_MS);
-    } catch (error) {
-      console.error("[GraphManager] Alarm error:", error);
-      // Retry in 1 minute on error
-      await this.ctx.storage.setAlarm(Date.now() + 60000);
-    }
+    // Cancel stale alarm - rebuilds now handled by cron
+    console.log("[GraphManager] Stale alarm triggered, cancelling (rebuilds now via cron)");
+    await this.ctx.storage.deleteAlarm();
   }
 
   /**
