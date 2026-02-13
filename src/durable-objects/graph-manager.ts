@@ -415,7 +415,7 @@ export class GraphManager extends DurableObject<Env> {
               WHEN 'bellman_ford_cycle' THEN 2.5
               ELSE 1.0
             END *
-            exp(-dateDiff('day', created_at, now()) / 30)
+            exp(-dateDiff('day', created_at, now()) * 0.693147 / 30)
           ))) AS weight,
           uniqExact(user_id) AS user_count,
           count() AS signal_count,

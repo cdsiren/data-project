@@ -100,7 +100,7 @@ FROM trading_data.graph_edges;
 --         WHEN 'bellman_ford_cycle' THEN 2.5
 --         ELSE 1.0
 --       END *
---       exp(-dateDiff('day', created_at, now()) / 30)  -- 30-day half-life
+--       exp(-dateDiff('day', created_at, now()) * 0.693147 / 30)  -- 30-day half-life (ln(2)/30)
 --     )) AS weight,
 --     uniqExact(user_id) AS user_count,
 --     count() AS signal_count,

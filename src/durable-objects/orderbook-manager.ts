@@ -4991,9 +4991,9 @@ export class OrderbookManager extends DurableObject<Env> {
       }
     }
 
-    // Cleanup HMAC key cache for deleted triggers
+    // Cleanup HMAC key cache for deleted triggers (check both standard and compound)
     for (const triggerId of this.hmacKeyCache.keys()) {
-      if (!this.triggers.has(triggerId)) {
+      if (!this.triggers.has(triggerId) && !this.compoundTriggers.has(triggerId)) {
         this.hmacKeyCache.delete(triggerId);
       }
     }

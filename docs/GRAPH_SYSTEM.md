@@ -93,7 +93,7 @@ log(1 + sum(
     WHEN 'metadata_tag' THEN 0.8
     ELSE 1.0
   END *
-  exp(-dateDiff('day', created_at, now()) / 30)  -- 30-day half-life
+  exp(-dateDiff('day', created_at, now()) * 0.693147 / 30)  -- 30-day half-life (ln(2)/30)
 )) AS weight
 ```
 
