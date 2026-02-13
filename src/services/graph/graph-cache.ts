@@ -496,6 +496,8 @@ export function allPairs(items: string[]): [string, string][] {
 /**
  * SQL query to seed positive correlation edges.
  * Finds market pairs with correlation > 0.6 over the last 7 days.
+ * Uses SETTINGS to control execution time and memory.
+ * Note: mid_price is Decimal(18,6), must cast to Float64 for corr()
  */
 export const CORRELATION_SEEDING_QUERY = `
   INSERT INTO trading_data.graph_edge_signals
@@ -505,7 +507,7 @@ export const CORRELATION_SEEDING_QUERY = `
     'correlation' AS edge_type,
     'cron_correlation' AS signal_source,
     '' AS user_id,
-    abs(corr(a.mid_price, b.mid_price)) AS strength,
+    abs(corr(toFloat64(a.mid_price), toFloat64(b.mid_price))) AS strength,
     '' AS metadata,
     now64(6) AS created_at,
     today() AS created_date
@@ -514,12 +516,15 @@ export const CORRELATION_SEEDING_QUERY = `
   WHERE a.condition_id < b.condition_id
     AND a.ingestion_ts > now() - INTERVAL 7 DAY
   GROUP BY a.condition_id, b.condition_id
-  HAVING abs(corr(a.mid_price, b.mid_price)) > 0.6
+  HAVING abs(corr(toFloat64(a.mid_price), toFloat64(b.mid_price))) > 0.6
+  SETTINGS max_execution_time = 300, max_memory_usage = 10000000000
 `;
 
 /**
  * SQL query to seed hedge edges (negative correlations).
  * Finds market pairs with correlation < -0.5 over the last 7 days.
+ * Uses SETTINGS to control execution time and memory.
+ * Note: mid_price is Decimal(18,6), must cast to Float64 for corr()
  */
 export const HEDGE_SEEDING_QUERY = `
   INSERT INTO trading_data.graph_edge_signals
@@ -529,7 +534,7 @@ export const HEDGE_SEEDING_QUERY = `
     'hedge' AS edge_type,
     'cron_correlation' AS signal_source,
     '' AS user_id,
-    abs(corr(a.mid_price, b.mid_price)) AS strength,
+    abs(corr(toFloat64(a.mid_price), toFloat64(b.mid_price))) AS strength,
     '' AS metadata,
     now64(6) AS created_at,
     today() AS created_date
@@ -538,7 +543,8 @@ export const HEDGE_SEEDING_QUERY = `
   WHERE a.condition_id < b.condition_id
     AND a.ingestion_ts > now() - INTERVAL 7 DAY
   GROUP BY a.condition_id, b.condition_id
-  HAVING corr(a.mid_price, b.mid_price) < -0.5
+  HAVING corr(toFloat64(a.mid_price), toFloat64(b.mid_price)) < -0.5
+  SETTINGS max_execution_time = 300, max_memory_usage = 10000000000
 `;
 
 /**
@@ -549,7 +555,7 @@ export async function executeCorrelationSeeding(
   clickhouseUrl: string,
   clickhouseUser: string,
   clickhouseToken: string
-): Promise<void> {
+): Promise<{ correlationMs: number; hedgeMs: number }> {
   const headers = {
     "Content-Type": "text/plain",
     "X-ClickHouse-User": clickhouseUser,
@@ -557,24 +563,43 @@ export async function executeCorrelationSeeding(
   };
 
   // Run correlation seeding
+  console.log("[CorrelationSeeding] Starting correlation query...");
+  const correlationStart = Date.now();
+
   const correlationResponse = await fetch(clickhouseUrl, {
     method: "POST",
     headers,
     body: CORRELATION_SEEDING_QUERY,
   });
 
+  const correlationMs = Date.now() - correlationStart;
+  console.log(`[CorrelationSeeding] Correlation query completed in ${correlationMs}ms, status: ${correlationResponse.status}`);
+
   if (!correlationResponse.ok) {
-    throw new Error(`Correlation seeding failed: ${correlationResponse.status} ${await correlationResponse.text()}`);
+    const errorText = await correlationResponse.text();
+    console.error(`[CorrelationSeeding] Correlation query failed: ${errorText}`);
+    throw new Error(`Correlation seeding failed: ${correlationResponse.status} ${errorText}`);
   }
 
   // Run hedge seeding
+  console.log("[CorrelationSeeding] Starting hedge query...");
+  const hedgeStart = Date.now();
+
   const hedgeResponse = await fetch(clickhouseUrl, {
     method: "POST",
     headers,
     body: HEDGE_SEEDING_QUERY,
   });
 
+  const hedgeMs = Date.now() - hedgeStart;
+  console.log(`[CorrelationSeeding] Hedge query completed in ${hedgeMs}ms, status: ${hedgeResponse.status}`);
+
   if (!hedgeResponse.ok) {
-    throw new Error(`Hedge seeding failed: ${hedgeResponse.status} ${await hedgeResponse.text()}`);
+    const errorText = await hedgeResponse.text();
+    console.error(`[CorrelationSeeding] Hedge query failed: ${errorText}`);
+    throw new Error(`Hedge seeding failed: ${hedgeResponse.status} ${errorText}`);
   }
+
+  console.log(`[CorrelationSeeding] Seeding complete. Correlation: ${correlationMs}ms, Hedge: ${hedgeMs}ms`);
+  return { correlationMs, hedgeMs };
 }

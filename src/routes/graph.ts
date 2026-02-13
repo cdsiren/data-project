@@ -528,3 +528,166 @@ graphRouter.post("/seed-correlation", async (c) => {
     return c.json({ error: String(error) }, 500);
   }
 });
+
+/**
+ * GET /api/graph/test-correlation
+ * Test the correlation seeding query without inserting.
+ * Returns first 10 correlated pairs that would be seeded.
+ */
+graphRouter.get("/test-correlation", async (c) => {
+  try {
+    // Same query as seeding but SELECT only, with LIMIT
+    // Note: mid_price is Decimal(18,6), must cast to Float64 for corr()
+    const testQuery = `
+      SELECT
+        a.condition_id AS market_a,
+        b.condition_id AS market_b,
+        abs(corr(toFloat64(a.mid_price), toFloat64(b.mid_price))) AS correlation_strength,
+        count() as data_points
+      FROM trading_data.ob_bbo a
+      JOIN trading_data.ob_bbo b ON a.ingestion_ts = b.ingestion_ts
+      WHERE a.condition_id < b.condition_id
+        AND a.ingestion_ts > now() - INTERVAL 7 DAY
+      GROUP BY a.condition_id, b.condition_id
+      HAVING abs(corr(toFloat64(a.mid_price), toFloat64(b.mid_price))) > 0.6
+      ORDER BY correlation_strength DESC
+      LIMIT 20
+      FORMAT JSONEachRow
+      SETTINGS max_execution_time = 120
+    `;
+
+    const headers = {
+      "Content-Type": "text/plain",
+      "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
+      "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
+    };
+
+    const startTime = Date.now();
+    const response = await fetch(c.env.CLICKHOUSE_URL, {
+      method: "POST",
+      headers,
+      body: testQuery,
+    });
+
+    const elapsed = Date.now() - startTime;
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return c.json({
+        error: "Query failed",
+        status: response.status,
+        message: errorText,
+        elapsed_ms: elapsed,
+      }, 500);
+    }
+
+    const text = await response.text();
+    const pairs = text.trim()
+      ? text.trim().split("\n").map(line => JSON.parse(line))
+      : [];
+
+    return c.json({
+      status: "ok",
+      elapsed_ms: elapsed,
+      found_pairs: pairs.length,
+      sample_pairs: pairs,
+      note: pairs.length === 0
+        ? "No market pairs with correlation > 0.6 found in last 7 days"
+        : `Found ${pairs.length} highly correlated market pairs (showing top 20)`,
+    });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});
+
+/**
+ * GET /api/graph/debug
+ * Debug endpoint to check graph cron state.
+ * Returns KV values, last rebuild timestamp, and signal counts.
+ */
+graphRouter.get("/debug", async (c) => {
+  try {
+    // Check last correlation seed timestamp
+    const lastSeedKey = "graph:last_correlation_seed";
+    const lastSeedValue = await c.env.GRAPH_CACHE.get(lastSeedKey);
+    const lastSeedTimestamp = lastSeedValue ? parseInt(lastSeedValue) : null;
+    const lastSeedDate = lastSeedTimestamp ? new Date(lastSeedTimestamp).toISOString() : null;
+
+    // Check rebuild timestamp from cache service
+    const cacheService = new GraphCacheService(c.env.GRAPH_CACHE);
+    const rebuildTimestamp = await cacheService.getRebuildTimestamp();
+    const rebuildDate = rebuildTimestamp ? new Date(rebuildTimestamp).toISOString() : null;
+
+    // Query ClickHouse for signal counts
+    const signalCountQuery = `
+      SELECT
+        signal_source,
+        edge_type,
+        count() as count,
+        min(created_at) as oldest,
+        max(created_at) as newest
+      FROM trading_data.graph_edge_signals
+      GROUP BY signal_source, edge_type
+      ORDER BY count DESC
+      FORMAT JSONEachRow
+    `;
+
+    const edgeCountQuery = `
+      SELECT count() as count FROM trading_data.graph_edges FINAL
+      FORMAT JSONEachRow
+    `;
+
+    const headers = {
+      "Content-Type": "text/plain",
+      "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
+      "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
+    };
+
+    const [signalResponse, edgeResponse] = await Promise.all([
+      fetch(c.env.CLICKHOUSE_URL, { method: "POST", headers, body: signalCountQuery }),
+      fetch(c.env.CLICKHOUSE_URL, { method: "POST", headers, body: edgeCountQuery }),
+    ]);
+
+    const signalText = await signalResponse.text();
+    const edgeText = await edgeResponse.text();
+
+    const signalCounts = signalText.trim()
+      ? signalText.trim().split("\n").map(line => JSON.parse(line))
+      : [];
+
+    const edgeCount = edgeText.trim()
+      ? JSON.parse(edgeText.trim()).count
+      : 0;
+
+    // Get GraphManager status
+    const stub = getGraphManagerStub(c.env);
+    const statusResponse = await stub.fetch("http://do/status");
+    const doStatus = await statusResponse.json();
+
+    return c.json({
+      cron_state: {
+        last_correlation_seed: lastSeedDate,
+        last_correlation_seed_ms: lastSeedTimestamp,
+        seed_age_hours: lastSeedTimestamp
+          ? ((Date.now() - lastSeedTimestamp) / (1000 * 60 * 60)).toFixed(2)
+          : null,
+        needs_seeding: !lastSeedTimestamp || (Date.now() - lastSeedTimestamp) > 24 * 60 * 60 * 1000,
+      },
+      kv_cache: {
+        last_rebuild: rebuildDate,
+        last_rebuild_ms: rebuildTimestamp,
+        rebuild_age_minutes: rebuildTimestamp
+          ? ((Date.now() - rebuildTimestamp) / (1000 * 60)).toFixed(2)
+          : null,
+      },
+      clickhouse: {
+        signal_counts: signalCounts,
+        total_signals: signalCounts.reduce((sum: number, s: { count: number }) => sum + s.count, 0),
+        aggregated_edge_count: edgeCount,
+      },
+      graph_manager: doStatus,
+    });
+  } catch (error) {
+    return c.json({ error: String(error) }, 500);
+  }
+});

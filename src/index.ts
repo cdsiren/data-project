@@ -1877,20 +1877,24 @@ async function scheduledHandler(
 
           if (!lastSeed || parseInt(lastSeed) < oneDayAgo) {
             console.log("[Scheduled] Running daily correlation seeding...");
+            console.log(`[Scheduled] Last seed: ${lastSeed ? new Date(parseInt(lastSeed)).toISOString() : 'never'}`);
 
             try {
-              await executeCorrelationSeeding(
+              const timing = await executeCorrelationSeeding(
                 env.CLICKHOUSE_URL,
                 env.CLICKHOUSE_USER,
                 env.CLICKHOUSE_TOKEN
               );
 
               await env.GRAPH_CACHE.put(lastSeedKey, Date.now().toString(), { expirationTtl: 86400 * 2 });
-              console.log("[Scheduled] Correlation seeding complete");
+              console.log(`[Scheduled] Correlation seeding complete (correlation: ${timing.correlationMs}ms, hedge: ${timing.hedgeMs}ms)`);
             } catch (seedError) {
               // Don't mark as complete on failure - will retry next cron run
               console.error("[Scheduled] Correlation seeding failed:", seedError);
             }
+          } else {
+            const seedAge = Date.now() - parseInt(lastSeed);
+            console.log(`[Scheduled] Skipping correlation seeding (last seed ${(seedAge / 3600000).toFixed(1)}h ago)`);
           }
 
           const response = await stub.fetch("http://do/rebuild", { method: "POST" });

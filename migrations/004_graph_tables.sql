@@ -117,6 +117,7 @@ FROM trading_data.graph_edges;
 -- ============================================================
 
 -- Daily correlation seeding (positive correlations):
+-- Note: mid_price is Decimal(18,6), must cast to Float64 for corr()
 --
 -- INSERT INTO trading_data.graph_edge_signals
 -- SELECT
@@ -125,7 +126,7 @@ FROM trading_data.graph_edges;
 --     'correlation' AS edge_type,
 --     'cron_correlation' AS signal_source,
 --     '' AS user_id,
---     abs(corr(a.mid_price, b.mid_price)) AS strength,
+--     abs(corr(toFloat64(a.mid_price), toFloat64(b.mid_price))) AS strength,
 --     '' AS metadata,
 --     now64(6) AS created_at,
 --     today() AS created_date
@@ -134,7 +135,7 @@ FROM trading_data.graph_edges;
 -- WHERE a.condition_id < b.condition_id
 --   AND a.ingestion_ts > now() - INTERVAL 7 DAY
 -- GROUP BY a.condition_id, b.condition_id
--- HAVING abs(corr(a.mid_price, b.mid_price)) > 0.6;
+-- HAVING abs(corr(toFloat64(a.mid_price), toFloat64(b.mid_price))) > 0.6;
 
 -- ============================================================
 -- 7. Hedge Seeding Query (run as daily cron)
@@ -143,6 +144,7 @@ FROM trading_data.graph_edges;
 -- ============================================================
 
 -- Daily hedge seeding (negative correlations):
+-- Note: mid_price is Decimal(18,6), must cast to Float64 for corr()
 --
 -- INSERT INTO trading_data.graph_edge_signals
 -- SELECT
@@ -151,7 +153,7 @@ FROM trading_data.graph_edges;
 --     'hedge' AS edge_type,
 --     'cron_correlation' AS signal_source,
 --     '' AS user_id,
---     abs(corr(a.mid_price, b.mid_price)) AS strength,  -- Store absolute value
+--     abs(corr(toFloat64(a.mid_price), toFloat64(b.mid_price))) AS strength,  -- Store absolute value
 --     '' AS metadata,
 --     now64(6) AS created_at,
 --     today() AS created_date
@@ -160,7 +162,7 @@ FROM trading_data.graph_edges;
 -- WHERE a.condition_id < b.condition_id
 --   AND a.ingestion_ts > now() - INTERVAL 7 DAY
 -- GROUP BY a.condition_id, b.condition_id
--- HAVING corr(a.mid_price, b.mid_price) < -0.5;  -- Negative correlation = hedge
+-- HAVING corr(toFloat64(a.mid_price), toFloat64(b.mid_price)) < -0.5;  -- Negative correlation = hedge
 
 -- ============================================================
 -- 8. Negative Cycle Alerts Table
