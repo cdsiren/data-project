@@ -3,7 +3,7 @@
 
 import { Hono, Context, Next } from "hono";
 import type { Env } from "../types";
-import { GraphCacheService, formatEdgeReason } from "../services/graph/graph-cache";
+import { GraphCacheService, formatEdgeReason, executeCorrelationSeeding } from "../services/graph/graph-cache";
 import type {
   GraphNeighbor,
   NeighborResponse,
@@ -517,71 +517,11 @@ graphRouter.post("/rebuild", async (c) => {
  */
 graphRouter.post("/seed-correlation", async (c) => {
   try {
-    // Run the correlation seeding query directly
-    const correlationQuery = `
-      INSERT INTO trading_data.graph_edge_signals
-      SELECT
-          a.condition_id AS market_a,
-          b.condition_id AS market_b,
-          'correlation' AS edge_type,
-          'cron_correlation' AS signal_source,
-          '' AS user_id,
-          abs(corr(a.mid_price, b.mid_price)) AS strength,
-          '' AS metadata,
-          now64(6) AS created_at,
-          today() AS created_date
-      FROM trading_data.ob_bbo a
-      JOIN trading_data.ob_bbo b ON a.ingestion_ts = b.ingestion_ts
-      WHERE a.condition_id < b.condition_id
-        AND a.ingestion_ts > now() - INTERVAL 7 DAY
-      GROUP BY a.condition_id, b.condition_id
-      HAVING abs(corr(a.mid_price, b.mid_price)) > 0.6
-    `;
-
-    const response = await fetch(c.env.CLICKHOUSE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "text/plain",
-        "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
-        "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
-      },
-      body: correlationQuery,
-    });
-
-    if (!response.ok) {
-      throw new Error(`ClickHouse error: ${await response.text()}`);
-    }
-
-    // Also run hedge seeding
-    const hedgeQuery = `
-      INSERT INTO trading_data.graph_edge_signals
-      SELECT
-          a.condition_id AS market_a,
-          b.condition_id AS market_b,
-          'hedge' AS edge_type,
-          'cron_correlation' AS signal_source,
-          '' AS user_id,
-          abs(corr(a.mid_price, b.mid_price)) AS strength,
-          '' AS metadata,
-          now64(6) AS created_at,
-          today() AS created_date
-      FROM trading_data.ob_bbo a
-      JOIN trading_data.ob_bbo b ON a.ingestion_ts = b.ingestion_ts
-      WHERE a.condition_id < b.condition_id
-        AND a.ingestion_ts > now() - INTERVAL 7 DAY
-      GROUP BY a.condition_id, b.condition_id
-      HAVING corr(a.mid_price, b.mid_price) < -0.5
-    `;
-
-    await fetch(c.env.CLICKHOUSE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "text/plain",
-        "X-ClickHouse-User": c.env.CLICKHOUSE_USER,
-        "X-ClickHouse-Key": c.env.CLICKHOUSE_TOKEN,
-      },
-      body: hedgeQuery,
-    });
+    await executeCorrelationSeeding(
+      c.env.CLICKHOUSE_URL,
+      c.env.CLICKHOUSE_USER,
+      c.env.CLICKHOUSE_TOKEN
+    );
 
     return c.json({ status: "seeded", timestamp: new Date().toISOString() });
   } catch (error) {

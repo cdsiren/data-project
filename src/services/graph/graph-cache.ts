@@ -482,3 +482,94 @@ export function allPairs<T>(items: T[]): [T, T][] {
 
   return pairs;
 }
+
+// ============================================================
+// Correlation Seeding Queries
+// Shared between cron handler and admin endpoint
+// ============================================================
+
+/**
+ * SQL query to seed positive correlation edges.
+ * Finds market pairs with correlation > 0.6 over the last 7 days.
+ */
+export const CORRELATION_SEEDING_QUERY = `
+  INSERT INTO trading_data.graph_edge_signals
+  SELECT
+    a.condition_id AS market_a,
+    b.condition_id AS market_b,
+    'correlation' AS edge_type,
+    'cron_correlation' AS signal_source,
+    '' AS user_id,
+    abs(corr(a.mid_price, b.mid_price)) AS strength,
+    '' AS metadata,
+    now64(6) AS created_at,
+    today() AS created_date
+  FROM trading_data.ob_bbo a
+  JOIN trading_data.ob_bbo b ON a.ingestion_ts = b.ingestion_ts
+  WHERE a.condition_id < b.condition_id
+    AND a.ingestion_ts > now() - INTERVAL 7 DAY
+  GROUP BY a.condition_id, b.condition_id
+  HAVING abs(corr(a.mid_price, b.mid_price)) > 0.6
+`;
+
+/**
+ * SQL query to seed hedge edges (negative correlations).
+ * Finds market pairs with correlation < -0.5 over the last 7 days.
+ */
+export const HEDGE_SEEDING_QUERY = `
+  INSERT INTO trading_data.graph_edge_signals
+  SELECT
+    a.condition_id AS market_a,
+    b.condition_id AS market_b,
+    'hedge' AS edge_type,
+    'cron_correlation' AS signal_source,
+    '' AS user_id,
+    abs(corr(a.mid_price, b.mid_price)) AS strength,
+    '' AS metadata,
+    now64(6) AS created_at,
+    today() AS created_date
+  FROM trading_data.ob_bbo a
+  JOIN trading_data.ob_bbo b ON a.ingestion_ts = b.ingestion_ts
+  WHERE a.condition_id < b.condition_id
+    AND a.ingestion_ts > now() - INTERVAL 7 DAY
+  GROUP BY a.condition_id, b.condition_id
+  HAVING corr(a.mid_price, b.mid_price) < -0.5
+`;
+
+/**
+ * Execute correlation and hedge seeding queries against ClickHouse.
+ * @throws Error if either query fails
+ */
+export async function executeCorrelationSeeding(
+  clickhouseUrl: string,
+  clickhouseUser: string,
+  clickhouseToken: string
+): Promise<void> {
+  const headers = {
+    "Content-Type": "text/plain",
+    "X-ClickHouse-User": clickhouseUser,
+    "X-ClickHouse-Key": clickhouseToken,
+  };
+
+  // Run correlation seeding
+  const correlationResponse = await fetch(clickhouseUrl, {
+    method: "POST",
+    headers,
+    body: CORRELATION_SEEDING_QUERY,
+  });
+
+  if (!correlationResponse.ok) {
+    throw new Error(`Correlation seeding failed: ${correlationResponse.status} ${await correlationResponse.text()}`);
+  }
+
+  // Run hedge seeding
+  const hedgeResponse = await fetch(clickhouseUrl, {
+    method: "POST",
+    headers,
+    body: HEDGE_SEEDING_QUERY,
+  });
+
+  if (!hedgeResponse.ok) {
+    throw new Error(`Hedge seeding failed: ${hedgeResponse.status} ${await hedgeResponse.text()}`);
+  }
+}

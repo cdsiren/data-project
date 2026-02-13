@@ -20,6 +20,7 @@ import { deadLetterConsumer } from "./consumers/dead-letter-consumer";
 import { edgeSignalConsumer } from "./consumers/edge-signal-consumer";
 import { graphRouter } from "./routes/graph";
 import type { GraphQueueMessage } from "./services/graph/types";
+import { executeCorrelationSeeding } from "./services/graph/graph-cache";
 import { MarketLifecycleService, insertMarketsIntoClickHouse, updateMarketCache, refreshAllMarketMetadata, type MarketLifecycleWebhook } from "./services/market-lifecycle";
 import { MarketCacheService } from "./services/market-cache";
 import { TriggerValidator } from "./services/trigger-evaluator/trigger-validator";
@@ -1877,76 +1878,12 @@ async function scheduledHandler(
           if (!lastSeed || parseInt(lastSeed) < oneDayAgo) {
             console.log("[Scheduled] Running daily correlation seeding...");
 
-            // Seed positive correlations
-            const correlationQuery = `
-              INSERT INTO trading_data.graph_edge_signals
-              SELECT
-                a.condition_id AS market_a,
-                b.condition_id AS market_b,
-                'correlation' AS edge_type,
-                'cron_correlation' AS signal_source,
-                '' AS user_id,
-                abs(corr(a.mid_price, b.mid_price)) AS strength,
-                '' AS metadata,
-                now64(6) AS created_at,
-                today() AS created_date
-              FROM trading_data.ob_bbo a
-              JOIN trading_data.ob_bbo b ON a.ingestion_ts = b.ingestion_ts
-              WHERE a.condition_id < b.condition_id
-                AND a.ingestion_ts > now() - INTERVAL 7 DAY
-              GROUP BY a.condition_id, b.condition_id
-              HAVING abs(corr(a.mid_price, b.mid_price)) > 0.6
-            `;
-
-            // Seed hedge relationships (negative correlations)
-            const hedgeQuery = `
-              INSERT INTO trading_data.graph_edge_signals
-              SELECT
-                a.condition_id AS market_a,
-                b.condition_id AS market_b,
-                'hedge' AS edge_type,
-                'cron_correlation' AS signal_source,
-                '' AS user_id,
-                abs(corr(a.mid_price, b.mid_price)) AS strength,
-                '' AS metadata,
-                now64(6) AS created_at,
-                today() AS created_date
-              FROM trading_data.ob_bbo a
-              JOIN trading_data.ob_bbo b ON a.ingestion_ts = b.ingestion_ts
-              WHERE a.condition_id < b.condition_id
-                AND a.ingestion_ts > now() - INTERVAL 7 DAY
-              GROUP BY a.condition_id, b.condition_id
-              HAVING corr(a.mid_price, b.mid_price) < -0.5
-            `;
-
             try {
-              const correlationResponse = await fetch(env.CLICKHOUSE_URL, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "text/plain",
-                  "X-ClickHouse-User": env.CLICKHOUSE_USER,
-                  "X-ClickHouse-Key": env.CLICKHOUSE_TOKEN,
-                },
-                body: correlationQuery,
-              });
-
-              if (!correlationResponse.ok) {
-                throw new Error(`Correlation seeding failed: ${correlationResponse.status} ${await correlationResponse.text()}`);
-              }
-
-              const hedgeResponse = await fetch(env.CLICKHOUSE_URL, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "text/plain",
-                  "X-ClickHouse-User": env.CLICKHOUSE_USER,
-                  "X-ClickHouse-Key": env.CLICKHOUSE_TOKEN,
-                },
-                body: hedgeQuery,
-              });
-
-              if (!hedgeResponse.ok) {
-                throw new Error(`Hedge seeding failed: ${hedgeResponse.status} ${await hedgeResponse.text()}`);
-              }
+              await executeCorrelationSeeding(
+                env.CLICKHOUSE_URL,
+                env.CLICKHOUSE_USER,
+                env.CLICKHOUSE_TOKEN
+              );
 
               await env.GRAPH_CACHE.put(lastSeedKey, Date.now().toString(), { expirationTtl: 86400 * 2 });
               console.log("[Scheduled] Correlation seeding complete");
