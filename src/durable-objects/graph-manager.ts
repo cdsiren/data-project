@@ -417,7 +417,7 @@ export class GraphManager extends DurableObject<Env> {
             END *
             exp(-dateDiff('day', created_at, now()) * 0.693147 / 30)
           ))) AS weight,
-          uniqExact(user_id) AS user_count,
+          uniqExactIf(user_id, user_id != '') AS user_count,
           count() AS signal_count,
           max(created_at) AS last_signal_at,
           now64(6) AS updated_at

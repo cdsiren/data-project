@@ -4535,15 +4535,16 @@ export class OrderbookManager extends DurableObject<Env> {
   ): Promise<void> {
     if (!this.compoundEvaluator) return;
 
-    // Find compound triggers that include this asset in their conditions
-    for (const [triggerId, trigger] of this.compoundTriggers) {
-      if (!trigger.enabled) continue;
+    // Use triggersByAsset index for O(relevant) instead of O(all compound triggers)
+    const relevantTriggerIds = this.triggersByAsset.get(snapshot.asset_id);
+    if (!relevantTriggerIds || relevantTriggerIds.size === 0) return;
 
-      // Check if any condition involves this asset
-      const involvesAsset = trigger.conditions.some(
-        c => c.asset_id === snapshot.asset_id
-      );
-      if (!involvesAsset) continue;
+    // Iterate only triggers that involve this asset (already indexed during registration)
+    for (const triggerId of relevantTriggerIds) {
+      const trigger = this.compoundTriggers.get(triggerId);
+      // Skip if not a compound trigger (index contains both standard and compound)
+      if (!trigger) continue;
+      if (!trigger.enabled) continue;
 
       // Check cooldown
       const lastFire = this.lastTriggerFire.get(triggerId) || 0;

@@ -102,7 +102,7 @@ FROM trading_data.graph_edges;
 --       END *
 --       exp(-dateDiff('day', created_at, now()) * 0.693147 / 30)  -- 30-day half-life (ln(2)/30)
 --     )) AS weight,
---     uniqExact(user_id) AS user_count,
+--     uniqExactIf(user_id, user_id != '') AS user_count,
 --     count() AS signal_count,
 --     max(created_at) AS last_signal_at,
 --     now64(6) AS updated_at
