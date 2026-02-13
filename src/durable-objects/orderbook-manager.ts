@@ -3406,7 +3406,7 @@ export class OrderbookManager extends DurableObject<Env> {
           compound_threshold: body.compound_threshold,
           cross_shard: body.cross_shard ?? false,
           inferred_edge_type: body.inferred_edge_type || "correlation",
-          market_ids: body.conditions.map((c: { market_id: string }) => c.market_id),
+          market_ids: [...new Set(body.conditions.map((c: { market_id: string }) => c.market_id))],
           market_source: body.market_source || "polymarket",
           user_id: body.user_id,
           webhook_url: body.webhook_url,

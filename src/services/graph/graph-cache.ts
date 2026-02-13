@@ -468,15 +468,18 @@ export function inferEdgeType(templateType: string): "correlation" | "hedge" | "
 }
 
 /**
- * Generate all pairs from an array of market IDs.
+ * Generate all unique pairs from an array of market IDs.
  * Used for creating edge signals between related markets.
+ * Deduplicates input to prevent self-edges and duplicate pairs.
  */
 export function allPairs<T>(items: T[]): [T, T][] {
+  // Deduplicate to prevent self-edges when same market appears multiple times
+  const unique = [...new Set(items)];
   const pairs: [T, T][] = [];
 
-  for (let i = 0; i < items.length; i++) {
-    for (let j = i + 1; j < items.length; j++) {
-      pairs.push([items[i], items[j]]);
+  for (let i = 0; i < unique.length; i++) {
+    for (let j = i + 1; j < unique.length; j++) {
+      pairs.push([unique[i], unique[j]]);
     }
   }
 
