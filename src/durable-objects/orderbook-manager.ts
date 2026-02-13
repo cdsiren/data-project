@@ -4616,14 +4616,17 @@ export class OrderbookManager extends DurableObject<Env> {
 
     const edgeType = trigger.inferred_edge_type || "correlation";
 
+    // Sort to ensure canonical ordering (market_a < market_b) for aggregation
+    const sortedIds = [...marketIds].sort();
+
     // Generate all pairs and emit signals
-    for (let i = 0; i < marketIds.length; i++) {
-      for (let j = i + 1; j < marketIds.length; j++) {
+    for (let i = 0; i < sortedIds.length; i++) {
+      for (let j = i + 1; j < sortedIds.length; j++) {
         try {
           await this.env.GRAPH_QUEUE.send({
             type: "edge_signal",
-            market_a: marketIds[i],
-            market_b: marketIds[j],
+            market_a: sortedIds[i],
+            market_b: sortedIds[j],
             edge_type: edgeType,
             signal_source: "trigger_fire",
             user_id: trigger.user_id || "",
@@ -4636,7 +4639,7 @@ export class OrderbookManager extends DurableObject<Env> {
           });
         } catch (error) {
           console.error(
-            `[Graph] Failed to emit fire signal for ${marketIds[i]}-${marketIds[j]}:`,
+            `[Graph] Failed to emit fire signal for ${sortedIds[i]}-${sortedIds[j]}:`,
             error
           );
         }
@@ -4654,14 +4657,17 @@ export class OrderbookManager extends DurableObject<Env> {
 
     const edgeType = trigger.inferred_edge_type || "correlation";
 
+    // Sort to ensure canonical ordering (market_a < market_b) for aggregation
+    const sortedIds = [...marketIds].sort();
+
     // Generate all pairs and emit signals
-    for (let i = 0; i < marketIds.length; i++) {
-      for (let j = i + 1; j < marketIds.length; j++) {
+    for (let i = 0; i < sortedIds.length; i++) {
+      for (let j = i + 1; j < sortedIds.length; j++) {
         try {
           await this.env.GRAPH_QUEUE.send({
             type: "edge_signal",
-            market_a: marketIds[i],
-            market_b: marketIds[j],
+            market_a: sortedIds[i],
+            market_b: sortedIds[j],
             edge_type: edgeType,
             signal_source: "user_trigger",
             user_id: trigger.user_id || "",
@@ -4675,7 +4681,7 @@ export class OrderbookManager extends DurableObject<Env> {
           });
         } catch (error) {
           console.error(
-            `[Graph] Failed to emit creation signal for ${marketIds[i]}-${marketIds[j]}:`,
+            `[Graph] Failed to emit creation signal for ${sortedIds[i]}-${sortedIds[j]}:`,
             error
           );
         }

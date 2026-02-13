@@ -470,12 +470,14 @@ export function inferEdgeType(templateType: string): "correlation" | "hedge" | "
 /**
  * Generate all unique pairs from an array of market IDs.
  * Used for creating edge signals between related markets.
- * Deduplicates input to prevent self-edges and duplicate pairs.
+ * Deduplicates and sorts input to ensure canonical ordering (market_a < market_b)
+ * so that signals for the same pair aggregate correctly in ClickHouse.
  */
-export function allPairs<T>(items: T[]): [T, T][] {
-  // Deduplicate to prevent self-edges when same market appears multiple times
-  const unique = [...new Set(items)];
-  const pairs: [T, T][] = [];
+export function allPairs(items: string[]): [string, string][] {
+  // Deduplicate and sort to ensure canonical ordering
+  // This prevents signals for (A,B) and (B,A) from being split across rows
+  const unique = [...new Set(items)].sort();
+  const pairs: [string, string][] = [];
 
   for (let i = 0; i < unique.length; i++) {
     for (let j = i + 1; j < unique.length; j++) {

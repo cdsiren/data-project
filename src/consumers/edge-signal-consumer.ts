@@ -139,10 +139,16 @@ export function createEdgeSignalMessage(params: {
   strength?: number;
   metadata?: Record<string, unknown>;
 }): EdgeSignalMessage {
+  // Ensure canonical ordering (market_a < market_b) so signals for the same
+  // pair aggregate correctly in ClickHouse GROUP BY (market_a, market_b)
+  const [market_a, market_b] = params.market_a < params.market_b
+    ? [params.market_a, params.market_b]
+    : [params.market_b, params.market_a];
+
   return {
     type: "edge_signal",
-    market_a: params.market_a,
-    market_b: params.market_b,
+    market_a,
+    market_b,
     edge_type: params.edge_type,
     signal_source: params.signal_source,
     user_id: params.user_id || "",
