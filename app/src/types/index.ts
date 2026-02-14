@@ -26,7 +26,9 @@ export type TriggerType =
   // Prediction market triggers
   | "ARBITRAGE_BUY"
   | "ARBITRAGE_SELL"
-  | "MULTI_OUTCOME_ARBITRAGE";
+  | "MULTI_OUTCOME_ARBITRAGE"
+  // Crypto price arbitrage
+  | "CRYPTO_PRICE_ARB";
 
 /**
  * Trigger event from SSE stream
@@ -58,6 +60,20 @@ export interface TriggerEvent {
   sum_of_asks?: number;
   sum_of_bids?: number;
   potential_profit_bps?: number;
+
+  // Crypto price arb fields
+  external_crypto_price?: number;
+  crypto_symbol?: string;
+  strike_price?: number;
+  market_direction?: "ABOVE" | "BELOW";
+  implied_probability?: number;
+  market_probability?: number;
+  probability_divergence_bps?: number;
+  fee_estimate_bps?: number;
+  net_divergence_bps?: number;
+  time_to_resolution_ms?: number;
+  has_structural_arb?: boolean;
+  structural_arb_sum?: number;
 
   // HFT trigger fields
   volatility?: number;

@@ -43,6 +43,7 @@ export interface Env {
   CLICKHOUSE_URL: string;
   CLICKHOUSE_USER: string;
   CLICKHOUSE_TOKEN: string;
+  RTDS_WSS_URL: string;            // Polymarket RTDS WebSocket URL for crypto price feed
   VITE_DASHBOARD_API_KEY: string;  // Required key for dashboard API access
 }
 

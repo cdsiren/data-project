@@ -34,7 +34,8 @@ export type GenericTriggerType =
 export type PredictionMarketTriggerType =
   | "ARBITRAGE_BUY"     // YES_ask + NO_ask < threshold (buy both for guaranteed profit)
   | "ARBITRAGE_SELL"    // YES_bid + NO_bid > threshold (sell both for guaranteed profit)
-  | "MULTI_OUTCOME_ARBITRAGE"; // Sum of all outcome asks < threshold (N-outcome arb)
+  | "MULTI_OUTCOME_ARBITRAGE" // Sum of all outcome asks < threshold (N-outcome arb)
+  | "CRYPTO_PRICE_ARB"; // Crypto price mispricing: external price diverges from market implied probability
 
 /**
  * All trigger types
@@ -51,6 +52,8 @@ export interface TriggerCondition {
   window_ms?: number;             // For PRICE_MOVE, VOLATILITY_SPIKE, IMBALANCE_SHIFT, QUOTE_VELOCITY
   counterpart_asset_id?: string;  // For ARBITRAGE triggers, the other side of the market
   outcome_asset_ids?: string[];   // For MULTI_OUTCOME_ARBITRAGE, all outcome token IDs
+  // CRYPTO_PRICE_ARB: crypto metadata (symbol, strike, direction) resolved from market question at evaluation time
+  min_time_to_resolution_ms?: number;   // Guard against firing too close to expiry (default 120000)
 }
 
 /**
@@ -161,6 +164,20 @@ export interface TriggerEvent {
    * Units: dollars (USD)
    */
   expected_profit?: number;
+
+  // CRYPTO_PRICE_ARB fields
+  external_crypto_price?: number;       // External price from RTDS
+  crypto_symbol?: string;               // RTDS symbol used
+  strike_price?: number;                // Market strike price
+  market_direction?: "ABOVE" | "BELOW"; // Market direction
+  implied_probability?: number;         // Probability implied by external price (0-1)
+  market_probability?: number;          // YES token market price (0-1)
+  probability_divergence_bps?: number;  // Gross divergence
+  fee_estimate_bps?: number;            // Estimated Polymarket fees
+  net_divergence_bps?: number;          // Divergence after fees
+  time_to_resolution_ms?: number;       // Time until market resolution
+  has_structural_arb?: boolean;         // Whether YES+NO < $1 also detected
+  structural_arb_sum?: number;          // YES_ask + NO_ask if structural arb present
 
   // HFT trigger-specific fields
   volatility?: number;            // VOLATILITY_SPIKE: realized volatility %
@@ -447,7 +464,8 @@ export function computeTriggerBounds(trigger: Trigger): TriggerBounds {
     case "ARBITRAGE_BUY":
     case "ARBITRAGE_SELL":
     case "MULTI_OUTCOME_ARBITRAGE":
-      // Cross-asset triggers can't be pre-filtered with single-asset BBO
+    case "CRYPTO_PRICE_ARB":
+      // Cross-asset / external data triggers can't be pre-filtered with single-asset BBO
       break;
   }
 

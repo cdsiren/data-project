@@ -167,6 +167,7 @@ crons = ["*/5 * * * *", "2 * * * *", "7,22,37,52 * * * *"]
 [vars]
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+RTDS_WSS_URL = "wss://ws-live-data.polymarket.com"
 SNAPSHOT_INTERVAL_MS = "60000"
 
 # Multi-market configuration

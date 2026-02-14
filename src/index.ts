@@ -1217,6 +1217,18 @@ const PRODUCTION_TRIGGERS = [
     cooldown_ms: 120000,
     description: "No update for 1 minute",
   },
+  // Crypto price arbitrage - external price divergence
+  {
+    id_prefix: "prod_crypto_price_arb",
+    asset_id: "*",
+    condition: {
+      type: "CRYPTO_PRICE_ARB",
+      threshold: 500, // 500 bps = 5% net divergence after fees
+      min_time_to_resolution_ms: 120000, // Don't fire in last 2 minutes
+    },
+    cooldown_ms: 5000, // 5s cooldown - opportunities are brief
+    description: "Crypto price mispricing >5% net divergence",
+  },
 ];
 
 /**
