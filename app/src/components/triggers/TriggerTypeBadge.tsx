@@ -175,6 +175,13 @@ export const TRIGGER_CONFIG: Record<TriggerType, TriggerConfig> = {
     label: "Multi-Arb",
     description: "N-outcome arbitrage opportunity",
   },
+  CRYPTO_PRICE_ARB: {
+    icon: Activity,
+    color: "text-emerald-400",
+    bgColor: "bg-emerald-600/20",
+    label: "Crypto Arb",
+    description: "Crypto price mispricing vs external feed",
+  },
 };
 
 // Default config for unknown trigger types
@@ -250,6 +257,7 @@ export const TriggerLegend = memo(function TriggerLegend() {
         "ARBITRAGE_BUY",
         "ARBITRAGE_SELL",
         "MULTI_OUTCOME_ARBITRAGE",
+        "CRYPTO_PRICE_ARB",
       ] as TriggerType[],
     },
   ];

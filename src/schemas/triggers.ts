@@ -15,27 +15,31 @@ import {
 // ============================================================
 
 export const TriggerTypeSchema = z.enum([
-  // Price triggers
+  // Generic triggers
   "PRICE_ABOVE",
   "PRICE_BELOW",
-  "PRICE_MOVE",
-  "MID_PRICE_TREND",
-  // Spread triggers
-  "SPREAD_WIDE",
   "SPREAD_NARROW",
-  // Imbalance triggers
+  "SPREAD_WIDE",
   "IMBALANCE_BID",
   "IMBALANCE_ASK",
-  "IMBALANCE_SHIFT",
-  // Size triggers
   "SIZE_SPIKE",
-  "LARGE_FILL",
-  // HFT triggers
+  "PRICE_MOVE",
+  "CROSSED_BOOK",
+  "EMPTY_BOOK",
+  // HFT / Market Making triggers
+  "VOLATILITY_SPIKE",
   "MICROPRICE_DIVERGENCE",
+  "IMBALANCE_SHIFT",
+  "MID_PRICE_TREND",
   "QUOTE_VELOCITY",
   "STALE_QUOTE",
-  // Arbitrage triggers
-  "YES_NO_ARBITRAGE",
+  "LARGE_FILL",
+  // Prediction market triggers
+  "ARBITRAGE_BUY",
+  "ARBITRAGE_SELL",
+  "MULTI_OUTCOME_ARBITRAGE",
+  // Crypto price arbitrage
+  "CRYPTO_PRICE_ARB",
 ]);
 
 export const TriggerSideSchema = z.enum(["BID", "ASK", "MID"]);
@@ -49,6 +53,8 @@ export const TriggerConditionSchema = z.object({
   threshold: z.number(),
   side: TriggerSideSchema.optional(),
   window_ms: z.number().optional(),
+  // CRYPTO_PRICE_ARB: time-to-resolution guard (symbol/strike/direction resolved from market metadata)
+  min_time_to_resolution_ms: z.number().optional(),
 });
 
 // ============================================================
@@ -131,4 +137,18 @@ export const TriggerEventSchema = z.object({
     bid_size: z.number().optional(),
     ask_size: z.number().optional(),
   }).optional(),
+  // CRYPTO_PRICE_ARB fields
+  external_crypto_price: z.number().optional(),
+  crypto_symbol: z.string().optional(),
+  strike_price: z.number().optional(),
+  market_direction: z.enum(["ABOVE", "BELOW"]).optional(),
+  trade_direction: z.enum(["BUY_YES", "SELL_YES"]).optional(),
+  implied_probability: z.number().optional(),
+  market_probability: z.number().optional(),
+  probability_divergence_bps: z.number().optional(),
+  fee_estimate_bps: z.number().optional(),
+  net_divergence_bps: z.number().optional(),
+  time_to_resolution_ms: z.number().optional(),
+  has_structural_arb: z.boolean().optional(),
+  structural_arb_sum: z.number().optional(),
 });

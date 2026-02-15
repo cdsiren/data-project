@@ -35,6 +35,7 @@ const MARKET_SPECIFIC_TRIGGERS: Partial<Record<TriggerType, MarketType[]>> = {
   ARBITRAGE_BUY: ["prediction"],
   ARBITRAGE_SELL: ["prediction"],
   MULTI_OUTCOME_ARBITRAGE: ["prediction"],
+  CRYPTO_PRICE_ARB: ["prediction"],
 };
 
 /**

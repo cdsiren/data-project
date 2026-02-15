@@ -243,6 +243,44 @@ Triggers specific to binary and multi-outcome prediction markets.
 - `max_notional`: Total capital required (size × sum_of_asks)
 - `expected_profit`: Projected profit in dollars (size × profit per share)
 
+### CRYPTO_PRICE_ARB
+**Purpose**: Detect crypto price mispricing on short-duration prediction markets. Compares external crypto prices (Binance via Polymarket RTDS feed) against market-implied probabilities to identify latency arbitrage opportunities.
+
+**How it works**:
+1. Market question is parsed to extract crypto symbol, strike price, and direction (e.g., "Will BTC be above $100,000 at 2:00 PM ET?")
+2. External crypto price is fetched in real-time from Polymarket's RTDS WebSocket (Binance source)
+3. Implied probability is calculated using logistic approximation of normal CDF based on distance from strike and time to resolution
+4. Divergence between implied probability and market YES token ask price is computed
+5. Polymarket fees (200 bps base + 50 bps urgency for <5min) are subtracted
+6. Trigger fires if net divergence exceeds threshold
+
+**Supported symbols**: BTC, ETH, SOL, XRP, DOGE
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `threshold` | number | Yes | Net divergence in basis points after fees (e.g., 500 = 5%) |
+| `min_time_to_resolution_ms` | number | No | Guard against firing too close to expiry (default: 120000 = 2 min) |
+
+**Note**: `crypto_symbol`, `strike_price`, and `market_direction` are resolved automatically from the market question text at evaluation time. No manual configuration needed.
+
+**Webhook extras**:
+- `external_crypto_price`: External price from Binance via RTDS
+- `crypto_symbol`: RTDS symbol used (e.g., `"btcusdt"`)
+- `strike_price`: Market strike price
+- `market_direction`: `"ABOVE"` or `"BELOW"`
+- `trade_direction`: `"BUY_YES"` (implied > market) or `"SELL_YES"` (implied < market)
+- `implied_probability`: Probability implied by external price (0-1)
+- `market_probability`: YES token mid-price (0-1)
+- `probability_divergence_bps`: Gross divergence before fees
+- `fee_estimate_bps`: Estimated Polymarket fees in bps
+- `net_divergence_bps`: Divergence after fees (this is `actual_value`)
+- `time_to_resolution_ms`: Time until market resolution
+- `has_structural_arb`: Whether YES+NO < $1 also detected (secondary signal)
+- `structural_arb_sum`: YES_ask + NO_ask if structural arb present
+- `recommended_size`: Available liquidity on the trade side (ask for BUY_YES, bid for SELL_YES)
+- `max_notional`: Capital required (size x trade price)
+- `expected_profit`: Projected profit in dollars
+
 ---
 
 ## Webhook Payload
@@ -276,7 +314,31 @@ interface TriggerEvent {
   sequence_number: number;
   metadata?: Record<string, string>;
 
-  // Trigger-specific fields (see individual triggers above)
+  // Arbitrage fields (ARBITRAGE_BUY/SELL, MULTI_OUTCOME_ARBITRAGE)
+  counterpart_asset_id?: string;
+  sum_of_asks?: number;
+  sum_of_bids?: number;
+  potential_profit_bps?: number;
+  recommended_size?: number;
+  max_notional?: number;
+  expected_profit?: number;
+
+  // Crypto price arbitrage fields (CRYPTO_PRICE_ARB)
+  external_crypto_price?: number;
+  crypto_symbol?: string;
+  strike_price?: number;
+  market_direction?: "ABOVE" | "BELOW";
+  trade_direction?: "BUY_YES" | "SELL_YES";
+  implied_probability?: number;
+  market_probability?: number;
+  probability_divergence_bps?: number;
+  fee_estimate_bps?: number;
+  net_divergence_bps?: number;
+  time_to_resolution_ms?: number;
+  has_structural_arb?: boolean;
+  structural_arb_sum?: number;
+
+  // HFT fields (see individual triggers)
   // ...
 }
 ```
@@ -374,6 +436,7 @@ POST /triggers/delete
 | LARGE_FILL | O(1) | 16 bytes |
 | ARBITRAGE_BUY/SELL | O(1) | Reuses latestBBO |
 | MULTI_OUTCOME_ARBITRAGE | O(k), k~5 | Reuses latestBBO |
+| CRYPTO_PRICE_ARB | O(1) + async KV | ~100 bytes (cached market info) |
 
 **Target**: <1ms total evaluation per BBO update
 
@@ -424,6 +487,7 @@ Built-in triggers that run on every BBO update without registration. These provi
 | `MID_PRICE_TREND` | 3+ consecutive moves | Momentum | Trending market |
 | `LARGE_FILL` | > $1000 removed | Whale activity | Large position opens |
 | `VOLATILITY_SPIKE` | volatility > 2% | Regime change | 10s rolling window |
+| `CRYPTO_PRICE_ARB` | net divergence > 500 bps | Latency arb | External crypto price vs market (5s cooldown) |
 
 **Key details:**
 - Fixed 500ms cooldown per trigger type per asset
@@ -639,6 +703,10 @@ es.onmessage = (event) => {
     case "LARGE_FILL":
       console.log(`Whale activity: $${data.fill_notional} ${data.fill_side}`);
       break;
+    case "CRYPTO_PRICE_ARB":
+      console.log(`Crypto arb: ${data.crypto_symbol} ${data.trade_direction} ${data.net_divergence_bps} bps net divergence`);
+      console.log(`  External: $${data.external_crypto_price}, Implied: ${data.implied_probability}, Market: ${data.market_probability}`);
+      break;
   }
 };
 ```
@@ -699,6 +767,26 @@ curl -X POST https://your-worker.workers.dev/triggers \
     "cooldown_ms": 100
   }'
 ```
+
+**Example: Crypto Price Arbitrage (All Crypto Markets)**
+
+```bash
+curl -X POST https://your-worker.workers.dev/triggers \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${WEBHOOK_API_KEY}" \
+  -d '{
+    "asset_id": "*",
+    "condition": {
+      "type": "CRYPTO_PRICE_ARB",
+      "threshold": 500,
+      "min_time_to_resolution_ms": 120000
+    },
+    "webhook_url": "https://your-server.com/crypto-arb",
+    "cooldown_ms": 5000
+  }'
+```
+
+**Note**: The trigger automatically detects crypto price prediction markets by parsing market question text. Non-crypto markets are silently skipped. The `threshold` is net divergence in basis points after Polymarket fees are subtracted.
 
 **Example: Wildcard Trigger (All Assets)**
 

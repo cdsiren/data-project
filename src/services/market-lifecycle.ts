@@ -234,6 +234,7 @@ async function updateMarketCache(markets: MarketMetadata[], env: Env): Promise<v
   for (const market of markets) {
     const cacheValue = JSON.stringify({
       condition_id: market.conditionId,
+      question: market.question,
       order_price_min_tick_size: market.orderPriceMinTickSize,
       neg_risk: market.negRisk,
       order_min_size: market.orderMinSize,

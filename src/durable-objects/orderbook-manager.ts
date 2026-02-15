@@ -31,9 +31,14 @@ import { LatencyTracker } from "../utils/ring-buffer";
 import {
   calculateArbitrageSizing,
   isTimestampFresh,
+  calculateImpliedProbability,
+  estimatePolymarketFees,
   STALE_DATA_THRESHOLD_US,
+  STALE_DATA_THRESHOLD_MS,
 } from "../utils/arbitrage-calculations";
 import { getAllRegionalBufferNames } from "../utils/region-mapping";
+import { RTDSConnector } from "../adapters/data-feeds/rtds-connector";
+import { parseCryptoMarket, type CryptoPriceMarketInfo } from "../services/crypto-market-parser";
 
 interface ConnectionState {
   ws: WebSocket | null;
@@ -156,6 +161,19 @@ export class OrderbookManager extends DurableObject<Env> {
   private lastUpdateTs: Map<string, number> = new Map();
   // LARGE_FILL: Track previous BBO for size delta calculation
   private previousBBO: Map<string, { bid_size: number | null; ask_size: number | null }> = new Map();
+
+  // ============================================================
+  // RTDS (Real-Time Data Service) - External crypto price feed
+  // Connected lazily when first CRYPTO_PRICE_ARB trigger is registered
+  // ============================================================
+  private rtdsWs: WebSocket | null = null;
+  private rtdsSubscriptionSent = false;
+  private rtdsReconnectAttempt = 0;
+  private rtdsNextReconnectAt = 0; // Unix ms timestamp for enforcing backoff
+  private externalPrices: Map<string, { value: number; timestamp: number; receivedAt: number }> = new Map();
+  // null = looked up but not a crypto market; undefined (absent) = not looked up yet
+  private cryptoMarketInfo: Map<string, import("../services/crypto-market-parser").CryptoPriceMarketInfo | null> = new Map();
+
   // Cached DO stubs for SSE publishing (avoids stub lookup on every event)
   // REGIONAL SHARDING: Publish to all 4 regional buffers for geo-distributed low latency
   private regionalBufferStubs: Map<string, DurableObjectStub> = new Map();
@@ -557,6 +575,9 @@ export class OrderbookManager extends DurableObject<Env> {
     // Clear graph cache
     this.graphCache.clear();
     this.graphCacheTimestamps.clear();
+    // Clear RTDS state
+    this.disconnectRTDS();
+    this.cryptoMarketInfo.clear();
 
     // Clear corrupted storage
     try {
@@ -564,6 +585,193 @@ export class OrderbookManager extends DurableObject<Env> {
       console.log(`[DO ${this.shardId}] Cleared corrupted poolState from storage`);
     } catch (deleteError) {
       console.error(`[DO ${this.shardId}] Failed to clear corrupted state:`, deleteError);
+    }
+  }
+
+  // ============================================================
+  // RTDS (Real-Time Data Service) LIFECYCLE
+  // Connected lazily when CRYPTO_PRICE_ARB triggers are present
+  // ============================================================
+
+  /**
+   * Check if any CRYPTO_PRICE_ARB triggers are registered.
+   */
+  private hasCryptoPriceArbTriggers(): boolean {
+    for (const trigger of this.triggers.values()) {
+      if (trigger.enabled && trigger.condition.type === "CRYPTO_PRICE_ARB") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Connect to RTDS if needed (lazy initialization).
+   * Called when a CRYPTO_PRICE_ARB trigger is registered.
+   */
+  private connectRTDS(): void {
+    if (this.rtdsWs && this.rtdsWs.readyState === WebSocket.OPEN) return;
+    if (!this.env.RTDS_WSS_URL) {
+      console.warn(`[RTDS ${this.shardId}] RTDS_WSS_URL not configured, skipping`);
+      return;
+    }
+
+    const connector = new RTDSConnector(this.env.RTDS_WSS_URL);
+    this.reconnectRTDS(connector);
+  }
+
+  /**
+   * Reconnect RTDS WebSocket with exponential backoff.
+   */
+  private reconnectRTDS(connector: RTDSConnector): void {
+    // Cleanup existing connection
+    if (this.rtdsWs) {
+      try {
+        this.rtdsWs.close();
+      } catch { /* ignore */ }
+      this.rtdsWs = null;
+    }
+    this.rtdsSubscriptionSent = false;
+
+    try {
+      const wsUrl = connector.getWebSocketUrl();
+      console.log(`[RTDS ${this.shardId}] Connecting to ${wsUrl}`);
+      const ws = new WebSocket(wsUrl);
+      this.rtdsWs = ws;
+
+      ws.addEventListener("open", () => {
+        if (this.rtdsWs !== ws) return; // Stale connection
+        console.log(`[RTDS ${this.shardId}] Connected`);
+        // Reset backoff only after successful connection
+        this.rtdsReconnectAttempt = 0;
+        this.rtdsNextReconnectAt = 0;
+        if (!this.rtdsSubscriptionSent) {
+          ws.send(connector.getSubscriptionMessage());
+          this.rtdsSubscriptionSent = true;
+        }
+      });
+
+      ws.addEventListener("message", (event) => {
+        if (this.rtdsWs !== ws) return; // Stale connection
+        const msg = connector.parseMessage(String(event.data));
+        if (msg) {
+          this.externalPrices.set(msg.symbol, {
+            value: msg.value,
+            timestamp: msg.timestamp,
+            receivedAt: Date.now(),
+          });
+        }
+      });
+
+      ws.addEventListener("close", () => {
+        if (this.rtdsWs !== ws) return; // Stale connection — already replaced
+        console.log(`[RTDS ${this.shardId}] Disconnected`);
+        this.rtdsWs = null;
+        this.rtdsSubscriptionSent = false;
+        // Auto-reconnect if we still have CRYPTO_PRICE_ARB triggers
+        if (this.hasCryptoPriceArbTriggers()) {
+          this.rtdsReconnectAttempt++;
+          const delay = Math.min(1000 * Math.pow(2, this.rtdsReconnectAttempt - 1), 30000) + Math.random() * 1000;
+          this.rtdsNextReconnectAt = Date.now() + delay;
+          // Reconnect will happen in next alarm cycle after backoff
+        }
+      });
+
+      ws.addEventListener("error", (error) => {
+        if (this.rtdsWs !== ws) return; // Stale connection
+        console.error(`[RTDS ${this.shardId}] WebSocket error:`, error);
+      });
+    } catch (error) {
+      console.error(`[RTDS ${this.shardId}] Failed to connect:`, error);
+      this.rtdsReconnectAttempt++;
+      const delay = Math.min(1000 * Math.pow(2, this.rtdsReconnectAttempt - 1), 30000) + Math.random() * 1000;
+      this.rtdsNextReconnectAt = Date.now() + delay;
+    }
+  }
+
+  /**
+   * Disconnect RTDS when no more CRYPTO_PRICE_ARB triggers remain.
+   */
+  private disconnectRTDS(): void {
+    if (this.rtdsWs) {
+      try {
+        this.rtdsWs.close();
+      } catch { /* ignore */ }
+      this.rtdsWs = null;
+    }
+    this.rtdsSubscriptionSent = false;
+    this.rtdsReconnectAttempt = 0;
+    this.rtdsNextReconnectAt = 0;
+    this.externalPrices.clear();
+    console.log(`[RTDS ${this.shardId}] Disconnected (no CRYPTO_PRICE_ARB triggers)`);
+  }
+
+  /**
+   * RTDS ping and reconnect logic, called from alarm() handler.
+   */
+  private maintainRTDS(): void {
+    if (!this.hasCryptoPriceArbTriggers()) {
+      // Disconnect if no longer needed
+      if (this.rtdsWs) this.disconnectRTDS();
+      return;
+    }
+
+    if (!this.env.RTDS_WSS_URL) return;
+
+    // Reconnect if needed
+    if (!this.rtdsWs || this.rtdsWs.readyState !== WebSocket.OPEN) {
+      if (this.rtdsReconnectAttempt > 0) {
+        // Enforce exponential backoff — skip if not enough time has passed
+        if (Date.now() < this.rtdsNextReconnectAt) return;
+        const connector = new RTDSConnector(this.env.RTDS_WSS_URL);
+        console.log(`[RTDS ${this.shardId}] Reconnecting (attempt ${this.rtdsReconnectAttempt})`);
+        this.reconnectRTDS(connector);
+      } else {
+        this.connectRTDS();
+      }
+      return;
+    }
+
+    // Send ping
+    try {
+      this.rtdsWs.send("ping");
+    } catch {
+      this.rtdsWs = null;
+      this.rtdsReconnectAttempt = 1;
+    }
+  }
+
+  /**
+   * Lazily fetch and cache crypto market info from MARKET_CACHE KV.
+   * Parses market question to extract symbol/strike/direction/resolution.
+   */
+  private async loadCryptoMarketInfo(assetId: string): Promise<CryptoPriceMarketInfo | null> {
+    // Check cache first (null = negative cache, undefined = not looked up)
+    if (this.cryptoMarketInfo.has(assetId)) {
+      return this.cryptoMarketInfo.get(assetId) ?? null;
+    }
+
+    // Fetch from KV
+    try {
+      const raw = await this.env.MARKET_CACHE.get(`market:${assetId}`);
+      if (!raw) {
+        this.cryptoMarketInfo.set(assetId, null);
+        return null;
+      }
+
+      const data = JSON.parse(raw) as { question?: string; end_date?: string };
+      if (!data.question || !data.end_date) {
+        this.cryptoMarketInfo.set(assetId, null);
+        return null;
+      }
+
+      const info = parseCryptoMarket(data.question, data.end_date);
+      // Cache both positive and negative results to avoid repeated KV lookups
+      this.cryptoMarketInfo.set(assetId, info);
+      return info;
+    } catch {
+      this.cryptoMarketInfo.set(assetId, null);
+      return null;
     }
   }
 
@@ -2340,6 +2548,9 @@ export class OrderbookManager extends DurableObject<Env> {
       this.cleanupPriceHistory();
     }
 
+    // Maintain RTDS connection for CRYPTO_PRICE_ARB triggers
+    this.maintainRTDS();
+
     // Check for stale quotes - evaluated in alarm since they detect absence of updates
     this.checkStaleQuotes();
 
@@ -3197,6 +3408,11 @@ export class OrderbookManager extends DurableObject<Env> {
         }
         break;
 
+      case "CRYPTO_PRICE_ARB":
+        // crypto_symbol, strike_price, and market_direction can be set dynamically
+        // from market metadata, so they're not strictly required at registration time
+        break;
+
       // MICROPRICE_DIVERGENCE and STALE_QUOTE only need threshold (already validated above)
     }
 
@@ -3517,6 +3733,11 @@ export class OrderbookManager extends DurableObject<Env> {
         );
       }
 
+      // CRYPTO_PRICE_ARB: Connect to RTDS lazily when first trigger is registered
+      if (trigger.condition.type === "CRYPTO_PRICE_ARB") {
+        this.connectRTDS();
+      }
+
       await this.persistState();
 
       console.log(
@@ -3555,6 +3776,11 @@ export class OrderbookManager extends DurableObject<Env> {
           for (const assetTriggers of this.triggersByAsset.values()) {
             assetTriggers.delete(trigger_id);
           }
+        }
+
+        // Disconnect RTDS if no more CRYPTO_PRICE_ARB triggers
+        if (trigger.condition.type === "CRYPTO_PRICE_ARB" && !this.hasCryptoPriceArbTriggers()) {
+          this.disconnectRTDS();
         }
 
         await this.persistState();
@@ -3788,6 +4014,11 @@ export class OrderbookManager extends DurableObject<Env> {
 
     // LARGE_FILL: Store current BBO sizes for next comparison (after trigger evaluation)
     // We'll update this AFTER evaluating triggers so we can compare current vs previous
+
+    // Pre-populate crypto market info for CRYPTO_PRICE_ARB triggers (async KV lookup, cached after first call)
+    if (hasRegisteredTriggers && this.hasCryptoPriceArbTriggers() && !this.cryptoMarketInfo.has(snapshot.asset_id)) {
+      await this.loadCryptoMarketInfo(snapshot.asset_id);
+    }
 
     // CRITICAL PATH OPTIMIZATION: Collect all fired events for potential batched dispatch
     const firedEvents: { trigger: Trigger; event: TriggerEvent }[] = [];
@@ -4201,6 +4432,99 @@ export class OrderbookManager extends DurableObject<Env> {
               sum_of_bids: sumOfBids,
               potential_profit_bps: profitBps,
               ...sizing,
+            },
+          };
+        }
+        break;
+      }
+
+      case "CRYPTO_PRICE_ARB": {
+        // Crypto price latency arbitrage: external price diverges from market implied probability
+        const { min_time_to_resolution_ms } = trigger.condition;
+
+        // Get market info from pre-populated cache (loaded from KV in evaluateTriggersCore)
+        const marketInfo = this.cryptoMarketInfo.get(snapshot.asset_id);
+        if (!marketInfo) break;
+
+        // Get external crypto price
+        const externalPrice = this.externalPrices.get(marketInfo.symbol);
+        if (!externalPrice) break;
+
+        // Check external price staleness (5s threshold)
+        const nowMs = Date.now();
+        if (nowMs - externalPrice.receivedAt > STALE_DATA_THRESHOLD_MS) break;
+
+        // Time-to-resolution guard (default 2 minutes)
+        const timeToResolutionMs = marketInfo.resolutionTime - nowMs;
+        const minTimeGuard = min_time_to_resolution_ms ?? 120000;
+        if (timeToResolutionMs < minTimeGuard) break;
+
+        // Calculate implied probability from external price
+        const impliedProb = calculateImpliedProbability(
+          externalPrice.value,
+          marketInfo.strikePrice,
+          marketInfo.direction,
+          timeToResolutionMs
+        );
+
+        // Get market probability from mid-price (fair value)
+        if (snapshot.best_bid === null || snapshot.best_ask === null ||
+            snapshot.best_bid <= 0 || snapshot.best_ask <= 0) break;
+        const marketProb = (snapshot.best_bid + snapshot.best_ask) / 2;
+
+        // Calculate divergence (preserve sign for trade direction)
+        const rawDivergence = impliedProb - marketProb;
+        const divergenceBps = Math.abs(rawDivergence) * 10000;
+        const feeEstimateBps = estimatePolymarketFees(timeToResolutionMs);
+        const netDivergenceBps = divergenceBps - feeEstimateBps;
+
+        if (netDivergenceBps >= threshold) {
+          // Determine trade direction from sign of divergence
+          const shouldBuyYes = rawDivergence > 0; // impliedProb > marketProb
+          const tradeDirection = shouldBuyYes ? "BUY_YES" as const : "SELL_YES" as const;
+
+          // Check structural arb as secondary signal
+          let hasStructuralArb = false;
+          let structuralArbSum: number | undefined;
+
+          if (counterpart_asset_id) {
+            const counterpartBBO = this.latestBBO.get(counterpart_asset_id);
+            if (counterpartBBO && counterpartBBO.best_ask !== null && snapshot.best_ask !== null) {
+              const sumOfAsks = snapshot.best_ask + counterpartBBO.best_ask;
+              if (sumOfAsks < 1.0) {
+                hasStructuralArb = true;
+                structuralArbSum = sumOfAsks;
+              }
+            }
+          }
+
+          // Trade sizing: use appropriate side for available liquidity
+          const tradePrice = shouldBuyYes ? snapshot.best_ask : snapshot.best_bid;
+          const recommendedSize = shouldBuyYes ? (snapshot.ask_size ?? 0) : (snapshot.bid_size ?? 0);
+          const maxNotional = recommendedSize * tradePrice;
+          const expectedProfit = recommendedSize * (netDivergenceBps / 10000);
+
+          return {
+            fired: true,
+            actualValue: netDivergenceBps,
+            arbitrageData: {
+              external_crypto_price: externalPrice.value,
+              crypto_symbol: marketInfo.symbol,
+              strike_price: marketInfo.strikePrice,
+              market_direction: marketInfo.direction,
+              trade_direction: tradeDirection,
+              implied_probability: impliedProb,
+              market_probability: marketProb,
+              probability_divergence_bps: divergenceBps,
+              fee_estimate_bps: feeEstimateBps,
+              net_divergence_bps: netDivergenceBps,
+              time_to_resolution_ms: timeToResolutionMs,
+              has_structural_arb: hasStructuralArb,
+              structural_arb_sum: structuralArbSum,
+              counterpart_asset_id,
+              recommended_size: recommendedSize,
+              max_notional: maxNotional,
+              expected_profit: expectedProfit,
             },
           };
         }
