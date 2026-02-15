@@ -640,6 +640,7 @@ export class OrderbookManager extends DurableObject<Env> {
       this.rtdsWs = ws;
 
       ws.addEventListener("open", () => {
+        if (this.rtdsWs !== ws) return; // Stale connection
         console.log(`[RTDS ${this.shardId}] Connected`);
         // Reset backoff only after successful connection
         this.rtdsReconnectAttempt = 0;
@@ -651,6 +652,7 @@ export class OrderbookManager extends DurableObject<Env> {
       });
 
       ws.addEventListener("message", (event) => {
+        if (this.rtdsWs !== ws) return; // Stale connection
         const msg = connector.parseMessage(String(event.data));
         if (msg) {
           this.externalPrices.set(msg.symbol, {
@@ -662,6 +664,7 @@ export class OrderbookManager extends DurableObject<Env> {
       });
 
       ws.addEventListener("close", () => {
+        if (this.rtdsWs !== ws) return; // Stale connection — already replaced
         console.log(`[RTDS ${this.shardId}] Disconnected`);
         this.rtdsWs = null;
         this.rtdsSubscriptionSent = false;
@@ -675,6 +678,7 @@ export class OrderbookManager extends DurableObject<Env> {
       });
 
       ws.addEventListener("error", (error) => {
+        if (this.rtdsWs !== ws) return; // Stale connection
         console.error(`[RTDS ${this.shardId}] WebSocket error:`, error);
       });
     } catch (error) {
