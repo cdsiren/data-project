@@ -66,6 +66,7 @@ export interface TriggerEvent {
   crypto_symbol?: string;
   strike_price?: number;
   market_direction?: "ABOVE" | "BELOW";
+  trade_direction?: "BUY_YES" | "SELL_YES";
   implied_probability?: number;
   market_probability?: number;
   probability_divergence_bps?: number;

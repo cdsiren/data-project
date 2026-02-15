@@ -169,8 +169,10 @@ export class OrderbookManager extends DurableObject<Env> {
   private rtdsWs: WebSocket | null = null;
   private rtdsSubscriptionSent = false;
   private rtdsReconnectAttempt = 0;
+  private rtdsNextReconnectAt = 0; // Unix ms timestamp for enforcing backoff
   private externalPrices: Map<string, { value: number; timestamp: number; receivedAt: number }> = new Map();
-  private cryptoMarketInfo: Map<string, import("../services/crypto-market-parser").CryptoPriceMarketInfo> = new Map();
+  // null = looked up but not a crypto market; undefined (absent) = not looked up yet
+  private cryptoMarketInfo: Map<string, import("../services/crypto-market-parser").CryptoPriceMarketInfo | null> = new Map();
 
   // Cached DO stubs for SSE publishing (avoids stub lookup on every event)
   // REGIONAL SHARDING: Publish to all 4 regional buffers for geo-distributed low latency
@@ -615,13 +617,13 @@ export class OrderbookManager extends DurableObject<Env> {
     }
 
     const connector = new RTDSConnector(this.env.RTDS_WSS_URL);
-    this.reconnectRTDS(connector, 0);
+    this.reconnectRTDS(connector);
   }
 
   /**
    * Reconnect RTDS WebSocket with exponential backoff.
    */
-  private reconnectRTDS(connector: RTDSConnector, attempt: number): void {
+  private reconnectRTDS(connector: RTDSConnector): void {
     // Cleanup existing connection
     if (this.rtdsWs) {
       try {
@@ -631,24 +633,17 @@ export class OrderbookManager extends DurableObject<Env> {
     }
     this.rtdsSubscriptionSent = false;
 
-    // Backoff for retry attempts
-    if (attempt > 0) {
-      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 30000) + Math.random() * 1000;
-      console.log(`[RTDS ${this.shardId}] Reconnect attempt ${attempt}, backoff ${Math.round(delay)}ms`);
-      // Schedule reconnect via alarm (don't block)
-      this.rtdsReconnectAttempt = attempt;
-      return;
-    }
-
     try {
       const wsUrl = connector.getWebSocketUrl();
       console.log(`[RTDS ${this.shardId}] Connecting to ${wsUrl}`);
       const ws = new WebSocket(wsUrl);
       this.rtdsWs = ws;
-      this.rtdsReconnectAttempt = 0;
 
       ws.addEventListener("open", () => {
         console.log(`[RTDS ${this.shardId}] Connected`);
+        // Reset backoff only after successful connection
+        this.rtdsReconnectAttempt = 0;
+        this.rtdsNextReconnectAt = 0;
         if (!this.rtdsSubscriptionSent) {
           ws.send(connector.getSubscriptionMessage());
           this.rtdsSubscriptionSent = true;
@@ -673,7 +668,9 @@ export class OrderbookManager extends DurableObject<Env> {
         // Auto-reconnect if we still have CRYPTO_PRICE_ARB triggers
         if (this.hasCryptoPriceArbTriggers()) {
           this.rtdsReconnectAttempt++;
-          // Reconnect will happen in next alarm cycle
+          const delay = Math.min(1000 * Math.pow(2, this.rtdsReconnectAttempt - 1), 30000) + Math.random() * 1000;
+          this.rtdsNextReconnectAt = Date.now() + delay;
+          // Reconnect will happen in next alarm cycle after backoff
         }
       });
 
@@ -682,7 +679,9 @@ export class OrderbookManager extends DurableObject<Env> {
       });
     } catch (error) {
       console.error(`[RTDS ${this.shardId}] Failed to connect:`, error);
-      this.rtdsReconnectAttempt = attempt + 1;
+      this.rtdsReconnectAttempt++;
+      const delay = Math.min(1000 * Math.pow(2, this.rtdsReconnectAttempt - 1), 30000) + Math.random() * 1000;
+      this.rtdsNextReconnectAt = Date.now() + delay;
     }
   }
 
@@ -698,6 +697,7 @@ export class OrderbookManager extends DurableObject<Env> {
     }
     this.rtdsSubscriptionSent = false;
     this.rtdsReconnectAttempt = 0;
+    this.rtdsNextReconnectAt = 0;
     this.externalPrices.clear();
     console.log(`[RTDS ${this.shardId}] Disconnected (no CRYPTO_PRICE_ARB triggers)`);
   }
@@ -717,11 +717,11 @@ export class OrderbookManager extends DurableObject<Env> {
     // Reconnect if needed
     if (!this.rtdsWs || this.rtdsWs.readyState !== WebSocket.OPEN) {
       if (this.rtdsReconnectAttempt > 0) {
-        const delay = Math.min(1000 * Math.pow(2, this.rtdsReconnectAttempt - 1), 30000);
-        // Only reconnect if enough time has passed
+        // Enforce exponential backoff — skip if not enough time has passed
+        if (Date.now() < this.rtdsNextReconnectAt) return;
         const connector = new RTDSConnector(this.env.RTDS_WSS_URL);
         console.log(`[RTDS ${this.shardId}] Reconnecting (attempt ${this.rtdsReconnectAttempt})`);
-        this.reconnectRTDS(connector, 0); // Reset to 0 since we're doing the actual attempt
+        this.reconnectRTDS(connector);
       } else {
         this.connectRTDS();
       }
@@ -742,24 +742,31 @@ export class OrderbookManager extends DurableObject<Env> {
    * Parses market question to extract symbol/strike/direction/resolution.
    */
   private async loadCryptoMarketInfo(assetId: string): Promise<CryptoPriceMarketInfo | null> {
-    // Check cache first
-    const cached = this.cryptoMarketInfo.get(assetId);
-    if (cached !== undefined) return cached;
+    // Check cache first (null = negative cache, undefined = not looked up)
+    if (this.cryptoMarketInfo.has(assetId)) {
+      return this.cryptoMarketInfo.get(assetId) ?? null;
+    }
 
     // Fetch from KV
     try {
       const raw = await this.env.MARKET_CACHE.get(`market:${assetId}`);
-      if (!raw) return null;
+      if (!raw) {
+        this.cryptoMarketInfo.set(assetId, null);
+        return null;
+      }
 
       const data = JSON.parse(raw) as { question?: string; end_date?: string };
-      if (!data.question || !data.end_date) return null;
+      if (!data.question || !data.end_date) {
+        this.cryptoMarketInfo.set(assetId, null);
+        return null;
+      }
 
       const info = parseCryptoMarket(data.question, data.end_date);
-      if (info) {
-        this.cryptoMarketInfo.set(assetId, info);
-      }
+      // Cache both positive and negative results to avoid repeated KV lookups
+      this.cryptoMarketInfo.set(assetId, info);
       return info;
     } catch {
+      this.cryptoMarketInfo.set(assetId, null);
       return null;
     }
   }
@@ -4456,24 +4463,30 @@ export class OrderbookManager extends DurableObject<Env> {
           timeToResolutionMs
         );
 
-        // Get market probability (YES token ask price)
-        const marketProb = snapshot.best_ask;
-        if (marketProb === null || marketProb <= 0) break;
+        // Get market probability from mid-price (fair value)
+        if (snapshot.best_bid === null || snapshot.best_ask === null ||
+            snapshot.best_bid <= 0 || snapshot.best_ask <= 0) break;
+        const marketProb = (snapshot.best_bid + snapshot.best_ask) / 2;
 
-        // Calculate divergence
-        const divergenceBps = Math.abs(impliedProb - marketProb) * 10000;
+        // Calculate divergence (preserve sign for trade direction)
+        const rawDivergence = impliedProb - marketProb;
+        const divergenceBps = Math.abs(rawDivergence) * 10000;
         const feeEstimateBps = estimatePolymarketFees(timeToResolutionMs);
         const netDivergenceBps = divergenceBps - feeEstimateBps;
 
         if (netDivergenceBps >= threshold) {
+          // Determine trade direction from sign of divergence
+          const shouldBuyYes = rawDivergence > 0; // impliedProb > marketProb
+          const tradeDirection = shouldBuyYes ? "BUY_YES" as const : "SELL_YES" as const;
+
           // Check structural arb as secondary signal
           let hasStructuralArb = false;
           let structuralArbSum: number | undefined;
 
           if (counterpart_asset_id) {
             const counterpartBBO = this.latestBBO.get(counterpart_asset_id);
-            if (counterpartBBO?.best_ask !== null && counterpartBBO && snapshot.best_ask !== null) {
-              const sumOfAsks = snapshot.best_ask + counterpartBBO.best_ask!;
+            if (counterpartBBO && counterpartBBO.best_ask !== null && snapshot.best_ask !== null) {
+              const sumOfAsks = snapshot.best_ask + counterpartBBO.best_ask;
               if (sumOfAsks < 1.0) {
                 hasStructuralArb = true;
                 structuralArbSum = sumOfAsks;
@@ -4481,9 +4494,10 @@ export class OrderbookManager extends DurableObject<Env> {
             }
           }
 
-          // Trade sizing: use ask size as available liquidity
-          const recommendedSize = snapshot.ask_size ?? 0;
-          const maxNotional = recommendedSize * marketProb;
+          // Trade sizing: use appropriate side for available liquidity
+          const tradePrice = shouldBuyYes ? snapshot.best_ask : snapshot.best_bid;
+          const recommendedSize = shouldBuyYes ? (snapshot.ask_size ?? 0) : (snapshot.bid_size ?? 0);
+          const maxNotional = recommendedSize * tradePrice;
           const expectedProfit = recommendedSize * (netDivergenceBps / 10000);
 
           return {
@@ -4494,6 +4508,7 @@ export class OrderbookManager extends DurableObject<Env> {
               crypto_symbol: marketInfo.symbol,
               strike_price: marketInfo.strikePrice,
               market_direction: marketInfo.direction,
+              trade_direction: tradeDirection,
               implied_probability: impliedProb,
               market_probability: marketProb,
               probability_divergence_bps: divergenceBps,

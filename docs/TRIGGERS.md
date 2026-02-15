@@ -268,16 +268,17 @@ Triggers specific to binary and multi-outcome prediction markets.
 - `crypto_symbol`: RTDS symbol used (e.g., `"btcusdt"`)
 - `strike_price`: Market strike price
 - `market_direction`: `"ABOVE"` or `"BELOW"`
+- `trade_direction`: `"BUY_YES"` (implied > market) or `"SELL_YES"` (implied < market)
 - `implied_probability`: Probability implied by external price (0-1)
-- `market_probability`: YES token market price (0-1)
+- `market_probability`: YES token mid-price (0-1)
 - `probability_divergence_bps`: Gross divergence before fees
 - `fee_estimate_bps`: Estimated Polymarket fees in bps
 - `net_divergence_bps`: Divergence after fees (this is `actual_value`)
 - `time_to_resolution_ms`: Time until market resolution
 - `has_structural_arb`: Whether YES+NO < $1 also detected (secondary signal)
 - `structural_arb_sum`: YES_ask + NO_ask if structural arb present
-- `recommended_size`: Available ask-side liquidity
-- `max_notional`: Capital required (size x market probability)
+- `recommended_size`: Available liquidity on the trade side (ask for BUY_YES, bid for SELL_YES)
+- `max_notional`: Capital required (size x trade price)
 - `expected_profit`: Projected profit in dollars
 
 ---
@@ -327,6 +328,7 @@ interface TriggerEvent {
   crypto_symbol?: string;
   strike_price?: number;
   market_direction?: "ABOVE" | "BELOW";
+  trade_direction?: "BUY_YES" | "SELL_YES";
   implied_probability?: number;
   market_probability?: number;
   probability_divergence_bps?: number;
@@ -702,7 +704,7 @@ es.onmessage = (event) => {
       console.log(`Whale activity: $${data.fill_notional} ${data.fill_side}`);
       break;
     case "CRYPTO_PRICE_ARB":
-      console.log(`Crypto arb: ${data.crypto_symbol} ${data.net_divergence_bps} bps net divergence`);
+      console.log(`Crypto arb: ${data.crypto_symbol} ${data.trade_direction} ${data.net_divergence_bps} bps net divergence`);
       console.log(`  External: $${data.external_crypto_price}, Implied: ${data.implied_probability}, Market: ${data.market_probability}`);
       break;
   }

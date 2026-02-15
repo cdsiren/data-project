@@ -305,8 +305,10 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
     minTimeToResolutionMs: number;
     externalPrice: ExternalPrice;
     resolutionTime: number;
+    bestBid: number;
     bestAsk: number;
     askSize: number;
+    bidSize?: number;
     counterpartBestAsk?: number | null;
   }
 
@@ -317,6 +319,7 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
     fired: boolean;
     netDivergenceBps?: number;
     impliedProbability?: number;
+    tradeDirection?: "BUY_YES" | "SELL_YES";
     hasStructuralArb?: boolean;
   } {
     const nowMs = Date.now();
@@ -340,14 +343,18 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
       timeToResolutionMs
     );
 
-    // Market probability
-    const marketProb = params.bestAsk;
-    if (marketProb <= 0) return { fired: false };
+    // Market probability from mid-price (fair value)
+    if (params.bestBid <= 0 || params.bestAsk <= 0) return { fired: false };
+    const marketProb = (params.bestBid + params.bestAsk) / 2;
 
-    // Divergence
-    const divergenceBps = Math.abs(impliedProb - marketProb) * 10000;
+    // Divergence (preserve sign for trade direction)
+    const rawDivergence = impliedProb - marketProb;
+    const divergenceBps = Math.abs(rawDivergence) * 10000;
     const feeEstimateBps = estimatePolymarketFees(timeToResolutionMs);
     const netDivergenceBps = divergenceBps - feeEstimateBps;
+
+    // Trade direction
+    const tradeDirection = rawDivergence > 0 ? "BUY_YES" as const : "SELL_YES" as const;
 
     // Check structural arb
     let hasStructuralArb = false;
@@ -363,11 +370,12 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
         fired: true,
         netDivergenceBps,
         impliedProbability: impliedProb,
+        tradeDirection,
         hasStructuralArb,
       };
     }
 
-    return { fired: false, netDivergenceBps, impliedProbability: impliedProb };
+    return { fired: false, netDivergenceBps, impliedProbability: impliedProb, tradeDirection };
   }
 
   const nowMs = Date.now();
@@ -383,12 +391,14 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
       minTimeToResolutionMs: 120000,
       externalPrice: { value: 110000, timestamp: nowMs, receivedAt: nowMs },
       resolutionTime: futureResolution,
-      bestAsk: 0.50, // Market way off
+      bestBid: 0.48,
+      bestAsk: 0.52, // mid = 0.50, Market way off
       askSize: 1000,
     });
 
     expect(result.fired).toBe(true);
     expect(result.netDivergenceBps).toBeGreaterThan(500);
+    expect(result.tradeDirection).toBe("BUY_YES"); // implied > market
   });
 
   it("does not fire when divergence is below threshold", () => {
@@ -401,7 +411,8 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
       minTimeToResolutionMs: 120000,
       externalPrice: { value: 100000, timestamp: nowMs, receivedAt: nowMs },
       resolutionTime: futureResolution,
-      bestAsk: 0.50,
+      bestBid: 0.48,
+      bestAsk: 0.52, // mid = 0.50
       askSize: 1000,
     });
 
@@ -418,7 +429,8 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
       minTimeToResolutionMs: 120000,
       externalPrice: { value: 110000, timestamp: nowMs, receivedAt: staleReceivedAt },
       resolutionTime: futureResolution,
-      bestAsk: 0.50,
+      bestBid: 0.48,
+      bestAsk: 0.52,
       askSize: 1000,
     });
 
@@ -435,7 +447,8 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
       minTimeToResolutionMs: 120000, // 2 min guard
       externalPrice: { value: 110000, timestamp: nowMs, receivedAt: nowMs },
       resolutionTime: nearResolution,
-      bestAsk: 0.50,
+      bestBid: 0.48,
+      bestAsk: 0.52,
       askSize: 1000,
     });
 
@@ -444,7 +457,7 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
 
   it("subtracts fees from divergence", () => {
     // Create a case where gross divergence is moderate but net (after 200bps fees) < threshold
-    // Price at strike means implied ~0.50, and market at 0.47 gives ~300 bps gross divergence
+    // Price at strike means implied ~0.50, mid-price at 0.47 gives ~300 bps gross divergence
     // After 200 bps fees: net = 100 bps < 500 threshold
     const result = evaluateCryptoPriceArb({
       cryptoSymbol: "btcusdt",
@@ -454,7 +467,8 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
       minTimeToResolutionMs: 120000,
       externalPrice: { value: 100000, timestamp: nowMs, receivedAt: nowMs },
       resolutionTime: futureResolution,
-      bestAsk: 0.47, // ~300 bps from implied ~0.50
+      bestBid: 0.45,
+      bestAsk: 0.49, // mid = 0.47, ~300 bps from implied ~0.50
       askSize: 1000,
     });
 
@@ -474,9 +488,10 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
       minTimeToResolutionMs: 120000,
       externalPrice: { value: 110000, timestamp: nowMs, receivedAt: nowMs },
       resolutionTime: futureResolution,
-      bestAsk: 0.45,
+      bestBid: 0.43,
+      bestAsk: 0.47, // mid = 0.45
       askSize: 1000,
-      counterpartBestAsk: 0.45, // YES + NO = 0.90 < 1.0
+      counterpartBestAsk: 0.45, // YES_ask + NO_ask = 0.47 + 0.45 = 0.92 < 1.0
     });
 
     expect(result.fired).toBe(true);
@@ -493,11 +508,35 @@ describe("CRYPTO_PRICE_ARB trigger evaluation", () => {
       minTimeToResolutionMs: 120000,
       externalPrice: { value: 90000, timestamp: nowMs, receivedAt: nowMs },
       resolutionTime: futureResolution,
-      bestAsk: 0.50, // Market hasn't adjusted
+      bestBid: 0.48,
+      bestAsk: 0.52, // mid = 0.50, Market hasn't adjusted
       askSize: 1000,
     });
 
     expect(result.fired).toBe(true);
     expect(result.impliedProbability).toBeGreaterThan(0.9);
+    expect(result.tradeDirection).toBe("BUY_YES"); // implied > market
+  });
+
+  it("recommends SELL_YES when implied probability is below market", () => {
+    // BTC far above strike on a BELOW market -> implied probability near 0
+    // But market still says ~0.50 -> should SELL YES
+    const result = evaluateCryptoPriceArb({
+      cryptoSymbol: "btcusdt",
+      strikePrice: 100000,
+      marketDirection: "BELOW",
+      threshold: 500,
+      minTimeToResolutionMs: 120000,
+      externalPrice: { value: 110000, timestamp: nowMs, receivedAt: nowMs },
+      resolutionTime: futureResolution,
+      bestBid: 0.48,
+      bestAsk: 0.52, // mid = 0.50, Market hasn't adjusted
+      askSize: 1000,
+      bidSize: 800,
+    });
+
+    expect(result.fired).toBe(true);
+    expect(result.impliedProbability).toBeLessThan(0.1);
+    expect(result.tradeDirection).toBe("SELL_YES"); // implied < market
   });
 });

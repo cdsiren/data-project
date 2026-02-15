@@ -170,8 +170,9 @@ export interface TriggerEvent {
   crypto_symbol?: string;               // RTDS symbol used
   strike_price?: number;                // Market strike price
   market_direction?: "ABOVE" | "BELOW"; // Market direction
+  trade_direction?: "BUY_YES" | "SELL_YES"; // Recommended trade direction
   implied_probability?: number;         // Probability implied by external price (0-1)
-  market_probability?: number;          // YES token market price (0-1)
+  market_probability?: number;          // YES token mid-price (0-1)
   probability_divergence_bps?: number;  // Gross divergence
   fee_estimate_bps?: number;            // Estimated Polymarket fees
   net_divergence_bps?: number;          // Divergence after fees

@@ -142,6 +142,7 @@ export const TriggerEventSchema = z.object({
   crypto_symbol: z.string().optional(),
   strike_price: z.number().optional(),
   market_direction: z.enum(["ABOVE", "BELOW"]).optional(),
+  trade_direction: z.enum(["BUY_YES", "SELL_YES"]).optional(),
   implied_probability: z.number().optional(),
   market_probability: z.number().optional(),
   probability_divergence_bps: z.number().optional(),
